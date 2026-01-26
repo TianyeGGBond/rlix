@@ -1,8 +1,23 @@
-# rules to agent
-- use easy English for non-native speakers and junior engineers; use short sentences and simple words
-- avoid jargon (even if common in software engineering); prefer plain words. If a technical term is necessary, define it in one short sentence (e.g., avoid "cross-cutting" and use "shared/system-wide" instead)
-- try to reuse the codebase as much as possible  
-- fail fast and loudly 
+# Rules for the Agent
+
+## 1. Safety (Critical)
+- **No Secrets**: Never print, store, or commit tokens or keys.
+- **No Destruction**: Do not delete files or force-push without asking first.
+- **No Surprises**: Do not change files unrelated to the task.
+
+## 2. Reliability
+- **Fail Fast**: Crash immediately with a clear error message; do not hide errors.
+- **Check Your Work**: Run the smallest relevant test. If you can't, tell the user what command to run.
+
+## 3. Scope & Quality
+- **Small Changes**: Do the smallest change that solves the problem. No extra formatting.
+- **Scope**: Do not edit code inside `third_party/` submodules unless asked.
+- **Reuse Code**: Don't reinvent the wheel; use existing patterns and libraries.
+
+## 4. Communication
+- **Simple English**: Use short sentences and plain words. Avoid jargon (or define it in one sentence).
+- **Update Docs**: If you change behavior, paths, or commands, update docs in the same commit.
+- **Ask First**: If unclear, ask one short question before starting.
 
 # Repository Guidelines
 
@@ -47,4 +62,4 @@ Run commands from the relevant subproject root:
 
 - Commit history here uses short, imperative summaries (e.g., `readme`); keep subjects concise.
 - PRs should include: what changed, why, and which framework(s) it impacts.
-- For protocol changes, update `design_doc/multi-pipeline-adaptation-plan_clean.md` and keep `design_doc/multi-pipeline_roll_old_design.md` as the reference sequence.
+- For protocol changes, update `design_doc/multi-pipeline-adaptation-plan.md` and keep `design_doc/archive/multi-pipeline_roll_old_design.md` as the reference sequence.
