@@ -1,0 +1,21 @@
+[submodule "third_party/ROLL"]
+	path = third_party/ROLL
+	url = git@github.com:alibaba/ROLL.git
+[submodule "third_party/SkyRL"]
+	path = third_party/SkyRL
+	url = git@github.com:NovaSky-AI/SkyRL.git
+[submodule "third_party/miles"]
+	path = third_party/miles
+	url = git@github.com:radixark/miles.git
+[submodule "third_party/nemo-gym"]
+	path = third_party/nemo-gym
+	url = git@github.com:NVIDIA-NeMo/Gym.git
+[submodule "third_party/nemo-rl"]
+	path = third_party/nemo-rl
+	url = git@github.com:NVIDIA-NeMo/RL.git
+[submodule "third_party/sglang"]
+	path = third_party/sglang
+	url = git@github.com:sgl-project/sglang.git
+[submodule "third_party/vllm"]
+	path = third_party/vllm
+	url = git@github.com:vllm-project/vllm.git

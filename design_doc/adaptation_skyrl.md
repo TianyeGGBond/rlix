@@ -15,10 +15,10 @@ Async SkyAgent (SWE + OpenHands) is noted as **future work**.
 ## 1.1 What we will support as async multi-turn examples (scoped)
 
 To keep the first SchedRL integration simple, we only target **GSM8K multi-turn** as the “async + multi-turn” reference for SkyRL-train:
-- Multi-turn task: `SkyRL/skyrl-train/examples/turn_level_rewards/` (env: `gsm8k_multi_turn`)
+- Multi-turn task: `third_party/SkyRL/skyrl-train/examples/turn_level_rewards/` (env: `gsm8k_multi_turn`)
 - Async trainers:
-  - One-step-off (recommended): `SkyRL/skyrl-train/examples/async/async_trainer.py`
-  - Fully-async bounded-staleness (supported): `SkyRL/skyrl-train/skyrl_train/fully_async_trainer.py`
+  - One-step-off (recommended): `third_party/SkyRL/skyrl-train/examples/async/async_trainer.py`
+  - Fully-async bounded-staleness (supported): `third_party/SkyRL/skyrl-train/skyrl_train/fully_async_trainer.py`
 
 We do **not** target Mini-SWE-Agent / Terminal-Bench as async examples yet, because those are long tool loops and need extra “resume on abort” handling to be reliable.
 
@@ -27,14 +27,14 @@ We do **not** target Mini-SWE-Agent / Terminal-Bench as async examples yet, beca
 Goal: add a **Mini-SWE** example that runs with async training.
 
 Where Mini-SWE already exists in this workspace:
-- SkyRL-train Mini-SWE training example (sync today): `SkyRL/skyrl-train/examples/mini_swe_agent/`
+- SkyRL-train Mini-SWE training example (sync today): `third_party/SkyRL/skyrl-train/examples/mini_swe_agent/`
 
 Phase 2 plan (Mini-SWE in SkyRL-train):
 - One-step-off async:
-  - Create a new entrypoint that mirrors `SkyRL/skyrl-train/examples/async/main_async.py`,
-    but uses `MiniSweAgentGenerator` from `SkyRL/skyrl-train/examples/mini_swe_agent/mini_swe_generator.py`.
+  - Create a new entrypoint that mirrors `third_party/SkyRL/skyrl-train/examples/async/main_async.py`,
+    but uses `MiniSweAgentGenerator` from `third_party/SkyRL/skyrl-train/examples/mini_swe_agent/mini_swe_generator.py`.
 - Fully-async bounded-staleness:
-  - Create a new entrypoint that mirrors `SkyRL/skyrl-train/examples/fully_async/main_fully_async.py`.
+  - Create a new entrypoint that mirrors `third_party/SkyRL/skyrl-train/examples/fully_async/main_fully_async.py`.
   - Keep the “fully-async constraints” in mind:
     - `generator.batched=false` is required in SkyRL-train fully-async.
     - vLLM-only for abort/pause in the current SkyRL-train code.
@@ -52,9 +52,9 @@ SkyRL-train provides a minimal “one-step-off” async trainer that overlaps:
 - training on the previous batch.
 
 Reference implementation:
-- Entrypoint: `SkyRL/skyrl-train/examples/async/main_async.py`
-- Trainer: `SkyRL/skyrl-train/examples/async/async_trainer.py` (`AsyncRayPPOTrainer`)
-- Doc: `SkyRL/skyrl-train/docs/tutorials/one_step_off_async.rst`
+- Entrypoint: `third_party/SkyRL/skyrl-train/examples/async/main_async.py`
+- Trainer: `third_party/SkyRL/skyrl-train/examples/async/async_trainer.py` (`AsyncRayPPOTrainer`)
+- Doc: `third_party/SkyRL/skyrl-train/docs/tutorials/one_step_off_async.rst`
 
 Important constraints:
 - `trainer.placement.colocate_all=false` (asserted in the async trainer).
@@ -62,10 +62,10 @@ Important constraints:
 ### 2.2 Fully-async training (streaming / bounded staleness)
 
 SkyRL-train provides a fully-async trainer with a staleness budget:
-- knob: `trainer.fully_async.max_staleness_steps` in `SkyRL/skyrl-train/skyrl_train/config/ppo_base_config.yaml`
-- implementation: `SkyRL/skyrl-train/skyrl_train/fully_async_trainer.py` (`FullyAsyncRayPPOTrainer`)
-- entrypoint: `SkyRL/skyrl-train/examples/fully_async/main_fully_async.py`
-- doc: `SkyRL/skyrl-train/docs/tutorials/fully_async.rst`
+- knob: `trainer.fully_async.max_staleness_steps` in `third_party/SkyRL/skyrl-train/skyrl_train/config/ppo_base_config.yaml`
+- implementation: `third_party/SkyRL/skyrl-train/skyrl_train/fully_async_trainer.py` (`FullyAsyncRayPPOTrainer`)
+- entrypoint: `third_party/SkyRL/skyrl-train/examples/fully_async/main_fully_async.py`
+- doc: `third_party/SkyRL/skyrl-train/docs/tutorials/fully_async.rst`
 
 Important constraints:
 - `trainer.placement.colocate_all=false` (asserted)
@@ -134,22 +134,22 @@ Version tagging (simple, for debugging):
 ## 4) How to run today (use existing examples)
 
 For now, treat SkyRL-train as a supported pipeline by using its existing example entrypoints:
-- One-step-off: run `SkyRL/skyrl-train/examples/async/main_async.py`
-- Fully-async: run `SkyRL/skyrl-train/examples/fully_async/main_fully_async.py`
+- One-step-off: run `third_party/SkyRL/skyrl-train/examples/async/main_async.py`
+- Fully-async: run `third_party/SkyRL/skyrl-train/examples/fully_async/main_fully_async.py`
 
 This provides the async training modes without requiring custom SchedRL adapter code immediately.
 
 For the first **async + multi-turn** reference, use the GSM8K multi-turn task setup:
-- `SkyRL/skyrl-train/examples/turn_level_rewards/` (multi-turn env + turn-level rewards)
+- `third_party/SkyRL/skyrl-train/examples/turn_level_rewards/` (multi-turn env + turn-level rewards)
 Then wire it to the async trainers above (one-step-off first).
 
 ## 5) Future work: SkyAgent SWE + async training
 
 SkyAgent has a SkyRL-train integration entrypoint today:
-- `SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/skyrl_train_main.py`
+- `third_party/SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/skyrl_train_main.py`
 
 But it uses a sync-style trainer wrapper:
-- `SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/trainer.py` (`SkyRLAgentPPOTrainer`)
+- `third_party/SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/trainer.py` (`SkyRLAgentPPOTrainer`)
 
 So, for SkyAgent SWE + OpenHands tasks, the current SkyRL-train integration should be treated as:
 - `update_policy=QUIESCE` / on-policy style (generate → train → sync),
@@ -157,9 +157,9 @@ So, for SkyAgent SWE + OpenHands tasks, the current SkyRL-train integration shou
 - no fully-async staleness-controlled training.
 
 To support async modes for SkyAgent SWE:
-- Add new async entrypoints under `SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/` that mirror:
-  - `SkyRL/skyrl-train/examples/async/main_async.py` (one-step-off), and
-  - `SkyRL/skyrl-train/examples/fully_async/main_fully_async.py` (fully-async).
+- Add new async entrypoints under `third_party/SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/` that mirror:
+  - `third_party/SkyRL/skyrl-train/examples/async/main_async.py` (one-step-off), and
+  - `third_party/SkyRL/skyrl-train/examples/fully_async/main_fully_async.py` (fully-async).
 - Add corresponding trainer classes that reuse SkyRL-train’s async training loops but keep SkyAgent’s generator.
 
 This is intentionally postponed until the base SkyRL-train async modes are validated in SchedRL first.
