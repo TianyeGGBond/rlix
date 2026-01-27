@@ -83,9 +83,6 @@ SchedRL unifies cross-framework behavior using two orthogonal knobs:
   - **Turn/request drain**: close admission for new turns/requests and wait until no in-flight requests remain. This guarantees no mid-request mixing, but a multi-turn trajectory can still span versions across turns.
   - **Trajectory-group drain**: close admission for new trajectory groups (e.g., NeMo-RL prompt-group rollout threads) and wait until no in-flight groups remain. This guarantees no interruption inside that group’s multi-turn rollout loop.
 
-**Important: INFLIGHT may still use backend abort under the hood**
-- Some frameworks implement `INFLIGHT` weight updates via **pause + abort-resume** at the inference-engine layer (abort is used to stop the current streaming request and then resume it later).
-- This is **not** `ABORT-to-zero` and does **not** imply `REQUEST_RETRY` (the same request/trajectory continues after resume).
 
 **B) Preemption migration policy during shrink (`migration_policy`)**
 - `REQUEST_RETRY` (baseline for elastic time-sharing): abort/cancel in-flight work on `P` and retry it on `new_S`.
