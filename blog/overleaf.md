@@ -121,8 +121,8 @@ We define the following standard terminology to clarify concepts across differen
   - Coordination protocol:
     - Training groups (trainer-side compute: train/value/logprobs): execution is driven by the job coordinator (request → run → `release_gpus()`),
       i.e. the scheduler allocates but does not preempt the computation once granted.
-    - Worker group (generator-side compute: `actor_infer` rollouts): preemptible DP Workers and completion-driven release:
-      - Scheduling is driven by the Global Scheduler: it can preempt/resume DP ranks while rollouts run.
+    - Worker group (generator-side compute: `actor_infer` trajectories): preemptible DP Workers and completion-driven release:
+      - Scheduling is driven by the Global Scheduler: it can preempt/resume DP ranks while trajectories run.
       - Allocation is at DP/TP-bundle granularity and may be partial.
       - After each training step, the job coordinator releases (or is preempted from) agentic rollout DP Workers, so those GPUs can be reclaimed and reused.
       - Workload rebalance on preemption/resume: `shrink_workers()` / `expand_workers()` rebalance routing by aborting in-flight prompt batches and clearing sticky mappings,
@@ -169,7 +169,7 @@ We define the following standard terminology to clarify concepts across differen
   - Heartbeat-driven monitoring keeps it lightweight: rollout workers send progress heartbeats (`remaining`, `percent_remaining`, `oldest_unfinished_creation_ts`), so the
     scheduler can plan using backlog signals without per-episode polling, reducing scheduler overhead while staying responsive to workload changes.
     - Metric meanings + reporting cadence:
-      - `remaining`: how many prompt batches are still missing for the current batch (`remaining = total_required - collected`).
+      - `remaining`: how many trajectories are still missing for the current batch (`remaining = total_required - collected`).
       - `percent_remaining`: remaining ratio in `[0, 1]` (`percent_remaining = remaining / max(total_required, 1)`), not a true percentage.
       - `oldest_unfinished_creation_ts`: timestamp of the oldest unfinished prompt batch; used as a FIFO tie-break within a priority tier.
       - Heartbeat cadence is event-driven: send at batch start, and whenever `percent_remaining` crosses a 2% progress band (`floor(percent_remaining * 50)` changes).
