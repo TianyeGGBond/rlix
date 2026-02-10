@@ -11,6 +11,8 @@
 ## 2. Reliability
 - **Happy Path First**: Assume perfect conditions. Do not fix edge case like hardware or external service failure unless asked (like network, hardware, server is down). Just document the risk and let the code fail.
 - **Fail Fast**: Crash immediately with a clear error message; do not hide errors.
+- **No Fault Tolerance**: Assume rare failures cannot happen to simplify implementation, ignore failure handling and fault tolerance cases by failing fast and loudly, then terminating the whole program. Do not implement retry logic, recovery mechanisms, or graceful degradation unless explicitly requested.
+- **No Idempotent Operations**: Assume operations always succeed and execute exactly once. Do not design for idempotency, deduplication, or duplicate detection. Avoid idempotent operation patterns.
 - **Check Your Work**: Run the smallest relevant test. If you can't, tell the user what command to run.
 
 ## 3. Scope & Quality
@@ -22,6 +24,13 @@
 - **Simple English**: Use short sentences and plain words. Avoid jargon (or define it in one sentence).
 - **Update Docs**: If you change behavior, paths, or commands, update docs in the same commit.
 - **Ask First**: If unclear, ask one short question before starting.
+
+## IDE Integration
+
+IMPORTANT: Prefer use the `pycharm-index` MCP server when applicable for code navigation and refactoring:
+
+IMPORTANT: When debugging, prefer using pycharm-debugger MCP tools to interact with the IDE debugger.
+
 
 # Repository Guidelines
 
