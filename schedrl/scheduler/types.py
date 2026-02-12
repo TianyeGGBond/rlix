@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from schedrl.protocol.types import Priority
+
+
+@dataclass(slots=True)
+class ClusterAllocation:
+    """Active GPU allocation for a cluster_id (format: '{pipeline_id}_{cluster_name}')."""
+
+    cluster_id: str
+    gpu_ids: List[int]
+    priority: Priority
+    active_dp_ranks: Set[int] = field(default_factory=set)
+    dp_rank_to_gpus: Dict[int, List[int]] = field(default_factory=dict)
+    global_step: Optional[int] = None
+    timestamp: Optional[float] = None
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationError(RuntimeError):
+    message: str
+    condition: Optional[int] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass(slots=True)
+class CompletionSuspensionOp:
+    cluster_id: str
+    dp_ranks_to_remove: List[int]
+    allocation_id: Optional[str] = None
+
+
+@dataclass(slots=True)
+class SchedGuidedShrinkOp:
+    cluster_id: str
+    dp_ranks_to_remove: List[int]
+
+
+@dataclass(slots=True)
+class SignalPendingAllocationOp:
+    cluster_id: str
+    gpus_to_allocate: List[int]
+    priority: Optional[Any] = None
+
+
+@dataclass(slots=True)
+class SchedGuidedAllocationOp:
+    cluster_id: str
+    dp_ranks_to_add: List[int]
+    gpus_to_allocate: List[int]
+    has_pending_request: bool = False
+
+
+@dataclass(slots=True)
+class ExecutionPlan:
+    completion_driven_suspension_ops: List[CompletionSuspensionOp] = field(default_factory=list)
+    sched_guided_shrink_ops: List[SchedGuidedShrinkOp] = field(default_factory=list)
+    signal_pending_allocation_ops: List[SignalPendingAllocationOp] = field(default_factory=list)
+    sched_guided_allocation_ops: List[SchedGuidedAllocationOp] = field(default_factory=list)
+    clusters_to_remove: Set[str] = field(default_factory=set)
+
+    def has_operations(self) -> bool:
+        return bool(
+            self.completion_driven_suspension_ops
+            or self.sched_guided_shrink_ops
+            or self.signal_pending_allocation_ops
+            or self.sched_guided_allocation_ops
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Request:
+    cluster_id: str
+    priority: Priority
+    timestamp: float
+
+
+@dataclass(slots=True)
+class PendingRequest:
+    request: Request
+    event: asyncio.Event
+    global_step: Optional[int] = None
+    result: List[int] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+@dataclass(slots=True)
+class PendingCompletionRequest:
+    cluster_id: str
+    allocation_id: str
+    event: asyncio.Event
+    global_step: Optional[int] = None
+    error: Optional[str] = None
+
+
+@dataclass(slots=True)
+class PendingPlannedReleaseRequest:
+    cluster_id: str
+    planned_release_gpu_ids: List[int]
+    dp_ranks_to_remove: List[int]
+    event: asyncio.Event
+    global_step: Optional[int] = None
+    result_released_gpu_ids: List[int] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+@dataclass(slots=True)
+class SimulatedState:
+    allocations: Dict[str, ClusterAllocation]
+    idle_gpus: Set[int]
+    gpu_states: Dict[int, Tuple[str, Optional[str]]]  # gpu_id -> (state, owner)
+
+
+def is_generation_cluster(cluster_id: str) -> bool:
+    return cluster_id.endswith("_actor_infer")
+
+
+def parse_cluster_id(cluster_id: str) -> Tuple[str, str]:
+    """Suffix-aware parser for cluster_id.
+
+    Fail-fast (H2): do not fall back to parsing by `rsplit("_", 1)`, since pipeline_id may
+    contain underscores and cluster_name may evolve. Only accept known suffixes.
+    """
+
+    known_clusters = {"actor_train", "actor_infer", "critic", "reference"}
+    for cluster_name in known_clusters:
+        suffix = f"_{cluster_name}"
+        if cluster_id.endswith(suffix):
+            pipeline_id = cluster_id[: -len(suffix)]
+            return pipeline_id, cluster_name
+
+    raise ValueError(
+        f"Unrecognized cluster_id {cluster_id!r}. Expected suffix _<cluster_name> where cluster_name is one of "
+        f"{sorted(known_clusters)!r}."
+    )
+
+
+def derive_dp_ranks_from_gpus(gpu_ids: List[int], tp_size: int) -> Set[int]:
+    if tp_size <= 0:
+        return set()
+    sorted_gpus = sorted(gpu_ids)
+    dp_ranks = set()
+    for i in range(0, len(sorted_gpus), tp_size):
+        dp_ranks.add(i // tp_size)
+    return dp_ranks
+
+
+def build_dp_rank_mapping(gpu_ids: List[int], tp_size: int) -> Dict[int, List[int]]:
+    if tp_size <= 0:
+        return {}
+    sorted_gpus = sorted(gpu_ids)
+    mapping: Dict[int, List[int]] = {}
+    for i in range(0, len(sorted_gpus), tp_size):
+        dp_rank = i // tp_size
+        mapping[dp_rank] = sorted_gpus[i : i + tp_size]
+    return mapping
