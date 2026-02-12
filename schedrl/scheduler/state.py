@@ -1,26 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, List, Set
 
-
-@dataclass(slots=True)
-class PipelineRuntimeState:
-    pipeline_id: str
-    registered: bool = False
-    admitted: bool = False
-    busy: bool = False
-    active_action: Optional[str] = None
-    last_progress_step_target: Optional[int] = None
+from schedrl.protocol.types import Priority, ProgressReport
+from schedrl.scheduler.types import ClusterAllocation, PendingCompletionRequest, PendingPlannedReleaseRequest, PendingRequest
 
 
 @dataclass(slots=True)
 class SchedulerState:
-    pipelines: Dict[str, PipelineRuntimeState] = field(default_factory=dict)
+    pending_requests: Dict[Priority, List[PendingRequest]] = field(default_factory=dict)
+    active_allocations: Dict[str, ClusterAllocation] = field(default_factory=dict)  # cluster_id -> allocation
+    idle_gpus: Set[int] = field(default_factory=set)
+    planned_available_gpus: Set[int] = field(default_factory=set)
 
-    def get_or_create_pipeline(self, pipeline_id: str) -> PipelineRuntimeState:
-        state = self.pipelines.get(pipeline_id)
-        if state is None:
-            state = PipelineRuntimeState(pipeline_id=pipeline_id)
-            self.pipelines[pipeline_id] = state
-        return state
+    pending_completion_requests: Dict[str, PendingCompletionRequest] = field(default_factory=dict)  # cluster_id -> request
+    pending_planned_release_requests: Dict[str, PendingPlannedReleaseRequest] = field(default_factory=dict)  # cluster_id -> request
+
+    pipeline_registry: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # pipeline_id -> info
+
+    latest_progress_by_pipeline: Dict[str, ProgressReport] = field(default_factory=dict)
+
+    def pending_bucket(self, priority: Priority) -> List[PendingRequest]:
+        bucket = self.pending_requests.get(priority)
+        if bucket is None:
+            bucket = []
+            self.pending_requests[priority] = bucket
+        return bucket

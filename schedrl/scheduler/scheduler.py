@@ -1,18 +1,35 @@
 from __future__ import annotations
 
-"""SchedRL Scheduler (Phase 1).
+"""SchedRL Scheduler (ENG-123 Phase 2).
 
 Operational policy (ENG-123): fail-fast only. No recovery or rehydration is provided; on any
 scheduler restart, pipelines are expected to re-register and be re-admitted.
 """
 
+import asyncio
+import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from schedrl.protocol.request_id import validate_pipeline_id
-from schedrl.protocol.types import ProgressReport, ReleaseAck
-from schedrl.protocol.validation import validate_optional_timeout_s
+from schedrl.protocol.types import Priority, ProgressReport
+from schedrl.scheduler.resource_manager import get_or_create_resource_manager
 from schedrl.scheduler.state import SchedulerState
+from schedrl.scheduler.types import (
+    ClusterAllocation,
+    CompletionSuspensionOp,
+    ExecutionPlan,
+    PendingCompletionRequest,
+    PendingPlannedReleaseRequest,
+    PendingRequest,
+    Request,
+    SchedGuidedAllocationOp,
+    SchedGuidedShrinkOp,
+    SignalPendingAllocationOp,
+    is_generation_cluster,
+    parse_cluster_id,
+)
+from schedrl.scheduler.validation import ValidationInputs, normalize_progress_oldest_ts, validate_execution_plan
 
 
 def _require_ray():
@@ -22,89 +39,1132 @@ def _require_ray():
         raise RuntimeError("schedrl.scheduler requires ray") from e
 
 
+@dataclass(frozen=True, slots=True)
+class _GapRatioDPWorker:
+    pipeline_id: str
+    dp_rank: int
+    gpu_ids: List[int]
+
+
+@dataclass(slots=True)
+class _GapRatioPipelineState:
+    pipeline_id: str
+    cluster_id: str
+    remaining: float
+    percent_remaining: float
+    tp_size: int
+    active_dp_workers: List[_GapRatioDPWorker]
+    inactive_dp_workers: List[_GapRatioDPWorker]
+    target_ratio: float = 0.0
+    existing_ratio: float = 0.0
+    gap: float = 0.0
+    target_gpu_count: int = 0
+
+
 @dataclass(slots=True)
 class SchedulerImpl:
     def __post_init__(self):
         _require_ray()
         self._state = SchedulerState()
+        self._lock = asyncio.Lock()
+        self._wakeup_event = asyncio.Event()
+        self._topology_ready = asyncio.Event()
+        self._loop_task: Optional[asyncio.Task] = None
+        self._resource_manager = None
+        self._cycle_counter = 0
+        self._request_seq = 0
+        self._num_gpus: Optional[int] = None
 
     def register_pipeline(self, *, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
-        pipe = self._state.get_or_create_pipeline(pipeline_id)
-        pipe.registered = True
+        if pipeline_id not in self._state.pipeline_registry:
+            self._state.pipeline_registry[pipeline_id] = {
+                "namespace": "default",
+                "cluster_configs": {},
+                "scheduler_cache": {},
+                "group_queue_cache": {},
+            }
 
     def admit_pipeline(self, *, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
-        pipe = self._state.get_or_create_pipeline(pipeline_id)
-        if not pipe.registered:
+        if pipeline_id not in self._state.pipeline_registry:
             raise RuntimeError(f"Pipeline {pipeline_id!r} must be registered before admission")
-        pipe.admitted = True
 
-    def unregister_pipeline(self, *, pipeline_id: str) -> None:
+    async def unregister_pipeline(self, *, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
-        self._state.pipelines.pop(pipeline_id, None)
+        async with self._lock:
+            self._state.pipeline_registry.pop(pipeline_id, None)
+            self._state.latest_progress_by_pipeline.pop(pipeline_id, None)
 
-    def report_progress(self, report: ProgressReport) -> None:
+            active_cluster_ids = []
+            for cluster_id in list(self._state.active_allocations.keys()):
+                if cluster_id.startswith(f"{pipeline_id}_"):
+                    active_cluster_ids.append(cluster_id)
+
+            for cluster_id in active_cluster_ids:
+                alloc = self._state.active_allocations.pop(cluster_id, None)
+                if alloc is not None:
+                    self._state.idle_gpus |= set(alloc.gpu_ids)
+
+            for priority in Priority:
+                bucket = self._state.pending_bucket(priority)
+                remaining: List[PendingRequest] = []
+                for pending in bucket:
+                    if not pending.request.cluster_id.startswith(f"{pipeline_id}_"):
+                        remaining.append(pending)
+                        continue
+                    pending.error = f"Pipeline {pipeline_id!r} unregistered"
+                    pending.event.set()
+                bucket[:] = remaining
+
+            for cluster_id, req in list(self._state.pending_completion_requests.items()):
+                if not cluster_id.startswith(f"{pipeline_id}_"):
+                    continue
+                req.error = f"Pipeline {pipeline_id!r} unregistered"
+                req.event.set()
+                self._state.pending_completion_requests.pop(cluster_id, None)
+
+            for cluster_id, req in list(self._state.pending_planned_release_requests.items()):
+                if not cluster_id.startswith(f"{pipeline_id}_"):
+                    continue
+                req.error = f"Pipeline {pipeline_id!r} unregistered"
+                req.event.set()
+                self._state.pending_planned_release_requests.pop(cluster_id, None)
+
+            self._wakeup_event.set()
+
+    async def initialize(self, *, expected_num_gpus: int | None = None) -> None:
+        if self._topology_ready.is_set() and self._loop_task is not None:
+            return
+
+        _require_ray()
+        import ray
+
+        if self._resource_manager is None:
+            self._resource_manager = get_or_create_resource_manager()
+
+        snap = await self._resource_manager.snapshot.remote(
+            wait_timeout_s=10.0, poll_interval_s=0.2, expected_num_gpus=expected_num_gpus
+        )
+        num_gpus = int(snap.get("num_gpus", 0))
+        if num_gpus <= 0:
+            raise RuntimeError(f"ResourceManager reported num_gpus={num_gpus}, expected > 0")
+
+        async with self._lock:
+            self._state.idle_gpus = set(range(num_gpus))
+            self._num_gpus = num_gpus
+            self._topology_ready.set()
+            if self._loop_task is None:
+                self._loop_task = asyncio.create_task(self._central_scheduling_loop())
+
+    def _has_any_pending_request_locked(self, *, cluster_id: str) -> bool:
+        for priority in Priority:
+            for pending in self._state.pending_bucket(priority):
+                if pending.request.cluster_id == cluster_id:
+                    return True
+        return False
+
+    def _has_pending_request_locked(self, *, cluster_id: str, priority: Priority) -> bool:
+        return any(pending.request.cluster_id == cluster_id for pending in self._state.pending_bucket(priority))
+
+    async def register_pipeline_topology(
+        self,
+        *,
+        pipeline_id: str,
+        ray_namespace: str,
+        cluster_tp_configs: Dict[str, int],
+        cluster_device_mappings: Dict[str, List[int]],
+    ) -> None:
+        await self._topology_ready.wait()
+        validate_pipeline_id(pipeline_id)
+        if not isinstance(ray_namespace, str) or ray_namespace == "":
+            raise ValueError("ray_namespace must be non-empty str")
+        if not cluster_tp_configs:
+            raise ValueError("cluster_tp_configs must be non-empty")
+        if not cluster_device_mappings:
+            raise ValueError("cluster_device_mappings must be non-empty")
+        if set(cluster_tp_configs.keys()) != set(cluster_device_mappings.keys()):
+            missing_tp = sorted(set(cluster_device_mappings.keys()) - set(cluster_tp_configs.keys()))
+            missing_map = sorted(set(cluster_tp_configs.keys()) - set(cluster_device_mappings.keys()))
+            raise ValueError(f"cluster config mismatch: missing tp_size for {missing_tp}, missing device_mapping for {missing_map}")
+        if "actor_infer" not in cluster_tp_configs:
+            raise ValueError("actor_infer cluster must be registered")
+
+        cluster_configs: Dict[str, Dict[str, Any]] = {}
+        for cluster_name, tp_size_raw in cluster_tp_configs.items():
+            tp_size = int(tp_size_raw)
+            if tp_size <= 0:
+                raise ValueError(f"tp_size must be > 0 for cluster {cluster_name!r}, got {tp_size!r}")
+            device_mapping = list(cluster_device_mappings.get(cluster_name) or [])
+            if not device_mapping:
+                raise ValueError(f"device_mapping must be non-empty for cluster {cluster_name!r}")
+            num_gpus = self._num_gpus
+            if num_gpus is None or num_gpus <= 0:
+                raise RuntimeError("Scheduler GPU topology is not initialized (num_gpus unknown)")
+            for gpu in device_mapping:
+                if not isinstance(gpu, int):
+                    raise ValueError(f"device_mapping must be list[int], got {type(gpu).__name__} for cluster {cluster_name!r}")
+                if gpu < 0 or gpu >= num_gpus:
+                    raise ValueError(
+                        f"device_mapping GPU id out of range for cluster {cluster_name!r}: gpu={gpu} not in [0,{num_gpus - 1}]"
+                    )
+            if len(device_mapping) % tp_size != 0:
+                raise ValueError(
+                    f"cluster {cluster_name!r} has len(device_mapping)={len(device_mapping)} not divisible by tp_size={tp_size}"
+                )
+            is_gen = cluster_name == "actor_infer"
+            cfg: Dict[str, Any] = {"tp_size": tp_size, "is_generation": is_gen, "device_mapping": device_mapping}
+            if is_gen:
+                cfg["max_dp_workers"] = len(device_mapping) // tp_size
+            cluster_configs[cluster_name] = cfg
+
+        async with self._lock:
+            self._state.pipeline_registry[pipeline_id] = {
+                "namespace": ray_namespace,
+                "cluster_configs": cluster_configs,
+                "scheduler_cache": {},
+                "group_queue_cache": {},
+            }
+
+    async def get_pipeline_namespace(self, *, pipeline_id: str) -> str:
+        validate_pipeline_id(pipeline_id)
+        async with self._lock:
+            info = self._state.pipeline_registry.get(pipeline_id)
+            if info is None:
+                raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
+            ray_namespace = info.get("namespace")
+            if not isinstance(ray_namespace, str) or ray_namespace == "":
+                raise RuntimeError(f"pipeline_id {pipeline_id!r} has invalid registered namespace {ray_namespace!r}")
+            return ray_namespace
+
+    async def report_progress(self, report: ProgressReport) -> None:
         validate_pipeline_id(report.pipeline_id)
-        pipe = self._state.get_or_create_pipeline(report.pipeline_id)
-        if not pipe.admitted:
-            raise RuntimeError(f"Pipeline {report.pipeline_id!r} is not admitted")
-        pipe.last_progress_step_target = report.step_target_trajectories
+        if report.step_target_trajectories <= 0:
+            raise ValueError("step_target_trajectories must be > 0")
+        oldest_ts = normalize_progress_oldest_ts(report.oldest_unfinished_creation_ts, report.fifo_timestamp)
+        if report.oldest_unfinished_creation_ts is None and oldest_ts is not None:
+            report = ProgressReport(
+                pipeline_id=report.pipeline_id,
+                queued_trajectories=report.queued_trajectories,
+                inflight_trajectories=report.inflight_trajectories,
+                step_target_trajectories=report.step_target_trajectories,
+                percent_completed=report.percent_completed,
+                oldest_unfinished_creation_ts=oldest_ts,
+                active_base_version=report.active_base_version,
+                fifo_timestamp=report.fifo_timestamp,
+                metrics=report.metrics,
+            )
+        async with self._lock:
+            if report.pipeline_id not in self._state.pipeline_registry:
+                raise RuntimeError(f"pipeline_id {report.pipeline_id!r} not registered")
+            self._state.latest_progress_by_pipeline[report.pipeline_id] = report
+            self._wakeup_event.set()
 
-    def request_gpus(self, *, pipeline_id: str, gpu_ids: list[int], timeout_s: Optional[float] = None) -> None:
-        validate_pipeline_id(pipeline_id)
-        validate_optional_timeout_s(timeout_s)
-        pipe = self._state.get_or_create_pipeline(pipeline_id)
-        if not pipe.admitted:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} is not admitted")
-        if pipe.busy:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} is busy")
-        raise NotImplementedError("Phase 1 provides scheduler API skeleton only")
+    async def request_gpus(self, *, cluster_id: str, priority: Priority, global_step: Optional[int] = None) -> List[int]:
+        await self._topology_ready.wait()
+        event = asyncio.Event()
+        pending: PendingRequest | None = None
+        async with self._lock:
+            existing = self._state.active_allocations.get(cluster_id)
+            if existing is not None:
+                if priority == Priority.GENERATION and not existing.active_dp_ranks:
+                    pass
+                elif priority != Priority.GENERATION and not existing.gpu_ids:
+                    pass
+                else:
+                    return list(existing.gpu_ids)
+            if self._has_any_pending_request_locked(cluster_id=cluster_id):
+                raise RuntimeError(f"Duplicate pending request for cluster_id={cluster_id!r} is not supported")
+            self._request_seq += 1
+            pending = PendingRequest(
+                request=Request(cluster_id=cluster_id, priority=priority, timestamp=float(self._request_seq)),
+                event=event,
+                global_step=global_step,
+            )
+            self._state.pending_bucket(priority).append(pending)
+            self._wakeup_event.set()
+        await event.wait()
+        if pending is None:
+            raise RuntimeError("request_gpus internal error: pending request not created")
+        if pending.error is not None:
+            raise RuntimeError(pending.error)
+        return list(pending.result)
 
-    def release_gpus(self, *, pipeline_id: str, gpu_ids: list[int]) -> ReleaseAck:
-        validate_pipeline_id(pipeline_id)
-        pipe = self._state.get_or_create_pipeline(pipeline_id)
-        if not pipe.admitted:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} is not admitted")
-        if pipe.busy:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} is busy")
-        raise NotImplementedError("Phase 1 provides scheduler API skeleton only")
+    async def release_gpus(self, *, cluster_id: str, global_step: Optional[int] = None) -> None:
+        await self._topology_ready.wait()
+        async with self._lock:
+            alloc = self._state.active_allocations.pop(cluster_id, None)
+            if alloc is None:
+                raise RuntimeError(f"cluster_id {cluster_id!r} not found in active_allocations")
+            self._state.idle_gpus |= set(alloc.gpu_ids)
+            self._wakeup_event.set()
 
-    def release_and_request(
+    async def release_and_request_gpus(
         self,
         *,
-        pipeline_id: str,
-        release_gpu_ids: list[int],
-        request_gpu_ids: list[int],
-        timeout_s: Optional[float] = None,
-    ) -> ReleaseAck:
-        validate_pipeline_id(pipeline_id)
-        validate_optional_timeout_s(timeout_s)
-        pipe = self._state.get_or_create_pipeline(pipeline_id)
-        if not pipe.admitted:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} is not admitted")
-        if pipe.busy:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} is busy")
-        raise NotImplementedError("Phase 1 provides scheduler API skeleton only")
+        release_cluster_id: Optional[str],
+        release_global_step: Optional[int],
+        request_cluster_id: str,
+        request_priority: Priority,
+        request_global_step: Optional[int] = None,
+    ) -> List[int]:
+        await self._topology_ready.wait()
+        event = asyncio.Event()
+        pending: PendingRequest | None = None
+        async with self._lock:
+            if release_cluster_id is not None:
+                alloc = self._state.active_allocations.pop(release_cluster_id, None)
+                if alloc is None:
+                    raise RuntimeError(f"release_cluster_id {release_cluster_id!r} not found")
+                self._state.idle_gpus |= set(alloc.gpu_ids)
+            if self._has_any_pending_request_locked(cluster_id=request_cluster_id):
+                raise RuntimeError(f"Duplicate pending request for cluster_id={request_cluster_id!r} is not supported")
+            self._request_seq += 1
+            pending = PendingRequest(
+                request=Request(cluster_id=request_cluster_id, priority=request_priority, timestamp=float(self._request_seq)),
+                event=event,
+                global_step=request_global_step,
+            )
+            self._state.pending_bucket(request_priority).append(pending)
+            self._wakeup_event.set()
+        await event.wait()
+        if pending is None:
+            raise RuntimeError("release_and_request_gpus internal error: pending request not created")
+        if pending.error is not None:
+            raise RuntimeError(pending.error)
+        return list(pending.result)
 
-    def notify_ready_to_release(
+    def _signal_all_waiters_with_error(self, *, error: str) -> None:
+        for priority in Priority:
+            for pending in list(self._state.pending_bucket(priority)):
+                pending.error = error
+                pending.event.set()
+            self._state.pending_bucket(priority).clear()
+        for _, req in list(self._state.pending_completion_requests.items()):
+            req.error = error
+            req.event.set()
+        self._state.pending_completion_requests.clear()
+        for _, req in list(self._state.pending_planned_release_requests.items()):
+            req.error = error
+            req.event.set()
+        self._state.pending_planned_release_requests.clear()
+
+    async def notify_completion(
         self,
         *,
-        pipeline_id: str,
-        planned_release_gpu_ids: list[int],
+        cluster_id: str,
+        allocation_id: str,
+        global_step: Optional[int] = None,
         timeout_s: Optional[float] = None,
-    ) -> ReleaseAck:
-        validate_pipeline_id(pipeline_id)
-        validate_optional_timeout_s(timeout_s)
-        pipe = self._state.get_or_create_pipeline(pipeline_id)
-        if not pipe.admitted:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} is not admitted")
-        if pipe.busy:
-            raise RuntimeError(f"Pipeline {pipeline_id!r} is busy")
-        raise NotImplementedError("Phase 1 provides scheduler API skeleton only")
+    ) -> None:
+        await self._topology_ready.wait()
+        if not isinstance(allocation_id, str) or allocation_id == "":
+            raise ValueError("allocation_id must be non-empty str")
+        if timeout_s is not None and (not isinstance(timeout_s, (int, float)) or timeout_s <= 0):
+            raise ValueError(f"timeout_s must be > 0, got {timeout_s!r}")
+        async with self._lock:
+            existing = self._state.pending_completion_requests.get(cluster_id)
+            if existing is not None:
+                return
+            req = PendingCompletionRequest(
+                cluster_id=cluster_id,
+                allocation_id=allocation_id,
+                event=asyncio.Event(),
+                global_step=global_step,
+            )
+            self._state.pending_completion_requests[cluster_id] = req
+            self._wakeup_event.set()
+        try:
+            if timeout_s is None:
+                await req.event.wait()
+            else:
+                await asyncio.wait_for(req.event.wait(), timeout=float(timeout_s))
+        except asyncio.TimeoutError:
+            await self._fail_fast_shutdown(reason=f"notify_completion_timeout: cluster_id={cluster_id!r}")
+            raise
+        if req.error is not None:
+            raise RuntimeError(req.error)
+
+    async def _central_scheduling_loop(self) -> None:
+        while True:
+            await self._wakeup_event.wait()
+            self._wakeup_event.clear()
+            try:
+                await self.scheduling_cycle()
+            except Exception as e:
+                async with self._lock:
+                    self._signal_all_waiters_with_error(
+                        error=f"scheduler_loop_failed: {type(e).__name__}: {e}",
+                    )
+                await self._fail_fast_shutdown(reason=f"central_scheduling_loop_failed: {type(e).__name__}: {e}")
+                raise
+
+    async def scheduling_cycle(self) -> None:
+        await self._topology_ready.wait()
+        async with self._lock:
+            self._cycle_counter += 1
+            plan = ExecutionPlan()
+            planned_allocation_targets: Set[str] = set()
+
+            try:
+                planned_available_gpus = set(self._state.idle_gpus)
+
+                # Phase 0: completion notifications (generation only).
+                for cluster_id, req in list(self._state.pending_completion_requests.items()):
+                    alloc = self._state.active_allocations.get(cluster_id)
+                    if alloc is None:
+                        req.event.set()
+                        self._state.pending_completion_requests.pop(cluster_id, None)
+                        continue
+                    if alloc.priority != Priority.GENERATION:
+                        raise RuntimeError(f"notify_completion is only valid for GENERATION clusters, got {cluster_id!r}")
+                    dp_ranks = sorted(alloc.active_dp_ranks)
+                    if dp_ranks:
+                        freed: Set[int] = set()
+                        for dp_rank in dp_ranks:
+                            bundle = alloc.dp_rank_to_gpus.get(dp_rank)
+                            if bundle is not None:
+                                freed |= set(bundle)
+                                continue
+                            pipeline_id, _ = parse_cluster_id(cluster_id)
+                            infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
+                            tp_size = int(infer_cfg.get("tp_size", 1))
+                            device_mapping = list(infer_cfg.get("device_mapping") or [])
+                            start = dp_rank * tp_size
+                            freed |= set(device_mapping[start : start + tp_size])
+                        planned_available_gpus |= freed
+                    plan.completion_driven_suspension_ops.append(
+                        CompletionSuspensionOp(cluster_id=cluster_id, dp_ranks_to_remove=dp_ranks, allocation_id=req.allocation_id)
+                    )
+                    plan.clusters_to_remove.add(cluster_id)
+
+                # Phase 0.5: planned release requests (blocking release hint from pipeline/coordinator).
+                for cluster_id, req in list(self._state.pending_planned_release_requests.items()):
+                    if cluster_id in plan.clusters_to_remove:
+                        req.event.set()
+                        self._state.pending_planned_release_requests.pop(cluster_id, None)
+                        continue
+                    alloc = self._state.active_allocations.get(cluster_id)
+                    if alloc is None:
+                        raise RuntimeError(f"notify_ready_to_release for unknown cluster_id {cluster_id!r}")
+                    if alloc.priority != Priority.GENERATION:
+                        raise RuntimeError(f"notify_ready_to_release is only supported for GENERATION clusters, got {cluster_id!r}")
+                    if not req.dp_ranks_to_remove:
+                        req.result_released_gpu_ids = []
+                        req.event.set()
+                        self._state.pending_planned_release_requests.pop(cluster_id, None)
+                        continue
+                    # Make planned release GPUs available for planning in this cycle.
+                    freed: Set[int] = set()
+                    for dp_rank in req.dp_ranks_to_remove:
+                        bundle = alloc.dp_rank_to_gpus.get(dp_rank)
+                        if bundle is None:
+                            pipeline_id, _ = parse_cluster_id(cluster_id)
+                            infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
+                            tp_size = int(infer_cfg.get("tp_size", 1))
+                            device_mapping = list(infer_cfg.get("device_mapping") or [])
+                            start = dp_rank * tp_size
+                            bundle = device_mapping[start : start + tp_size]
+                        freed |= set(bundle or [])
+                    planned_available_gpus |= freed
+                    for existing in plan.sched_guided_shrink_ops:
+                        if existing.cluster_id != cluster_id:
+                            continue
+                        for dp_rank in req.dp_ranks_to_remove:
+                            if dp_rank not in existing.dp_ranks_to_remove:
+                                existing.dp_ranks_to_remove.append(dp_rank)
+                        break
+                    else:
+                        plan.sched_guided_shrink_ops.append(
+                            SchedGuidedShrinkOp(cluster_id=cluster_id, dp_ranks_to_remove=list(req.dp_ranks_to_remove))
+                        )
+
+                # Phase 2: non-generation planning (priorities 0-5).
+                non_gen_reserved_gpus: Set[int] = set()
+                for alloc in self._state.active_allocations.values():
+                    if alloc.priority != Priority.GENERATION:
+                        non_gen_reserved_gpus |= set(alloc.gpu_ids)
+
+                for prio_value in range(int(Priority.INITIALIZATION), int(Priority.GENERATION)):
+                    prio = Priority(prio_value)
+                    bucket = list(self._state.pending_bucket(prio))
+                    if not bucket:
+                        continue
+                    for pending in bucket:
+                        cluster_id = pending.request.cluster_id
+                        if cluster_id in planned_allocation_targets:
+                            raise RuntimeError(f"Duplicate pending allocation planned for cluster_id={cluster_id!r}")
+                        if cluster_id in self._state.active_allocations:
+                            continue
+                        _, cluster_name = parse_cluster_id(cluster_id)
+                        device_mapping = self._state.pipeline_registry.get(parse_cluster_id(cluster_id)[0], {}).get("cluster_configs", {}).get(cluster_name, {}).get("device_mapping")
+                        if device_mapping is None:
+                            raise RuntimeError(f"Unknown cluster_id {cluster_id!r}; register_pipeline_topology must run first")
+                        needed = set(device_mapping)
+                        missing = needed - planned_available_gpus
+                        if missing:
+                            # Try to free by shrinking generation donors that hold missing GPUs.
+                            for donor_cid, donor_alloc in list(self._state.active_allocations.items()):
+                                if donor_alloc.priority != Priority.GENERATION:
+                                    continue
+                                if donor_cid in plan.clusters_to_remove:
+                                    continue
+                                if not (set(donor_alloc.gpu_ids) & missing):
+                                    continue
+                                tp_size = int(
+                                    self._state.pipeline_registry[parse_cluster_id(donor_cid)[0]]["cluster_configs"]["actor_infer"]["tp_size"]
+                                )
+                                active_ranks = sorted(donor_alloc.active_dp_ranks)
+                                for dp_rank in active_ranks:
+                                    bundle = set(donor_alloc.dp_rank_to_gpus.get(dp_rank) or [])
+                                    if not (bundle & missing):
+                                        continue
+                                    for existing in plan.sched_guided_shrink_ops:
+                                        if existing.cluster_id != donor_cid:
+                                            continue
+                                        if dp_rank not in existing.dp_ranks_to_remove:
+                                            existing.dp_ranks_to_remove.append(dp_rank)
+                                        break
+                                    else:
+                                        plan.sched_guided_shrink_ops.append(
+                                            SchedGuidedShrinkOp(cluster_id=donor_cid, dp_ranks_to_remove=[dp_rank])
+                                        )
+                                    planned_available_gpus |= bundle
+                                    missing -= bundle
+                                    if not missing:
+                                        break
+                                if not missing:
+                                    break
+                        if needed.issubset(planned_available_gpus):
+                            planned_available_gpus -= needed
+                            non_gen_reserved_gpus |= needed
+                            planned_allocation_targets.add(cluster_id)
+                            plan.signal_pending_allocation_ops.append(
+                                SignalPendingAllocationOp(cluster_id=cluster_id, gpus_to_allocate=sorted(needed), priority=prio)
+                            )
+
+                # Phase 3: generation gap-ratio planning.
+                planned_available_gpus -= non_gen_reserved_gpus
+
+                # Unblock pending generation requests if there are already active workers (no allocation needed).
+                pending_gen = list(self._state.pending_bucket(Priority.GENERATION))
+                for pending in pending_gen:
+                    cluster_id = pending.request.cluster_id
+                    alloc = self._state.active_allocations.get(cluster_id)
+                    if alloc is None:
+                        continue
+                    if alloc.priority != Priority.GENERATION:
+                        continue
+                    if alloc.active_dp_ranks:
+                        plan.signal_pending_allocation_ops.append(
+                            SignalPendingAllocationOp(
+                                cluster_id=cluster_id,
+                                gpus_to_allocate=[],
+                                priority=Priority.GENERATION,
+                            )
+                        )
+
+                active_dp_workers, inactive_dp_workers, idle_for_gen = self._snapshot_generation_dp_workers(
+                    plan=plan, idle_gpus=set(planned_available_gpus)
+                )
+                idle_for_gen = self._plan_generation_gap_ratio(
+                    plan,
+                    active_dp_workers=active_dp_workers,
+                    inactive_dp_workers=inactive_dp_workers,
+                    non_gen_reserved_gpus=set(non_gen_reserved_gpus),
+                    idle_gpus=idle_for_gen,
+                )
+
+                # Phase 4: validation
+                validate_execution_plan(
+                    plan,
+                    inputs=ValidationInputs(
+                        pipeline_registry=self._state.pipeline_registry,
+                        active_allocations=self._state.active_allocations,
+                        idle_gpus=set(self._state.idle_gpus),
+                    ),
+                )
+
+                # Phase 5/6: execute + commit (Phase 2 simulation: state-only).
+                self._apply_plan_and_signal(plan)
+
+            except Exception as e:
+                # Fail-fast rule (Issue 107): any execution-phase failure triggers controlled shutdown.
+                await self._fail_fast_shutdown(reason=f"scheduler_cycle_failed: {type(e).__name__}: {e}")
+                raise
 
     def get_debug_state(self) -> Any:
         return self._state
+
+    async def _fail_fast_shutdown(self, *, reason: str) -> None:
+        _require_ray()
+        import ray
+
+        try:
+            orchestrator = ray.get_actor("schedrl:orchestrator", namespace="schedrl")
+        except Exception:
+            return
+        try:
+            orchestrator.shutdown.remote(force=True, reason=reason, source="scheduler")
+        except Exception:
+            return
+
+    def _snapshot_generation_dp_workers(
+        self, *, plan: ExecutionPlan, idle_gpus: Set[int]
+    ) -> Tuple[Dict[str, List[_GapRatioDPWorker]], Dict[str, List[_GapRatioDPWorker]], Set[int]]:
+        active_dp_workers: Dict[str, List[_GapRatioDPWorker]] = {}
+        inactive_dp_workers: Dict[str, List[_GapRatioDPWorker]] = {}
+
+        planned_removed_ranks: Dict[str, Set[int]] = {}
+        for pipeline_id in self._state.pipeline_registry:
+            cluster_id = f"{pipeline_id}_actor_infer"
+            planned_removed_ranks[cluster_id] = set()
+        for op in plan.completion_driven_suspension_ops:
+            if not is_generation_cluster(op.cluster_id):
+                continue
+            planned_removed_ranks.setdefault(op.cluster_id, set()).update(op.dp_ranks_to_remove)
+        for op in plan.sched_guided_shrink_ops:
+            if not is_generation_cluster(op.cluster_id):
+                continue
+            planned_removed_ranks.setdefault(op.cluster_id, set()).update(op.dp_ranks_to_remove)
+
+        non_gen_reserved_gpus: Set[int] = set()
+        for cluster_id, alloc in self._state.active_allocations.items():
+            if alloc.priority != Priority.GENERATION:
+                non_gen_reserved_gpus |= set(alloc.gpu_ids)
+
+        for pipeline_id, pipeline_info in self._state.pipeline_registry.items():
+            cluster_configs = pipeline_info.get("cluster_configs") or {}
+            infer_cfg = cluster_configs.get("actor_infer")
+            if infer_cfg is None:
+                continue
+            tp_size = int(infer_cfg.get("tp_size", 1))
+            device_mapping = list(infer_cfg.get("device_mapping") or [])
+            if tp_size <= 0 or not device_mapping:
+                continue
+
+            cluster_id = f"{pipeline_id}_actor_infer"
+            all_dp_ranks = list(range(len(device_mapping) // tp_size))
+            removed_ranks = planned_removed_ranks.get(cluster_id, set())
+
+            current_active_ranks: Set[int] = set()
+            if cluster_id in self._state.active_allocations:
+                alloc = self._state.active_allocations[cluster_id]
+                if alloc.priority == Priority.GENERATION:
+                    current_active_ranks = set(alloc.active_dp_ranks)
+
+            effective_active_ranks = current_active_ranks - removed_ranks
+            active_list: List[_GapRatioDPWorker] = []
+            for dp_rank in sorted(effective_active_ranks):
+                start_idx = dp_rank * tp_size
+                gpus = device_mapping[start_idx : start_idx + tp_size]
+                active_list.append(_GapRatioDPWorker(pipeline_id=pipeline_id, dp_rank=dp_rank, gpu_ids=list(gpus)))
+
+            inactive_list: List[_GapRatioDPWorker] = []
+            for dp_rank in all_dp_ranks:
+                if dp_rank in effective_active_ranks:
+                    continue
+                start_idx = dp_rank * tp_size
+                gpus = device_mapping[start_idx : start_idx + tp_size]
+                inactive_list.append(_GapRatioDPWorker(pipeline_id=pipeline_id, dp_rank=dp_rank, gpu_ids=list(gpus)))
+
+            active_dp_workers[pipeline_id] = active_list
+            inactive_dp_workers[pipeline_id] = inactive_list
+
+        assert idle_gpus.isdisjoint(non_gen_reserved_gpus), "idle_gpus must exclude non-GEN reserved GPUs"
+        return active_dp_workers, inactive_dp_workers, idle_gpus
+
+    def _has_pending_generation_request(self, cluster_id: str) -> bool:
+        return any(p.request.cluster_id == cluster_id for p in self._state.pending_bucket(Priority.GENERATION))
+
+    def _plan_generation_gap_ratio(
+        self,
+        plan: ExecutionPlan,
+        *,
+        active_dp_workers: Dict[str, List[_GapRatioDPWorker]],
+        inactive_dp_workers: Dict[str, List[_GapRatioDPWorker]],
+        non_gen_reserved_gpus: Set[int],
+        idle_gpus: Set[int],
+        epsilon: float = 0.0,
+    ) -> Set[int]:
+        # Ported from ROLL_multi_pipeline CentralizedGPUSchedulerImpl._plan_generation_gap_ratio_alternative,
+        # adapted to SchedRL-standard progress reporting (percent_completed / step_target_trajectories).
+        import math
+        from collections import defaultdict
+
+        def _round_half_up(value: float) -> int:
+            return int(math.floor(value + 0.5))
+
+        def _remove_worker(worker: _GapRatioDPWorker) -> None:
+            donor_pipeline_id = worker.pipeline_id
+            donor_active = active_dp_workers.setdefault(donor_pipeline_id, [])
+            donor_active[:] = [w for w in donor_active if w.dp_rank != worker.dp_rank]
+            inactive_dp_workers.setdefault(donor_pipeline_id, []).append(worker)
+
+        def _append_shrink_dp_rank(*, cluster_id: str, dp_rank: int) -> None:
+            for op in plan.sched_guided_shrink_ops:
+                if op.cluster_id == cluster_id:
+                    if dp_rank not in op.dp_ranks_to_remove:
+                        op.dp_ranks_to_remove.append(dp_rank)
+                    return
+            plan.sched_guided_shrink_ops.append(SchedGuidedShrinkOp(cluster_id=cluster_id, dp_ranks_to_remove=[dp_rank]))
+
+        def _receiver_eligible(state: _GapRatioPipelineState) -> bool:
+            if state.cluster_id in plan.clusters_to_remove:
+                return False
+            if self._has_pending_generation_request(state.cluster_id):
+                return True
+            return bool(state.active_dp_workers) or state.cluster_id in self._state.active_allocations
+
+        pipeline_states: List[_GapRatioPipelineState] = []
+        for pipeline_id in self._state.pipeline_registry:
+            cluster_id = f"{pipeline_id}_actor_infer"
+            progress = self._state.latest_progress_by_pipeline.get(pipeline_id)
+            if progress is None:
+                continue
+            infer_cfg = self._state.pipeline_registry[pipeline_id].get("cluster_configs", {}).get("actor_infer")
+            if infer_cfg is None:
+                raise KeyError(f"pipeline_id={pipeline_id!r} missing actor_infer cluster config")
+            tp_size = int(infer_cfg.get("tp_size", 1))
+            if tp_size <= 0:
+                raise ValueError(f"pipeline_id={pipeline_id!r} has invalid actor_infer tp_size={tp_size}")
+
+            step_target = float(progress.step_target_trajectories)
+            percent_completed = float(progress.percent_completed)
+            remaining = max(step_target * (1.0 - percent_completed), 0.0)
+            percent_remaining = 0.0 if step_target <= 0 else remaining / step_target
+
+            has_pending = self._has_pending_generation_request(cluster_id)
+            if has_pending:
+                remaining += step_target
+                percent_remaining = remaining / step_target if step_target > 0 else 0.0
+
+            active_list = active_dp_workers.setdefault(pipeline_id, [])
+            inactive_list = inactive_dp_workers.setdefault(pipeline_id, [])
+            pipeline_states.append(
+                _GapRatioPipelineState(
+                    pipeline_id=pipeline_id,
+                    cluster_id=cluster_id,
+                    remaining=remaining,
+                    percent_remaining=percent_remaining,
+                    tp_size=tp_size,
+                    active_dp_workers=active_list,
+                    inactive_dp_workers=inactive_list,
+                )
+            )
+
+        assert idle_gpus.isdisjoint(non_gen_reserved_gpus), "idle_gpus must exclude non-GEN reserved GPUs"
+
+        protected: Set[Tuple[str, int]] = set()
+        for op in plan.completion_driven_suspension_ops:
+            pipeline_id, cluster_name = parse_cluster_id(op.cluster_id)
+            if cluster_name != "actor_infer":
+                continue
+            for dp_rank in op.dp_ranks_to_remove:
+                protected.add((pipeline_id, dp_rank))
+        for op in plan.sched_guided_shrink_ops:
+            pipeline_id, cluster_name = parse_cluster_id(op.cluster_id)
+            if cluster_name != "actor_infer":
+                continue
+            for dp_rank in op.dp_ranks_to_remove:
+                protected.add((pipeline_id, dp_rank))
+
+        eligible_for_target = [p for p in pipeline_states if _receiver_eligible(p)]
+        total_target_weight = sum(p.remaining * p.tp_size for p in eligible_for_target)
+        total_gen_budget_gpus = len(idle_gpus) + sum(len(p.active_dp_workers) * p.tp_size for p in pipeline_states)
+        if total_gen_budget_gpus == 0:
+            return idle_gpus
+
+        for p in pipeline_states:
+            if not _receiver_eligible(p) or total_target_weight == 0:
+                p.target_ratio = 0.0
+                p.target_gpu_count = 0
+            else:
+                p.target_ratio = (p.remaining * p.tp_size) / total_target_weight
+                raw_target_bundles = (p.target_ratio * total_gen_budget_gpus) / p.tp_size
+                rounded_bundles = _round_half_up(raw_target_bundles)
+                p.target_gpu_count = max(rounded_bundles * p.tp_size, p.tp_size)
+
+        def _update_gaps() -> None:
+            for state in pipeline_states:
+                active_gpus = len(state.active_dp_workers) * state.tp_size
+                state.existing_ratio = 0.0 if total_gen_budget_gpus == 0 else active_gpus / total_gen_budget_gpus
+                state.gap = state.target_ratio - state.existing_ratio
+
+        def _compute_shrink_budget_by_pipeline_id() -> Dict[str, int]:
+            shrink_budget: Dict[str, int] = {}
+            for state in pipeline_states:
+                if state.cluster_id in plan.clusters_to_remove:
+                    min_bundles = 0
+                elif _receiver_eligible(state):
+                    min_bundles = max(1, state.target_gpu_count // state.tp_size)
+                else:
+                    min_bundles = 0
+                shrink_budget[state.pipeline_id] = max(0, len(state.active_dp_workers) - min_bundles)
+            return shrink_budget
+
+        def _try_activate_one(
+            state: _GapRatioPipelineState,
+            *,
+            shrink_budget_by_pipeline_id: Dict[str, int],
+            percent_remaining_by_pipeline_id: Dict[str, float],
+        ) -> bool:
+            nonlocal idle_gpus, activations
+
+            if state.cluster_id in plan.clusters_to_remove:
+                return False
+
+            available_inactive = [w for w in state.inactive_dp_workers if (state.pipeline_id, w.dp_rank) not in protected]
+            if not available_inactive:
+                return False
+
+            candidates: List[Tuple[_GapRatioDPWorker, List[Tuple[float, _GapRatioDPWorker, Set[int]]], Tuple[int, Tuple[float, ...], int]]] = []
+            for inactive in sorted(available_inactive, key=lambda w: w.dp_rank):
+                needed_bundle = set(inactive.gpu_ids)
+                if needed_bundle & non_gen_reserved_gpus:
+                    continue
+
+                missing = needed_bundle - idle_gpus
+                donor_plan: List[Tuple[float, _GapRatioDPWorker, Set[int]]] = []
+
+                if missing:
+                    donors: List[Tuple[float, _GapRatioDPWorker, Set[int]]] = []
+                    for donor_state in sorted(pipeline_states, key=lambda x: x.gap):
+                        if donor_state.gap >= -epsilon:
+                            continue
+                        if shrink_budget_by_pipeline_id[donor_state.pipeline_id] <= 0:
+                            continue
+                        for worker in donor_state.active_dp_workers:
+                            if (worker.pipeline_id, worker.dp_rank) in protected:
+                                continue
+                            worker_bundle = set(worker.gpu_ids)
+                            if not (worker_bundle & missing):
+                                continue
+                            donors.append((donor_state.gap, worker, worker_bundle))
+
+                    planned_shrinks_per_pipeline_id: Dict[str, int] = defaultdict(int)
+                    picked: List[Tuple[float, _GapRatioDPWorker, Set[int]]] = []
+                    for gap_value, worker, worker_bundle in donors:
+                        if not missing:
+                            break
+                        if planned_shrinks_per_pipeline_id[worker.pipeline_id] >= shrink_budget_by_pipeline_id[worker.pipeline_id]:
+                            continue
+                        picked.append((gap_value, worker, worker_bundle))
+                        planned_shrinks_per_pipeline_id[worker.pipeline_id] += 1
+                        missing -= worker_bundle
+
+                    if missing:
+                        continue
+                    donor_plan.extend(picked)
+
+                needs_shrink = 0 if not donor_plan else 1
+                donor_percents = sorted([percent_remaining_by_pipeline_id[donor_worker.pipeline_id] for _, donor_worker, _ in donor_plan])
+                score = (needs_shrink, tuple([-p for p in donor_percents]), inactive.dp_rank)
+                candidates.append((inactive, donor_plan, score))
+
+            if not candidates:
+                return False
+
+            inactive, donor_plan, _ = sorted(candidates, key=lambda c: c[2])[0]
+            needed_bundle = set(inactive.gpu_ids)
+            if needed_bundle & non_gen_reserved_gpus:
+                return False
+
+            planned_available = set(idle_gpus)
+            for _, _, donor_gpus in donor_plan:
+                planned_available |= set(donor_gpus)
+            if not needed_bundle.issubset(planned_available):
+                return False
+
+            new_idle_gpus = planned_available - needed_bundle
+
+            for _, donor_worker, _ in donor_plan:
+                _append_shrink_dp_rank(cluster_id=f"{donor_worker.pipeline_id}_actor_infer", dp_rank=donor_worker.dp_rank)
+                _remove_worker(donor_worker)
+                protected.add((donor_worker.pipeline_id, donor_worker.dp_rank))
+
+            has_pending_request = self._has_pending_generation_request(state.cluster_id)
+            if not has_pending_request and state.cluster_id not in self._state.active_allocations:
+                return False
+            if state.cluster_id in plan.clusters_to_remove:
+                return False
+            plan.sched_guided_allocation_ops.append(
+                SchedGuidedAllocationOp(
+                    cluster_id=state.cluster_id,
+                    dp_ranks_to_add=[inactive.dp_rank],
+                    gpus_to_allocate=sorted(needed_bundle),
+                    has_pending_request=has_pending_request,
+                )
+            )
+            active_dp_workers.setdefault(state.pipeline_id, []).append(inactive)
+            receiver_inactive = inactive_dp_workers.setdefault(state.pipeline_id, [])
+            receiver_inactive[:] = [w for w in receiver_inactive if w.dp_rank != inactive.dp_rank]
+            protected.add((state.pipeline_id, inactive.dp_rank))
+            activations += 1
+            idle_gpus = new_idle_gpus
+            return True
+
+        iterations = 0
+        activations = 0
+        while True:
+            iterations += 1
+            if iterations > 10_000 or activations > 1_000:
+                raise RuntimeError("gap_ratio_generation_planning_exceeded_limits")
+
+            _update_gaps()
+            percent_remaining_by_pipeline_id = {s.pipeline_id: s.percent_remaining for s in pipeline_states}
+            shrink_budget_by_pipeline_id = _compute_shrink_budget_by_pipeline_id()
+
+            def _normalized_gap(state: _GapRatioPipelineState) -> Optional[float]:
+                if state.target_ratio <= 0:
+                    return None
+                return state.gap / state.target_ratio
+
+            acceptors: List[_GapRatioPipelineState] = [
+                p
+                for p in pipeline_states
+                if p.gap > epsilon and _receiver_eligible(p) and (len(p.active_dp_workers) * p.tp_size) < p.target_gpu_count
+            ]
+            acceptors_with_norm_gap = [(_normalized_gap(p), p) for p in acceptors]
+            acceptors_with_norm_gap = [(ng, p) for ng, p in acceptors_with_norm_gap if ng is not None]
+            acceptors = [p for _, p in sorted(acceptors_with_norm_gap, key=lambda x: (-x[0], -x[1].gap, x[1].pipeline_id))]
+            if not acceptors:
+                break
+
+            any_activation = False
+            for acceptor in acceptors:
+                if _try_activate_one(
+                    acceptor,
+                    shrink_budget_by_pipeline_id=shrink_budget_by_pipeline_id,
+                    percent_remaining_by_pipeline_id=percent_remaining_by_pipeline_id,
+                ):
+                    any_activation = True
+                    break
+
+            if not any_activation:
+                break
+
+        return idle_gpus
+
+    def _apply_plan_and_signal(self, plan: ExecutionPlan) -> None:
+        def _reconstruct_bundle(*, cluster_id: str, dp_rank: int) -> Set[int]:
+            pipeline_id, cluster_name = parse_cluster_id(cluster_id)
+            if cluster_name != "actor_infer":
+                return set()
+            infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
+            tp_size = int(infer_cfg.get("tp_size", 1))
+            device_mapping = list(infer_cfg.get("device_mapping") or [])
+            start = dp_rank * tp_size
+            return set(device_mapping[start : start + tp_size])
+
+        # Apply shrinks (state-only for Phase 2).
+        for op in plan.completion_driven_suspension_ops:
+            if not op.dp_ranks_to_remove:
+                continue
+            alloc = self._state.active_allocations.get(op.cluster_id)
+            if alloc is None:
+                continue
+            for dp_rank in op.dp_ranks_to_remove:
+                bundle = set(alloc.dp_rank_to_gpus.get(dp_rank) or [])
+                if not bundle:
+                    bundle = _reconstruct_bundle(cluster_id=op.cluster_id, dp_rank=dp_rank)
+                alloc.active_dp_ranks.discard(dp_rank)
+                alloc.dp_rank_to_gpus.pop(dp_rank, None)
+                alloc.gpu_ids = [g for g in alloc.gpu_ids if g not in bundle]
+                self._state.idle_gpus |= bundle
+
+        for op in plan.sched_guided_shrink_ops:
+            if not op.dp_ranks_to_remove:
+                continue
+            alloc = self._state.active_allocations.get(op.cluster_id)
+            if alloc is None:
+                continue
+            for dp_rank in op.dp_ranks_to_remove:
+                bundle = set(alloc.dp_rank_to_gpus.get(dp_rank) or [])
+                if not bundle:
+                    bundle = _reconstruct_bundle(cluster_id=op.cluster_id, dp_rank=dp_rank)
+                alloc.active_dp_ranks.discard(dp_rank)
+                alloc.dp_rank_to_gpus.pop(dp_rank, None)
+                alloc.gpu_ids = [g for g in alloc.gpu_ids if g not in bundle]
+                self._state.idle_gpus |= bundle
+
+        for cluster_id in plan.clusters_to_remove:
+            alloc = self._state.active_allocations.pop(cluster_id, None)
+            if alloc is not None:
+                self._state.idle_gpus |= set(alloc.gpu_ids)
+
+        # Apply allocations.
+        for op in plan.signal_pending_allocation_ops:
+            if not op.gpus_to_allocate:
+                if op.priority is None:
+                    raise RuntimeError(f"signal_pending_allocation_ops missing priority for cluster_id={op.cluster_id!r}")
+                self._signal_pending_request(cluster_id=op.cluster_id, priority=Priority(op.priority), result=[])
+                continue
+            if op.priority is None:
+                raise RuntimeError(f"signal_pending_allocation_ops missing priority for cluster_id={op.cluster_id!r}")
+            priority = Priority(op.priority)
+            if not self._has_pending_request_locked(cluster_id=op.cluster_id, priority=priority):
+                raise RuntimeError(f"Planned allocation has no pending waiter: cluster_id={op.cluster_id!r} priority={priority!r}")
+            gpu_set = set(op.gpus_to_allocate)
+            self._state.idle_gpus -= gpu_set
+            pipeline_id, cluster_name = parse_cluster_id(op.cluster_id)
+            tp_size = int(self._state.pipeline_registry[pipeline_id]["cluster_configs"][cluster_name].get("tp_size", 1))
+            dp_rank_to_gpus = {}
+            if tp_size > 0:
+                sorted_gpus = sorted(op.gpus_to_allocate)
+                for i in range(0, len(sorted_gpus), tp_size):
+                    dp_rank_to_gpus[i // tp_size] = sorted_gpus[i : i + tp_size]
+            active_dp_ranks = set(dp_rank_to_gpus.keys()) if is_generation_cluster(op.cluster_id) else set()
+            self._state.active_allocations[op.cluster_id] = ClusterAllocation(
+                cluster_id=op.cluster_id,
+                gpu_ids=sorted(op.gpus_to_allocate),
+                priority=priority,
+                active_dp_ranks=active_dp_ranks,
+                dp_rank_to_gpus=dp_rank_to_gpus,
+            )
+            self._signal_pending_request(cluster_id=op.cluster_id, priority=priority, result=sorted(op.gpus_to_allocate))
+
+        # Apply expansions (state-only).
+        for op in plan.sched_guided_allocation_ops:
+            if not op.gpus_to_allocate:
+                continue
+            if op.has_pending_request and not self._has_pending_request_locked(cluster_id=op.cluster_id, priority=Priority.GENERATION):
+                raise RuntimeError(f"Planned expansion has no pending waiter: cluster_id={op.cluster_id!r} priority=GENERATION")
+            gpu_set = set(op.gpus_to_allocate)
+            self._state.idle_gpus -= gpu_set
+            alloc = self._state.active_allocations.get(op.cluster_id)
+            if alloc is None:
+                alloc = ClusterAllocation(cluster_id=op.cluster_id, gpu_ids=[], priority=Priority.GENERATION)
+                self._state.active_allocations[op.cluster_id] = alloc
+            pipeline_id, _ = parse_cluster_id(op.cluster_id)
+            tp_size = int(self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"].get("tp_size", 1))
+            sorted_needed = sorted(op.gpus_to_allocate)
+            for i, dp_rank in enumerate(sorted(op.dp_ranks_to_add)):
+                alloc.dp_rank_to_gpus[dp_rank] = sorted_needed[i * tp_size : (i + 1) * tp_size]
+                alloc.active_dp_ranks.add(dp_rank)
+            alloc.gpu_ids = sorted(set(alloc.gpu_ids) | gpu_set)
+            if op.has_pending_request:
+                self._signal_pending_request(cluster_id=op.cluster_id, priority=Priority.GENERATION, result=sorted(op.gpus_to_allocate))
+
+        # Completion requests: signal completion events and clear.
+        for cluster_id, req in list(self._state.pending_completion_requests.items()):
+            if cluster_id in plan.clusters_to_remove or cluster_id not in self._state.active_allocations:
+                req.event.set()
+                self._state.pending_completion_requests.pop(cluster_id, None)
+
+        # Planned release requests: signal after shrink commit.
+        for cluster_id, req in list(self._state.pending_planned_release_requests.items()):
+            # If the cluster still exists, we assume shrink commit applied.
+            req.event.set()
+            self._state.pending_planned_release_requests.pop(cluster_id, None)
+
+    def _signal_pending_request(self, *, cluster_id: str, priority: Priority, result: Optional[List[int]] = None) -> None:
+        bucket = self._state.pending_bucket(priority)
+        for idx, pending in enumerate(bucket):
+            if pending.request.cluster_id != cluster_id:
+                continue
+            bucket.pop(idx)
+            pending.result = list(result or [])
+            pending.event.set()
+            return
+        raise RuntimeError(f"No pending request found for cluster_id={cluster_id!r} priority={priority!r}")
+
+    async def notify_ready_to_release(
+        self,
+        *,
+        pipeline_id: Optional[str] = None,
+        cluster_id: Optional[str] = None,
+        global_step: Optional[int] = None,
+        timeout_s: Optional[float] = None,
+        planned_release_gpu_ids: Optional[List[int]] = None,
+    ) -> List[int]:
+        """Blocking planned release API (SchedRL checklist).
+
+        Phase 2 implementation is state-only: we translate planned_release_gpu_ids into dp_ranks_to_remove for the
+        generation cluster and block until the scheduler commits a shrink in its next cycle.
+        """
+
+        await self._topology_ready.wait()
+        if (pipeline_id is None) == (cluster_id is None):
+            raise ValueError("Exactly one of pipeline_id or cluster_id must be provided")
+        if cluster_id is None:
+            validate_pipeline_id(str(pipeline_id))
+            cluster_id = f"{pipeline_id}_actor_infer"
+        if not isinstance(planned_release_gpu_ids, list) or not planned_release_gpu_ids:
+            raise ValueError("planned_release_gpu_ids must be a non-empty list[int]")
+        for gpu in planned_release_gpu_ids:
+            if not isinstance(gpu, int) or gpu < 0:
+                raise ValueError(f"planned_release_gpu_ids must be list[int>=0], got {gpu!r}")
+        if timeout_s is not None and (not isinstance(timeout_s, (int, float)) or timeout_s <= 0):
+            raise ValueError(f"timeout_s must be > 0, got {timeout_s!r}")
+
+        event = asyncio.Event()
+        async with self._lock:
+            alloc = self._state.active_allocations.get(cluster_id)
+            if alloc is None:
+                raise RuntimeError(f"cluster_id {cluster_id!r} not found in active_allocations")
+            if alloc.priority != Priority.GENERATION:
+                raise RuntimeError(f"notify_ready_to_release only supports GENERATION clusters, got {cluster_id!r}")
+
+            # Idempotency: if already pending, wait on the existing request.
+            existing = self._state.pending_planned_release_requests.get(cluster_id)
+            if existing is not None:
+                event = existing.event
+                req = existing
+            else:
+                pipeline_id, cluster_name = parse_cluster_id(cluster_id)
+                if cluster_name != "actor_infer":
+                    raise RuntimeError(f"notify_ready_to_release only supports actor_infer generation clusters, got {cluster_id!r}")
+                infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
+                tp_size = int(infer_cfg.get("tp_size", 1))
+                if tp_size <= 0:
+                    raise RuntimeError(f"Invalid tp_size={tp_size} for cluster_id {cluster_id!r}")
+                device_mapping = list(infer_cfg.get("device_mapping") or [])
+                if not device_mapping:
+                    raise RuntimeError(f"Missing device_mapping for cluster_id {cluster_id!r}")
+
+                planned_set = set(planned_release_gpu_ids)
+                dp_ranks_to_remove: List[int] = []
+                released_gpu_ids: List[int] = []
+                for dp_rank in sorted(alloc.active_dp_ranks):
+                    bundle = alloc.dp_rank_to_gpus.get(dp_rank)
+                    if bundle is None:
+                        start = dp_rank * tp_size
+                        bundle = device_mapping[start : start + tp_size]
+                    bundle_set = set(bundle)
+                    if bundle_set and bundle_set.issubset(planned_set):
+                        dp_ranks_to_remove.append(dp_rank)
+                        released_gpu_ids.extend(list(bundle))
+
+                if not dp_ranks_to_remove:
+                    raise RuntimeError(
+                        "planned_release_gpu_ids does not correspond to any active dp-rank bundles; "
+                        f"cluster_id={cluster_id!r}, planned_release_gpu_ids={sorted(planned_set)!r}, active_dp_ranks={sorted(alloc.active_dp_ranks)!r}"
+                    )
+
+                req = PendingPlannedReleaseRequest(
+                    cluster_id=cluster_id,
+                    planned_release_gpu_ids=list(planned_release_gpu_ids),
+                    dp_ranks_to_remove=dp_ranks_to_remove,
+                    event=event,
+                    global_step=global_step,
+                )
+                req.result_released_gpu_ids = sorted(set(released_gpu_ids))
+                self._state.pending_planned_release_requests[cluster_id] = req
+                self._wakeup_event.set()
+
+        try:
+            if timeout_s is None:
+                await event.wait()
+            else:
+                await asyncio.wait_for(event.wait(), timeout=float(timeout_s))
+        except asyncio.TimeoutError:
+            await self._fail_fast_shutdown(reason=f"notify_ready_to_release_timeout: cluster_id={cluster_id!r}")
+            raise
+        if req.error is not None:
+            raise RuntimeError(req.error)
+
+        return list(req.result_released_gpu_ids)
 
 
 def scheduler_actor_class():
