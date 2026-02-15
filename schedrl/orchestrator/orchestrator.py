@@ -11,8 +11,11 @@ from typing import Any, Dict, Optional
 
 from schedrl.protocol.request_id import validate_pipeline_id
 from schedrl.protocol.validation import RegisterValidationInput, validate_register_pipeline
+from schedrl.scheduler.resource_manager import get_or_create_resource_manager
+from schedrl.scheduler.scheduler import scheduler_actor_class
 from schedrl.utils.ray_head import get_head_node_id
 from schedrl.utils.ray_head import head_node_affinity_strategy
+import ray
 
 SCHEDRL_NAMESPACE = "schedrl"
 ORCHESTRATOR_ACTOR_NAME = "schedrl:orchestrator"
@@ -42,25 +45,12 @@ def _ray_cli_path() -> str:
     return str(python_bin_dir / "ray")
 
 
-def _require_ray():
-    try:
-        import ray  # noqa: F401
-    except Exception as e:
-        raise RuntimeError("schedrl.orchestrator requires ray") from e
-
-
 def _kill_local_ray() -> None:
     ray_executable = _ray_cli_path()
     subprocess.run([ray_executable, "stop", "--force"], check=False)
 
 
 def _ensure_scheduler_singleton():
-    _require_ray()
-    import ray
-
-    from schedrl.scheduler.scheduler import scheduler_actor_class
-    from schedrl.scheduler.resource_manager import get_or_create_resource_manager
-
     try:
         return ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
     except ValueError:
@@ -106,9 +96,6 @@ def _ensure_scheduler_singleton():
 
 
 def _kill_ray_on_node(node_ip: str):
-    _require_ray()
-    import ray
-
     @ray.remote(max_retries=0)
     def _kill_local_ray_task():
         _kill_local_ray()
@@ -117,9 +104,6 @@ def _kill_ray_on_node(node_ip: str):
 
 
 def _force_stop_cluster_workers_first(*, timeout_s: float = 10.0) -> None:
-    _require_ray()
-    import ray
-
     head_node_id = get_head_node_id()
     nodes = ray.nodes()
     alive_nodes = [n for n in nodes if n.get("Alive")]
@@ -142,7 +126,6 @@ def _force_stop_cluster_workers_first(*, timeout_s: float = 10.0) -> None:
 
 class Orchestrator:
     def __init__(self, env_vars: Optional[Dict[str, str]] = None):
-        _require_ray()
         if env_vars is not None:
             if not isinstance(env_vars, dict):
                 raise ValueError(f"env_vars must be dict[str,str] | None, got {type(env_vars).__name__}")
@@ -183,7 +166,6 @@ class Orchestrator:
                 cluster_device_mappings=cluster_device_mappings,
             )
         )
-        import ray
         ray.get(
             self._scheduler.register_pipeline.remote(
                 pipeline_id=pipeline_id,
@@ -208,7 +190,6 @@ class Orchestrator:
             raise RuntimeError(f"Pipeline {pipeline_id!r} must be registered before admission")
         if state.admitted:
             return AdmitResponse(pipeline_id=pipeline_id, scheduler=self._scheduler)
-        import ray
         ray.get(self._scheduler.admit_pipeline.remote(pipeline_id=pipeline_id))
         self._pipelines[pipeline_id] = PipelineState(pipeline_id=pipeline_id, registered=True, admitted=True)
         return AdmitResponse(pipeline_id=pipeline_id, scheduler=self._scheduler)
@@ -229,7 +210,6 @@ class Orchestrator:
 
     def kill_pipeline(self, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
-        import ray
 
         # Best-effort SharedStorage cleanup (job-global).
         # This releases pipeline-owned coordination metadata (e.g., MASTER_ADDR_PORT claims) so ports can be reused
@@ -322,6 +302,11 @@ class Orchestrator:
             for s in unnamed_alive:
                 actor_id_hex = _attr(s, "actor_id")
                 try:
+                    # FIXME: Last-resort kill path using Ray internals.
+                    # This relies on `ray._raylet.ActorID` and
+                    # `ray.worker.global_worker.core_worker.get_actor_handle(...)`, which are
+                    # internal, brittle APIs and may break across Ray versions. Prefer naming
+                    # actors or retaining actor handles so this code path is never required.
                     actor_id_obj = ActorID.from_hex(actor_id_hex)
                     handle = ray.worker.global_worker.core_worker.get_actor_handle(actor_id_obj)
                     ray.kill(handle, no_restart=True)
@@ -377,7 +362,6 @@ class Orchestrator:
 
     def unregister_pipeline(self, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
-        import ray
         ray.get(self._scheduler.unregister_pipeline.remote(pipeline_id=pipeline_id))
         self._pipelines.pop(pipeline_id, None)
 

@@ -11,13 +11,7 @@ from schedrl.orchestrator.orchestrator import (
     Orchestrator,
 )
 from schedrl.utils.ray_head import head_node_affinity_strategy
-
-
-def _require_ray():
-    try:
-        import ray  # noqa: F401
-    except Exception as e:
-        raise RuntimeError("schedrl.client requires ray") from e
+import ray
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +30,6 @@ def connect(
     namespace: str = SCHEDRL_NAMESPACE,
     env_vars: Optional[dict[str, str]] = None,
 ):
-    _require_ray()
-    import ray
-
     if not ray.is_initialized():
         ray.init(address=address, namespace=namespace, ignore_reinit_error=True, log_to_driver=True)
 
@@ -47,9 +38,6 @@ def connect(
 
 
 def _get_or_create_orchestrator(opts: ConnectOptions):
-    _require_ray()
-    import ray
-
     try:
         return ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=opts.namespace)
     except ValueError:
@@ -83,7 +71,4 @@ def _get_or_create_orchestrator(opts: ConnectOptions):
 
 
 def admit_pipeline(*, orchestrator, pipeline_id: str) -> AdmitResponse:
-    _require_ray()
-    import ray
-
     return ray.get(orchestrator.admit_pipeline.remote(pipeline_id=pipeline_id))

@@ -5,6 +5,7 @@ import signal
 import time
 from contextlib import contextmanager
 from typing import Any, Optional
+import ray
 
 
 def get_env_timeout_s(var_name: str, default_s: float) -> float:
@@ -76,11 +77,6 @@ def get_named_actor_with_timeout(
         raise ValueError(f"timeout_s must be > 0, got {timeout_s!r}")
     if poll_interval_s <= 0:
         raise ValueError(f"poll_interval_s must be > 0, got {poll_interval_s!r}")
-
-    try:
-        import ray
-    except Exception as e:
-        raise RuntimeError("ray is required to look up named actors") from e
 
     deadline = time.monotonic() + float(timeout_s)
     last_error: Optional[BaseException] = None
