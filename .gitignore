@@ -55,7 +55,10 @@ checkpoints/
 logs/
 wandb/
 
-third_party/
+# Only track ROLL submodule in external/
+external/*
+!external/ROLL/
+
 hack/
 .claude*/
 .gemini/
