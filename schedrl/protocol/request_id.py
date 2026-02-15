@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 REQUEST_ID_DELIMITER = ":"
 
 
@@ -33,20 +31,11 @@ def build_request_id(pipeline_id: str, traj_id: str, turn_id: int, attempt: int)
     return f"{pipeline_id}{REQUEST_ID_DELIMITER}{traj_id}{REQUEST_ID_DELIMITER}{turn_id}{REQUEST_ID_DELIMITER}{attempt}"
 
 
-@dataclass(frozen=True, slots=True)
-class ParsedRequestId:
-    pipeline_id: str
-    traj_id: str
-    turn_id: int
-    attempt: int
-
-
 def parse_request_id(request_id: str) -> tuple[str, str, int, int]:
-    parsed = _parse_request_id_obj(request_id)
-    return parsed.pipeline_id, parsed.traj_id, parsed.turn_id, parsed.attempt
+    return _parse_request_id(request_id)
 
 
-def _parse_request_id_obj(request_id: str) -> ParsedRequestId:
+def _parse_request_id(request_id: str) -> tuple[str, str, int, int]:
     if not isinstance(request_id, str):
         raise ValueError(f"request_id must be str, got {type(request_id).__name__}")
     parts = request_id.split(REQUEST_ID_DELIMITER)
@@ -69,9 +58,8 @@ def _parse_request_id_obj(request_id: str) -> ParsedRequestId:
         raise ValueError(f"request_id turn_id must be >= 0, got {turn_id}: {request_id!r}")
     if attempt < 0:
         raise ValueError(f"request_id attempt must be >= 0, got {attempt}: {request_id!r}")
-    return ParsedRequestId(pipeline_id=pipeline_id, traj_id=traj_id, turn_id=turn_id, attempt=attempt)
+    return pipeline_id, traj_id, turn_id, attempt
 
 
 def validate_request_id(request_id: str) -> None:
-    _ = _parse_request_id_obj(request_id)
-
+    _ = _parse_request_id(request_id)

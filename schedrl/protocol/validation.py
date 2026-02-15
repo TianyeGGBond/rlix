@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, List
 
-from schedrl.protocol.request_id import validate_pipeline_id, validate_request_id
+from schedrl.protocol.request_id import validate_pipeline_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,17 +59,3 @@ def validate_register_pipeline(inp: RegisterValidationInput) -> None:
             raise ValueError(
                 f"cluster {cluster_name!r} has len(device_mapping)={len(device_mapping)} not divisible by tp_size={tp_size}"
             )
-
-
-def validate_request_ids(request_ids: Iterable[str]) -> None:
-    for rid in request_ids:
-        validate_request_id(rid)
-
-
-def validate_optional_timeout_s(timeout_s: Optional[float]) -> None:
-    if timeout_s is None:
-        return
-    if not isinstance(timeout_s, (int, float)):
-        raise ValueError(f"timeout_s must be float|None, got {type(timeout_s).__name__}")
-    if timeout_s <= 0:
-        raise ValueError(f"timeout_s must be > 0, got {timeout_s!r}")
