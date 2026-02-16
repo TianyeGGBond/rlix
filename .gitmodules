@@ -2,6 +2,7 @@
 	path = external/ROLL
 	url = git@github.com:taoluo/_rlos_ROLL.git
 	update = none
+	branch = main
 [submodule "external/SkyRL"]
 	path = external/SkyRL
 	url = git@github.com:NovaSky-AI/SkyRL.git
@@ -30,11 +31,14 @@
 	path = external/ROLL_multi_lora
 	url = git@github.com:alibaba/ROLL.git
 	update = none
+	branch = sync/multi-lora
 [submodule "external/ROLL_multi_pipeline"]
 	path = external/ROLL_multi_pipeline
 	url = git@github.com:alibaba/ROLL.git
 	update = none
+	branch = sync/multi-pipeline
 [submodule "external/ROLL_upstream_main"]
 	path = external/ROLL_upstream_main
 	url = git@github.com:alibaba/ROLL.git
 	update = none
+	branch = main
