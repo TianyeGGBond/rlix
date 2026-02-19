@@ -1,8 +1,26 @@
-# SchedRL Multi‑LoRA Adapter Extension (vLLM-first, ROLL + SkyRL-train) Implementation Plan
+# SchedRL Multi‑LoRA Adapter Extension (ROLL SchedRL Integration) Implementation Plan
 
-**Date**: 2026-02-02
+**Date**: 2026-02-02 (Updated: 2026-02-18)
 
 ## Overview
+
+Port the multi-LoRA feature from `external/ROLL_multi_lora` into `external/ROLL_schedrl` to enable SchedRL-controlled multi-LoRA training. The goal is to make the multi-LoRA pipeline coordinator integrate with the SchedRL scheduler the same way the current concurrent pipeline does.
+
+### Current State
+- **external/ROLL_schedrl**: Has `SchedRLConcurrentPipeline` with full SchedRL integration (shrink/expand, `notify_ready_to_release`, selective sync via `ModelUpdateService`)
+- **external/ROLL_multi_lora**: Has `AgenticMultiLoraPipeline` with multi-LoRA support (per-tag schedulers, `model_update_lora_subset`, partial GPU mode)
+- **Gap**: ROLL_schedrl only supports single LoRA (via `actor_lora_target` check); multi-LoRA patterns exist in ROLL_multi_lora but aren't integrated with SchedRL
+
+### Goal
+Create `SchedRLMultiLoraPipeline` in `external/ROLL_schedrl` that:
+1. Reuses existing multi-LoRA patterns from ROLL_multi_lora
+2. Integrates with SchedRL scheduler like `SchedRLConcurrentPipeline` does
+3. Supports per-adapter progress tracking and reporting
+4. Handles shrink/expand with adapter-aware routing
+
+---
+
+## OLD PLAN CONTENT (for reference)
 
 Extend the shared multi-pipeline protocol (`design_doc/multi-pipeline-adaptation-plan.md`) so **each RL pipeline** can run in either:
 
@@ -470,6 +488,307 @@ Adopt the same adapter artifact + activation semantics for NeMo-RL, reusing its 
 
 ---
 
+## NEW IMPLEMENTATION PLAN (Porting Multi-LoRA to ROLL_schedrl)
+
+Based on codebase research, here is the concrete implementation plan:
+
+### Key Files to Port/Modify
+
+#### 1. `roll/pipeline/base_pipeline.py`
+**Current State**: ROLL_schedrl has basic `model_update()` without adapter subset support
+**Change Required**: Add `model_update_lora_subset()` method (copy from ROLL_multi_lora)
+```python
+def model_update_lora_subset(self, global_step: int, *, adapters_to_update: set[str] | None = None) -> dict:
+    """Adapter-subset model update helper for multi-LoRA pipelines."""
+    metrics: dict = {}
+    for model_update_group in self.model_update_groups:
+        metrics.update(model_update_group.model_update(step=global_step, adapters_to_update=adapters_to_update))
+    return metrics
+```
+
+#### 2. `roll/distributed/executor/model_update_group.py`
+**Current State**: `model_update()` takes only `step` parameter
+**Change Required**: Add `adapters_to_update` parameter and pass to workers
+```python
+def model_update(self, step=None, adapters_to_update: set[str] | None = None):
+    if step % self.frequency != 0:
+        return {}
+    kwargs = {"model_update_name": self.model_update_name}
+    if adapters_to_update is not None:
+        kwargs["adapters_to_update"] = sorted(adapters_to_update)
+    # ... rest of implementation
+```
+
+#### 3. Create `roll/schedrl_adapter/multi_lora_pipeline.py`
+**New File**: `SchedRLMultiLoraPipeline` class combining:
+- SchedRL integration patterns from `SchedRLConcurrentPipeline`:
+  - `_notify_ready_to_release_actor_infer()`
+  - `_request_actor_infer_gpus()` / `_release_static_cluster()`
+  - `resize_infer()` with shrink/expand
+- Multi-LoRA patterns from `AgenticMultiLoraPipeline`:
+  - Per-tag rollout schedulers (`self.rollout_schedulers: dict[str, Any]`)
+  - `lora_step: dict[str, int]` for per-adapter step tracking
+  - `dirty_adapters: set[str]` for tracking updates
+  - `model_update_lora_subset()` calls
+
+**Key Integration Points**:
+1. **Initialization**: Create per-tag `RolloutScheduler` instances like `AgenticMultiLoraPipeline`
+2. **Run Loop**: 
+   - Request GPUs via `_request_actor_infer_gpus()` before rollout
+   - Collect batches from per-tag schedulers
+   - Track `dirty_adapters` from batch `lora_name`
+   - Call `model_update_lora_subset(global_tick, adapters_to_update=dirty_adapters)`
+   - Call `_notify_ready_to_release_actor_infer()` after rollout
+3. **Shrink/Expand**: Handle per-tag scheduler shrink/expand in `resize_infer()`
+
+#### 4. `roll/utils/lora_routing.py`
+**Action**: Copy from ROLL_multi_lora to ROLL_schedrl (if not present)
+- `normalize_domain()` - normalize adapter names
+- `get_lora_name_array()` - extract lora_name from batch
+- `resolve_microbatch_lora_name()` - validate homogeneous lora_name in batch
+
+#### 5. `roll/schedrl_adapter/adapter.py`
+**No Change Required**: Keep `sleep_level=2` requirement for both single-LoRA and multi-LoRA
+- Multi-LoRA will broadcast both backbone + all active adapters on selective sync
+- This is handled by the existing `ModelUpdateService` pattern with adapter-aware sync
+
+#### 6. `roll/distributed/scheduler/rollout_scheduler.py` (and `GroupQueueManager`)
+**Change Required**: Enable passing `adapter_id` through to `GroupQueueManager` for progress reporting.
+- Update `GroupQueueManager.__init__` to extract `adapter_id` from `env_manager_config.tags[0]` (since multi-LoRA uses one scheduler per tag).
+- Update `GroupQueueManager._maybe_emit_progress` to include `adapter_id` in `metrics`.
+- *Note*: No changes needed to `RolloutScheduler` signature if `adapter_id` is derived from `env_manager_config`.
+
+### Implementation Phases
+
+#### Phase 1: Base Pipeline Updates
+**Files**:
+- `roll/pipeline/base_pipeline.py`: Add `model_update_lora_subset()`
+- `roll/distributed/executor/model_update_group.py`: Add `adapters_to_update` parameter
+- `roll/distributed/scheduler/rollout_scheduler.py`: Add `adapter_id` extraction to `GroupQueueManager`
+- `roll/third_party/megatron/model_update.py`: **CRITICAL** Port adapter-aware logic from `ROLL_multi_lora`.
+    - Update `MegatronWeightUpdater.model_update` to accept `adapters_to_update`.
+    - Update `gather_all_hf_weights`, `gather_pp_stage_hf_weights` to accept `adapter_name`.
+    - Implement `_colocated_model_update` and `_separated_model_update` loop over adapters.
+
+- `roll/distributed/strategy/megatron_strategy.py`: **CRITICAL** Generalize SchedRL's CPU bucket cache for multi-LoRA.
+    - **Current**: `_build_latest_bucket_cache` serializes all weights into one bucket list.
+    - **New**: Separate base model weights from adapter weights.
+        - Identify adapter weights via `adapter_name` or parameter analysis.
+        - Store in `_cache_map` with structure supporting multiple components: `cache_key -> { "base": [buckets], "adapters": { "adapter_1": [buckets], ... } }` or distinct keys.
+        - **Implementation Detail**:
+            - Modify `_build_latest_bucket_cache` to accept optional `adapters_to_cache`.
+            - If `adapters_to_cache` is provided, only serialize and cache those specific adapters (and base if needed/changed).
+            - Use a composite key or nested dictionary in `self._cache_map` to store base and adapter artifacts separately.
+            - Ensure `promote_active_checkpoint` can mark a composite state (base version + specific adapter versions) as active.
+    - Update `promote_active_checkpoint` to handle promoting the base and relevant adapters.
+    - Update `selective_sync_active_cache`:
+        - Accept `adapters_to_sync` list (derived from active configuration).
+        - Broadcast base bucket (if needed/missing) AND specific adapter buckets to the target workers.
+        - Ensure atomicity or proper sequencing (base first, then adapters).
+
+- `roll/schedrl_adapter/model_update_service.py`: **CRITICAL** Generalize selective sync orchestration.
+    - Update `sync_selected_workers`:
+        - Accept `adapters_to_sync` (optional list of adapter IDs).
+        - Pass this list to `selective_sync_active_cache` on the sender (train worker).
+        - **Implementation Detail**:
+            - In `sync_selected_workers`, pass `adapters_to_sync` to `_build_comm_plan_for_sender` (if needed for group sizing, though likely not if topology is static).
+            - Critical: Pass `adapters_to_sync` to `worker.selective_sync_active_cache.remote(...)`.
+            - Verify that `selective_sync_active_cache` on the worker iterates through `adapters_to_sync` and performs the broadcast for each adapter artifact found in the cache.
+        - Ensure the `comm_plan` and `setup_collective_group` can handle multiple sequential broadcasts (base then adapters) if they use the same group, or separate groups if needed (reusing the same group is preferred for efficiency).
+
+**Verification Task**:
+- [ ] **Critical**: Verify `ActorWorker` (in `roll/pipeline/rlvr/actor_worker.py` / `roll/pipeline/base_worker.py`) supports `selective_sync_active_cache` with multiple adapters.
+      - `ModelUpdateService` (used by SchedRL expand) calls `selective_sync_active_cache`.
+      - We must ensure that when `adapters_to_update` are active on the trainer, the worker correctly receives and loads both the base and the adapters during sync.
+      - **Action**: Add a verification test where we simulate an expand call with `active_adapters=["lora_a", "lora_b"]` and verify the worker has both adapters loaded after sync.
+      - **Specific check**: Ensure `ActorWorker.update_parameter_in_bucket` (or the underlying strategy method) correctly handles the received buckets and loads them into the correct LoRA adapter slots in the model.
+
+**Success Criteria**:
+- [ ] `make test` passes in `external/ROLL_schedrl`
+- [ ] `model_update_lora_subset()` method exists and delegates to ModelUpdateGroup
+- [ ] `GroupQueueManager` reports `adapter_id` in metrics
+- [ ] `MegatronTrainStrategy` can cache and selectively broadcast specific adapters alongside the base model.
+- [ ] `ModelUpdateService` can orchestrate the broadcast of specific adapters.
+
+#### Phase 2: LoRA Routing Utilities
+**Files**:
+- `roll/utils/lora_routing.py`: Copy from ROLL_multi_lora
+
+**Success Criteria**:
+- [ ] `normalize_domain()`, `get_lora_name_array()`, `resolve_microbatch_lora_name()` available
+
+#### Phase 2.5: Adapter GC / Eviction
+**Overview**:
+Implement adapter eviction to prevent OOM as new adapters are loaded.
+
+**Changes Required**:
+1. **Surface Removal API**: Implement `remove_lora(adapter_id)` (or equivalent) in the engine/strategy layer.
+2. **Implement Eviction Logic**:
+   - Track resident adapters per worker.
+   - Enforce a `max_resident_adapters` limit.
+   - When loading a new adapter exceeds the limit:
+     - Identify the least-recently-used (LRU) adapter with no in-flight work.
+     - Evict it.
+     - If no adapter can be evicted (all have in-flight work), fail fast (skip load/schedule).
+
+**Success Criteria**:
+- [ ] Adapter eviction logic handles OOM scenarios by unloading unused adapters.
+- [ ] Validated that vLLM (or target engine) supports unloading/removing adapters without restarting.
+
+#### Phase 3: Multi-LoRA Pipeline Coordinator
+**Files**:
+- `roll/schedrl_adapter/multi_lora_pipeline.py`: New file
+
+**Key Implementation Details**:
+```python
+class SchedRLMultiLoraPipeline(BasePipeline):
+    """SchedRL-controlled multi-LoRA pipeline.
+
+    Combines:
+    - SchedRL GPU allocation/release patterns from SchedRLConcurrentPipeline
+    - Multi-LoRA per-tag scheduling from AgenticMultiLoraPipeline
+    """
+
+    def __init__(self, *, pipeline_id: str, pipeline_config: Any):
+        # ... initialize like AgenticMultiLoraPipeline ...
+        # ... but also setup SchedRL scheduler connection ...
+
+        # IMPORTANT: When porting from AgenticMultiLoraPipeline, remove the
+        # `sleep_level=1` runtime check. SchedRL requires `sleep_level=2`.
+        # Ensure proper validation of sleep_level=2 with LoRA reload.
+
+    def run(self):
+        # Similar to AgenticMultiLoraPipeline.run() but with SchedRL integration:
+        # 1. Request GPUs: self._request_actor_infer_gpus(global_step=global_tick)
+        # 2. Run rollout loop with per-tag schedulers
+        # 3. Release GPUs: self._notify_ready_to_release_actor_infer(global_step=global_tick)
+        #
+        # IMPORTANT: Do NOT copy the manual `shrink_sampler` / partial GPU offloading logic
+        # from `AgenticMultiLoraPipeline.run`. SchedRL handles resource arbitration via
+        # the request/release cycle (Phase 4 of the step).
+        # Use `_release_and_request_static_cluster` pattern from `SchedRLConcurrentPipeline`.
+
+    def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
+        """Reuse SchedRLConcurrentPipeline.resize_infer() pattern for per-tag schedulers.
+
+        Instead of operating on train_rollout_scheduler + val_rollout_scheduler,
+        operate on all per-tag schedulers in self.rollout_schedulers.
+        """
+        # ... validation from SchedRLConcurrentPipeline ...
+
+        schedulers = list(self.rollout_schedulers.values())
+
+        if dp_ranks_to_remove:
+            # Shrink all per-tag schedulers
+            for sched in schedulers:
+                self._shrink_scheduler(sched, dp_ranks_to_remove)
+        else:
+            # Expand: Coordinator-driven Warmup
+            # 1. Identify "Active Model Spec" (base + all currently active/queued adapters).
+            #    (Or query local queues to find needed adapters)
+            # 2. Warm up these adapters on the new workers using `expand_workers`.
+            #    - This ensures workers have necessary state before admission opens.
+
+            # Expand all per-tag schedulers
+            for sched in schedulers:
+                self._expand_scheduler(sched, dp_ranks_to_add)
+
+        return ActionResponse(success=True)
+```
+
+**Key Design Decision**: Reuse `_shrink_workers()` / `_expand_workers()` helper methods from `SchedRLConcurrentPipeline` (or refactor into shared helpers) to avoid code duplication.
+
+**Multi-LoRA Sync on Expand**: When expanding inference workers with sleep_level=2:
+1. Backbone/base model is broadcast from training workers
+2. All active LoRA adapters are broadcast alongside the backbone
+3. This ensures inference workers have complete model state (backbone + adapters)
+
+**Progress Reporting**: Each per-tag `GroupQueueManager` reports progress independently:
+- `ProgressReport.pipeline_id`: Identifies which pipeline the report belongs to
+- `ProgressReport.metrics["adapter_id"]`: Identifies which specific adapter within the pipeline
+- **Aggregation Location**: SchedRL Scheduler (e.g., `RoundRobinGlobalScheduler`) aggregates per-adapter reports (queued, inflight) to track total pipeline load and make admission decisions. No aggregation needed in the pipeline itself.
+
+**Success Criteria**:
+- [ ] Pipeline initializes with per-tag rollout schedulers
+- [ ] Requests/releases GPUs via SchedRL scheduler
+- [ ] Handles shrink/expand via `resize_infer()` with same API as `SchedRLConcurrentPipeline`
+- [ ] Selective sync broadcasts both backbone + all active adapters on expand
+- [ ] Each adapter reports progress independently with `adapter_id` in metrics
+- [ ] `sleep_level=2` validated with LoRA reload (no weight loss).
+
+#### Phase 4: Adapter Registration
+**Files**:
+- `roll/schedrl_adapter/adapter.py`: Add support for creating `SchedRLMultiLoraPipeline`
+
+**Changes**:
+```python
+def create_coordinator(self, *, pipeline_config: Any, multi_lora: bool = False):
+    if multi_lora:
+        from roll.schedrl_adapter.multi_lora_pipeline import SchedRLMultiLoraPipeline
+        Coordinator = ray.remote(SchedRLMultiLoraPipeline)
+    else:
+        from roll.schedrl_adapter.concurrent_pipeline import SchedRLConcurrentPipeline
+        Coordinator = ray.remote(SchedRLConcurrentPipeline)
+    # ... rest of method
+```
+
+**Success Criteria**:
+- [ ] Adapter can create both single-LoRA and multi-LoRA coordinators
+
+#### Phase 5: Testing
+**Test Scenarios**:
+1. Single adapter training (regression test)
+2. Multi-adapter training with 2+ adapters
+3. Shrink/expand during multi-adapter rollout
+4. Adapter subset updates (only dirty adapters synced)
+
+**Commands**:
+```bash
+cd external/ROLL_schedrl
+make test
+```
+
+### Code Reuse Strategy
+
+| Component | ROLL_multi_lora Source | Reuse Approach |
+|-----------|----------------------|----------------|
+| `model_update_lora_subset()` | `base_pipeline.py:85` | Copy method |
+| `ModelUpdateGroup.model_update()` | `model_update_group.py:28` | Add parameter |
+| LoRA routing utilities | `utils/lora_routing.py` | Copy file |
+| Per-tag scheduler setup | `agentic_multi_lora_pipeline.py:136-180` | Adapt to SchedRL |
+| Run loop structure | `agentic_multi_lora_pipeline.py:500-1028` | Adapt with SchedRL calls |
+| `resize_infer()` API | `concurrent_pipeline.py:985-1040` | **Reuse directly** - same API for per-tag schedulers |
+| `_shrink_workers()` / `_expand_workers()` | `concurrent_pipeline.py` | Refactor to shared helpers or inherit |
+
+### Implementation Notes
+
+#### `resize_infer()` Reuse Strategy
+The `resize_infer()` API from `SchedRLConcurrentPipeline` is reused directly:
+- **Same signature**: `resize_infer(*, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int])`
+- **Same behavior**: Shrink or expand inference workers by DP rank
+- **Different scope**: Applied to all per-tag schedulers instead of just train/val schedulers
+
+This allows the SchedRL scheduler to control multi-LoRA pipelines the same way it controls single-LoRA pipelines.
+
+#### Helper Method Reuse
+Consider refactoring `_shrink_workers()` and `_expand_workers()` from `SchedRLConcurrentPipeline` into shared helper methods or a common base class to avoid code duplication between `SchedRLConcurrentPipeline` and `SchedRLMultiLoraPipeline`.
+
+### Design Decisions
+
+1. **Sleep Level**: Use `sleep_level=2` for both full fine-tune and multi-LoRA (SchedRL time-sharing requirement).
+   - For multi-LoRA: On selective model update, broadcast **both** the backbone and all active LoRA adapters to newly scheduled actor_infer engines
+   - The `ModelUpdateService` needs to handle multi-adapter sync
+
+2. **Progress Reporting**: Each adapter reports its own progress independently; SchedRL aggregates.
+   - Each `GroupQueueManager` (per adapter) calls `report_progress()` independently.
+   - **Metrics**: Each report includes `metrics["adapter_id"]` and `metrics["adapter_progress"]` (unclamped `completed / target`).
+   - **Aggregation**: SchedRL aggregates `queued` and `inflight` counts from all adapter reports to track total pipeline load.
+   - `ProgressReport.pipeline_id` identifies the pipeline.
+
+3. **Code Sharing**: Should we create a shared base class (e.g., `SchedRLPipelineBase`) containing common methods like `_shrink_workers()`, `_expand_workers()`, `_notify_ready_to_release_actor_infer()`?
+
+---
+
 ## References
 
 - Shared protocol: `design_doc/multi-pipeline-adaptation-plan.md`
@@ -477,3 +796,5 @@ Adopt the same adapter artifact + activation semantics for NeMo-RL, reusing its 
 - ROLL adaptation plan: `thoughts/shared/plans/2026-01-28-roll-schedrl-adaptation.md`
 - SkyRL-train adaptation plan: `thoughts/shared/plans/2026-01-28-skyrl-train-adaptation-plan.md`
 - NeMo-RL adaptation plan: `thoughts/shared/plans/2026-01-28-nemo-rl-schedrl-adaptation.md` (deferred; archived)
+- ROLL_multi_lora: `external/ROLL_multi_lora/roll/pipeline/agentic/agentic_multi_lora_pipeline.py`
+- ROLL_schedrl: `external/ROLL_schedrl/roll/schedrl_adapter/concurrent_pipeline.py`
