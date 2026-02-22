@@ -224,7 +224,7 @@ The existing `_shrink_workers` / `_expand_workers` methods in `AgenticPipeline` 
 
 ### Key Files to Port/Modify
 
-#### 1. `roll/pipeline/base_pipeline.py`
+#### 1. `roll/pipeline/base_pipeline.py` — ✅ DONE
 **Current State**: ROLL_schedrl has basic `model_update()` without adapter subset support
 **Change Required**: Add `model_update_lora_subset()` method (copy from ROLL_multi_lora)
 ```python
@@ -236,7 +236,7 @@ def model_update_lora_subset(self, global_step: int, *, adapters_to_update: set[
     return metrics
 ```
 
-#### 2. `roll/distributed/executor/model_update_group.py`
+#### 2. `roll/distributed/executor/model_update_group.py` — ✅ DONE
 **Current State**: `model_update()` takes only `step` parameter
 **Change Required**: Add `adapters_to_update` parameter and pass to workers
 ```python
@@ -249,12 +249,10 @@ def model_update(self, step=None, adapters_to_update: set[str] | None = None):
     # ... rest of implementation
 ```
 
-#### 3. Create `roll/schedrl_adapter/multi_lora_pipeline.py`
-**New File**: `SchedRLMultiLoraPipeline` class.
-
+#### 3. `roll/schedrl_adapter/multi_lora_pipeline.py` — ✅ DONE (separate file from `SchedRLConcurrentPipeline`)
 **Key Components**:
 - **Initialization**:
-  - Inherit from `BasePipeline` (or `SchedRLConcurrentPipeline` if feasible, but `BasePipeline` is safer for custom run loop).
+  - Inherits from `SchedRLConcurrentPipeline` (reuses resize/release helpers, `_infer_resize_lock`, and full SchedRL lifecycle scaffolding; `BasePipeline` was considered but skipped).
   - Initialize `self.rollout_schedulers` (per-tag) as in `AgenticMultiLoraPipeline`.
   - **Remove** `partial_gpu_mode` checks/requirements.
   - **Remove** `sleep_level=1` validation check.
@@ -276,10 +274,10 @@ def model_update(self, step=None, adapters_to_update: set[str] | None = None):
   - `_shrink_all_schedulers(dp_ranks_to_remove)`: Iterate `self.rollout_schedulers.values()` and call `shrink_sampler`.
   - `_expand_all_schedulers(dp_ranks_to_add)`: Iterate `self.rollout_schedulers.values()` and call `expand_sampler`.
 
-#### 4. `roll/utils/lora_routing.py`
+#### 4. `roll/utils/lora_routing.py` — ✅ DONE
 **Action**: Copy from ROLL_multi_lora to ROLL_schedrl (if not present).
 
-#### 5. `roll/distributed/scheduler/rollout_scheduler.py` (and `GroupQueueManager`)
+#### 5. `roll/distributed/scheduler/rollout_scheduler.py` (and `GroupQueueManager`) — ✅ DONE
 **Change Required**: Enable passing `adapter_id` through to `GroupQueueManager` for progress reporting.
 - Update `GroupQueueManager.__init__` to extract `adapter_id` from `env_manager_config.tags[0]`.
 - Update `GroupQueueManager._maybe_emit_progress` to include `adapter_id` in `metrics`.
