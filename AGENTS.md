@@ -2,10 +2,10 @@
 
 - DO NOT add new files, like ".md" ".txt" or test, unless explicitly told or approved by user. 
 - DO NOT make use of any new libraries or packages, unless explicitly told or approved by user.
-- DO NOT display using table, use list or bulletin points instead. 
+- DO NOT response with table, use list or cc points instead. 
 - ALWAYS comment code changes: MUST add comments for short explanation first before changing existing code.
 - Copy-then-revise: When adding more than ~20 lines of new code, you MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class). Copy the closest match and adapt it, noting the source file. Only write from scratch if no similar pattern exists.
-- Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs at suspicious spots and key checkpoints to observe runtime state before touching any code.     
+- Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs at suspicious spots and key points to observe runtime state before touching any code.     
 
 ## 1. Safety (Critical)
 - **No Secrets**: Never print, store, or commit tokens or keys.
@@ -26,7 +26,8 @@
 - **Reuse Code**: Don't reinvent the wheel; use existing patterns and libraries.
 
 ## 4. Communication
-- **Simple English**: Use short sentences and plain words. Avoid jargon (or define it in one sentence).
+- **Always English**: Always think and respond to user in English.
+- **Simple English**: Use short sentences and plain words in respnose. Avoid jargon (or define it in one sentence).
 - **Update Docs**: If you change behavior, paths, or commands, update docs in the same commit.
 - **Ask First**: If unclear, ask one short question before starting.
 

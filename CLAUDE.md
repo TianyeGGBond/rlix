@@ -4,7 +4,7 @@
 - DO NOT make use of any new libraries or packages, unless explicitly told or approved by user.
 - ALWAYS comment code changes: MUST add comments for short explanation first before changing existing code.
 - Copy-then-revise: When adding more than ~20 lines of new code, you MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class). Copy the closest match and adapt it, noting the source file. Only write from scratch if no similar pattern exists.
-- Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs at suspicious spots and key checkpoints to observe runtime state before touching any code.     
+- Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs at suspicious spots and key points to observe runtime state before touching any code.     
 
 ## 1. Safety (Critical)
 - **No Secrets**: Never print, store, or commit tokens or keys.
