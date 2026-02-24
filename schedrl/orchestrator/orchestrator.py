@@ -394,6 +394,16 @@ class Orchestrator:
         self._shutdown_started = True
         if not force:
             raise RuntimeError("shutdown(force=False) is not supported in ENG-123 Phase 1")
+
+        # GPU Tracing: Explicit scheduler shutdown for trace finalization (with short timeout)
+        # Use ray.wait() with timeout to avoid blocking indefinitely in fail-fast scenarios
+        # 0.5s is enough for flush() under normal conditions, but won't stall on dead actors
+        try:
+            shutdown_ref = self._scheduler.shutdown.remote()
+            ray.wait([shutdown_ref], timeout=0.5)
+        except Exception:
+            pass  # Best-effort, don't stall shutdown
+
         _force_stop_cluster_workers_first()
 
     def get_env_vars(self) -> Dict[str, str]:

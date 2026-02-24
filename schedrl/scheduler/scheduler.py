@@ -6,13 +6,16 @@ Operational policy (ENG-123): fail-fast only. No recovery or rehydration is prov
 scheduler restart, pipelines are expected to re-register and be re-admitted.
 """
 
+import atexit
 import asyncio
+import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from schedrl.protocol.request_id import validate_pipeline_id
 from schedrl.protocol.types import Priority, ProgressReport
@@ -33,6 +36,32 @@ from schedrl.scheduler.types import (
 from schedrl.scheduler.validation import ValidationInputs, normalize_progress_oldest_ts, validate_execution_plan
 
 import ray
+
+# GPU Tracing: Conditional import for tg4perfetto (may not be installed)
+try:
+    from tg4perfetto import TraceGenerator
+    _TG4PERFETTO_AVAILABLE = True
+except ImportError:
+    TraceGenerator = None  # type: ignore[misc,assignment]
+    _TG4PERFETTO_AVAILABLE = False
+
+# GPU Tracing: Type-only imports for static type checking
+if TYPE_CHECKING:
+    from tg4perfetto import Group, NormalTrack
+
+# GPU Tracing: TypeVar for safe trace call helper
+T = TypeVar("T")
+
+# GPU Tracing: Short names for GPU trace labels - matches actual Priority enum values
+_PRIORITY_SHORT = {
+    Priority.INITIALIZATION: "INIT",
+    Priority.ACTOR_TRAINING: "ACT",
+    Priority.CRITIC_TRAINING: "CRT",
+    Priority.OLD_LOG_PROBS: "OLD",
+    Priority.REF_LOG_PROBS: "REF",
+    Priority.VALUE_COMPUTE: "VAL",
+    Priority.GENERATION: "GEN",
+}
 
 
 def _validate_and_canonicalize_device_mapping(
@@ -120,6 +149,27 @@ class _GapRatioPipelineState:
 
 
 @dataclass(slots=True)
+class _GPUAllocTraceContext:
+    """Context for an active GPU allocation trace slice.
+
+    Stored in _gpu_contexts dict keyed by gpu_id.
+    Used for debugging and future features (e.g., duration tracking).
+
+    NOTE: Currently stored but not read - reserved for:
+    - Duration calculation in _end_gpu_trace
+    - Validation of end/start matching
+    - Label updates mid-slice (if needed)
+    """
+
+    pipeline_id: str
+    cluster_id: str
+    priority: Priority
+    alloc_type: str  # "initial" | "proactive"
+    dp_ranks: Optional[List[int]] = None  # Generation clusters only
+    lora_name: Optional[str] = None  # Training clusters only
+
+
+@dataclass(slots=True)
 class SchedulerImpl:
     _state: SchedulerState = field(init=False)
     _lock: asyncio.Lock = field(init=False)
@@ -132,6 +182,16 @@ class SchedulerImpl:
     _num_gpus: Optional[int] = field(init=False)
     _required_gpus_per_node: Optional[int] = field(init=False)
     _adapter_handle_cache: Dict[str, Tuple[str, Any]] = field(init=False)
+    # GPU Tracing: State fields (MUST be declared at class level for slots=True)
+    _enable_gpu_tracing: bool = field(init=False, default=False)
+    _trace_gen: Optional["TraceGenerator"] = field(init=False, default=None)
+    _trace_file_path: Optional[str] = field(init=False, default=None)
+    _scheduler_group: Optional["Group"] = field(init=False, default=None)
+    _gpu_tracks: Dict[int, "NormalTrack"] = field(init=False, default_factory=dict)
+    _gpu_contexts: Dict[int, _GPUAllocTraceContext] = field(init=False, default_factory=dict)
+    _trace_last_flush_ns: int = field(init=False, default=0)  # Throttled flush state
+    _trace_flush_interval_ns: int = field(init=False, default=1_000_000_000)  # 1 second
+    _trace_shutdown_started: bool = field(init=False, default=False)  # Shutdown guard for idempotency
 
     def __post_init__(self):
         self._state = SchedulerState()
@@ -145,6 +205,290 @@ class SchedulerImpl:
         self._num_gpus: Optional[int] = None
         self._required_gpus_per_node: Optional[int] = None
         self._adapter_handle_cache = {}
+
+    # =========================================================================
+    # GPU Tracing: Core Methods
+    # =========================================================================
+
+    def _safe_trace_call(self, func: Callable[..., T], *args, **kwargs) -> Tuple[bool, Optional[T]]:
+        """Execute tracing call with fail-safe guard.
+
+        Returns:
+            tuple[bool, Optional[T]]: (success, result) where success indicates if call completed.
+
+        On first unexpected error, disables all tracing to prevent scheduler crash.
+        I/O errors are logged at debug level and don't disable tracing.
+        """
+        if not self._enable_gpu_tracing:
+            return False, None
+
+        try:
+            return True, func(*args, **kwargs)
+        except (IOError, OSError) as e:
+            # I/O errors are expected - don't disable, don't spam logs
+            logging.getLogger(__name__).debug(f"Trace I/O error: {e}")
+            return False, None
+        except Exception as e:
+            # Unexpected errors - disable tracing immediately to prevent crash
+            logging.getLogger(__name__).warning(f"Tracing disabled due to unexpected error: {e}")
+            self._enable_gpu_tracing = False
+            return False, None
+
+    def _safe_final_flush(self) -> None:
+        """Guarded flush for shutdown - not dependent on _enable_gpu_tracing.
+
+        Called only from _shutdown_tracing during explicit shutdown.
+        Safe to call even when tracing was already disabled.
+        """
+        if self._trace_gen is None:
+            return
+        try:
+            self._trace_gen.flush()
+        except Exception as e:
+            logging.getLogger(__name__).debug(f"Final trace flush failed: {e}")
+
+    # -------------------------------------------------------------------------
+    # GPU Tracing: Extracted Helper Methods
+    # -------------------------------------------------------------------------
+
+    def _safe_trace(self, func: Callable[..., Any], *args, **kwargs) -> bool:
+        """Fire-and-forget trace call. Returns success status."""
+        ok, _ = self._safe_trace_call(func, *args, **kwargs)
+        return ok
+
+    def _safe_trace_get(self, func: Callable[..., T], *args, **kwargs) -> Optional[T]:
+        """Trace call with return value. Returns result or None on failure."""
+        _, result = self._safe_trace_call(func, *args, **kwargs)
+        return result
+
+    def _get_or_create_gpu_track(self, gpu_id: int) -> Optional["NormalTrack"]:
+        """Get existing track or create new one. Returns None on failure."""
+        if gpu_id in self._gpu_tracks:
+            return self._gpu_tracks[gpu_id]
+
+        if self._required_gpus_per_node is None:
+            return None
+
+        node_id = gpu_id // int(self._required_gpus_per_node)
+        local_id = gpu_id % int(self._required_gpus_per_node)
+        track = self._safe_trace_get(
+            self._scheduler_group.create_track,
+            f"GPU{gpu_id}_{node_id}_{local_id}",
+        )
+        if track is not None:
+            self._gpu_tracks[gpu_id] = track
+        return track
+
+    def _build_trace_label(
+        self,
+        cluster_id: str,
+        pipeline_id: str,
+        priority: Priority,
+        alloc_type: str,
+        dp_ranks: Optional[List[int]] = None,
+        lora_name: Optional[str] = None,
+    ) -> str:
+        """Build trace label string. Testable in isolation.
+
+        Label format:
+        - Training with LoRA:    [ACT] pipeline-1_actor_train | job:pipeline-1 | lora:adapter-0 | initial | C5
+        - Training without LoRA: [ACT] pipeline-1_actor_train | job:pipeline-1 | initial | C5
+        - Generation:            [GEN] pipeline-1_actor_infer | job:pipeline-1 | initial | C10 | DP:[0,1]
+        """
+        p = _PRIORITY_SHORT.get(priority, priority.name[:3])
+        parts = [f"[{p}]", cluster_id, f"job:{pipeline_id}"]
+
+        # LoRA only for non-generation clusters (with sanitization)
+        if lora_name and priority != Priority.GENERATION:
+            safe_lora = lora_name.replace("|", "_").replace(" ", "_")[:64]
+            parts.append(f"lora:{safe_lora}")
+
+        parts.extend([alloc_type, f"C{self._cycle_counter}"])
+        label = " | ".join(parts)
+
+        # DP only for generation clusters
+        if dp_ranks and priority == Priority.GENERATION:
+            label += f" | DP:{dp_ranks}"
+
+        return label
+
+    def _end_traces_for_gpu_ids(self, gpu_ids: List[int]) -> None:
+        """End trace slices for multiple GPUs. Reusable across release paths."""
+        for gpu_id in gpu_ids:
+            self._end_gpu_trace(gpu_id)
+
+    def _trace_cycle_marker(self, name: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        """Record a cycle marker instant event."""
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return
+        if payload:
+            self._safe_trace(self._scheduler_group.instant, time.time_ns(), name, kwargs=payload)
+        else:
+            self._safe_trace(self._scheduler_group.instant, time.time_ns(), name)
+
+    def _maybe_flush_trace(self) -> None:
+        """Throttled flush - only flush if interval elapsed."""
+        if not self._trace_gen:
+            return
+        now_ns = time.time_ns()
+        if now_ns - self._trace_last_flush_ns >= self._trace_flush_interval_ns:
+            ok, _ = self._safe_trace_call(self._trace_gen.flush)
+            if ok:
+                self._trace_last_flush_ns = now_ns
+
+    def _init_tracing(self, trace_output_dir: Optional[str]) -> None:
+        """Initialize trace generator.
+
+        Called once from initialize() when enable_gpu_tracing=True.
+
+        Fail-fast policy:
+        - If tg4perfetto not installed when tracing enabled: log warning, disable tracing
+        - If trace file creation fails: log warning, disable tracing
+        - Runtime I/O errors during tracing: degrade gracefully (don't crash scheduler)
+
+        NOTE: atexit handler is a best-effort fallback for non-Ray scenarios only.
+        Ray terminates workers with SIGTERM/SIGKILL, which bypasses Python's atexit.
+        The reliable path is explicit shutdown() via orchestrator integration.
+        """
+        # Guard: tg4perfetto must be available
+        if not _TG4PERFETTO_AVAILABLE:
+            logging.getLogger(__name__).warning("GPU tracing requested but tg4perfetto not installed; tracing disabled")
+            self._enable_gpu_tracing = False
+            return
+
+        # Use correct extension: perfetto-trace (protobuf binary, NOT JSON)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        self._trace_file_path = os.path.join(
+            trace_output_dir or os.getcwd(),
+            f"schedrl_gpu_timeline_{ts}.perfetto-trace",
+        )
+
+        try:
+            self._trace_gen = TraceGenerator(self._trace_file_path)
+            self._scheduler_group = self._trace_gen.create_group("SCHEDULER")
+            # Best-effort fallback for non-Ray scenarios; unreliable in Ray deployments
+            atexit.register(self._shutdown_tracing)
+            logging.getLogger(__name__).info(f"GPU tracing enabled: {self._trace_file_path}")
+        except (IOError, OSError) as e:
+            # I/O errors during init are expected - disable tracing gracefully
+            logging.getLogger(__name__).warning(f"GPU tracing disabled (cannot create trace file): {e}")
+            self._enable_gpu_tracing = False
+            self._trace_gen = None
+            self._scheduler_group = None
+        except Exception as e:
+            # Unexpected init errors - disable tracing but don't crash scheduler
+            logging.getLogger(__name__).error(f"GPU tracing disabled (unexpected init error): {e}")
+            self._enable_gpu_tracing = False
+            self._trace_gen = None
+            self._scheduler_group = None
+
+    def _shutdown_tracing(self) -> None:
+        """Idempotent shutdown. Safe to call multiple times.
+
+        Called by:
+        - atexit handler on normal process exit (unreliable in Ray - SIGTERM/SIGKILL bypass atexit)
+        - Explicit shutdown() method from orchestrator (reliable path)
+
+        Order of operations:
+        1. Check idempotency guard
+        2. Disable tracing flag (stops new trace calls)
+        3. Clear all trace state (prevent orphaned references)
+        4. Final flush (write remaining data)
+        """
+        if self._trace_shutdown_started:
+            return
+        self._trace_shutdown_started = True
+
+        if self._trace_gen is None:
+            return
+
+        # Step 1: Disable tracing to stop new calls
+        self._enable_gpu_tracing = False
+
+        # Step 2: Clear all trace state before flush
+        # NormalTrack holds parent generator refs - must clear to prevent writes after flush
+        self._gpu_tracks.clear()
+        self._gpu_contexts.clear()
+        self._scheduler_group = None
+
+        # Step 3: Final flush via guarded helper
+        self._safe_final_flush()
+
+        self._trace_gen = None
+        # Keep _trace_file_path for post-shutdown assertions
+        # Unregister atexit to prevent double-call
+        try:
+            atexit.unregister(self._shutdown_tracing)
+        except Exception:
+            pass
+
+    async def shutdown(self) -> None:
+        """Explicit shutdown - call from orchestrator for clean termination.
+
+        Acquires scheduler lock to ensure no concurrent tracing writes.
+        Note: This is bounded best-effort - orchestrator uses 0.5s timeout.
+        """
+        async with self._lock:
+            self._shutdown_tracing()
+
+    def _start_gpu_trace(
+        self,
+        gpu_id: int,
+        cluster_id: str,
+        pipeline_id: str,
+        priority: Priority,
+        alloc_type: str,
+        dp_ranks: Optional[List[int]] = None,
+        lora_name: Optional[str] = None,
+    ) -> None:
+        """Start a trace slice for GPU allocation.
+
+        Creates track if needed, builds label, opens slice, stores context.
+        Silently returns if tracing disabled or on error (best-effort).
+        """
+        if not self._enable_gpu_tracing:
+            return
+
+        if self._trace_gen is None or self._scheduler_group is None:
+            return
+
+        # Use extracted helper for track creation
+        track = self._get_or_create_gpu_track(gpu_id)
+        if track is None:
+            return
+
+        # Use extracted helper for label building
+        label = self._build_trace_label(
+            cluster_id, pipeline_id, priority, alloc_type, dp_ranks, lora_name
+        )
+
+        # Open slice - ONLY store context on success
+        ok, _ = self._safe_trace_call(track.open, time.time_ns(), label)
+        if not ok:
+            return
+
+        self._gpu_contexts[gpu_id] = _GPUAllocTraceContext(
+            pipeline_id=pipeline_id,
+            cluster_id=cluster_id,
+            priority=priority,
+            alloc_type=alloc_type,
+            dp_ranks=dp_ranks,
+            lora_name=lora_name,
+        )
+
+    def _end_gpu_trace(self, gpu_id: int) -> None:
+        """End a trace slice for GPU release.
+
+        Removes context and closes the slice on the track.
+        Silently handles missing context (may happen in edge cases).
+        """
+        if not self._enable_gpu_tracing:
+            return
+
+        self._gpu_contexts.pop(gpu_id, None)
+        track = self._gpu_tracks.get(gpu_id)
+        if track:
+            self._safe_trace(track.close, time.time_ns())
 
     async def register_pipeline(
         self,
@@ -178,14 +522,14 @@ class SchedulerImpl:
             self._state.latest_progress_by_pipeline.pop(pipeline_id, None)
             self._adapter_handle_cache.pop(pipeline_id, None)
 
-            active_cluster_ids = []
+            # Single iteration: end traces + remove allocations for this pipeline
             for cluster_id in list(self._state.active_allocations.keys()):
-                if cluster_id.startswith(f"{pipeline_id}_"):
-                    active_cluster_ids.append(cluster_id)
-
-            for cluster_id in active_cluster_ids:
+                if not cluster_id.startswith(f"{pipeline_id}_"):
+                    continue
                 alloc = self._state.active_allocations.pop(cluster_id, None)
                 if alloc is not None:
+                    # GPU Tracing: End traces for all GPUs held by this cluster
+                    self._end_traces_for_gpu_ids(alloc.gpu_ids)
                     self._state.idle_gpus |= set(alloc.gpu_ids)
 
             for priority in Priority:
@@ -208,7 +552,13 @@ class SchedulerImpl:
 
             self._wakeup_event.set()
 
-    async def initialize(self, *, resource_manager: Any | None = None) -> None:
+    async def initialize(
+        self,
+        *,
+        resource_manager: Any | None = None,
+        enable_gpu_tracing: bool = False,
+        trace_output_dir: Optional[str] = None,
+    ) -> None:
         if self._topology_ready.is_set() and self._loop_task is not None:
             return
 
@@ -240,6 +590,16 @@ class SchedulerImpl:
             self._topology_ready.set()
             if self._loop_task is None:
                 self._loop_task = asyncio.create_task(self._central_scheduling_loop())
+
+        # GPU Tracing: Enable tracing if parameter or env var is set
+        # NOTE: Both env vars are read here (in scheduler actor) for consistency
+        env_tracing = os.environ.get("SCHEDRL_ENABLE_GPU_TRACING", "").lower() in ("1", "true")
+        env_trace_dir = os.environ.get("SCHEDRL_TRACE_OUTPUT_DIR")
+        self._enable_gpu_tracing = enable_gpu_tracing or env_tracing
+
+        if self._enable_gpu_tracing:
+            # Prefer explicit parameter, fall back to env var, then cwd
+            self._init_tracing(trace_output_dir or env_trace_dir)
 
     def _has_any_pending_request_locked(self, *, cluster_id: str) -> bool:
         for priority in Priority:
@@ -422,7 +782,14 @@ class SchedulerImpl:
                 mode_bucket[adapter_key] = report
             self._wakeup_event.set()
 
-    async def request_gpus(self, *, cluster_id: str, priority: Priority, global_step: Optional[int] = None) -> List[int]:
+    async def request_gpus(
+        self,
+        *,
+        cluster_id: str,
+        priority: Priority,
+        global_step: Optional[int] = None,
+        lora_name: Optional[str] = None,  # GPU Tracing: LoRA adapter name for non-generation clusters
+    ) -> List[int]:
         await self._topology_ready.wait()
         validate_cluster_id(cluster_id)
         event = asyncio.Event()
@@ -453,6 +820,7 @@ class SchedulerImpl:
                 request=Request(cluster_id=cluster_id, priority=priority, timestamp=float(self._request_seq)),
                 event=event,
                 global_step=global_step,
+                lora_name=lora_name,  # GPU Tracing: pass lora_name to pending request
             )
             self._state.pending_bucket(priority).append(pending)
             self._wakeup_event.set()
@@ -469,6 +837,8 @@ class SchedulerImpl:
             alloc = self._state.active_allocations.pop(cluster_id, None)
             if alloc is None:
                 raise RuntimeError(f"cluster_id {cluster_id!r} not found in active_allocations")
+            # GPU Tracing: End traces for released GPUs
+            self._end_traces_for_gpu_ids(alloc.gpu_ids)
             self._state.idle_gpus |= set(alloc.gpu_ids)
             self._wakeup_event.set()
 
@@ -480,6 +850,7 @@ class SchedulerImpl:
         request_cluster_id: str,
         request_priority: Priority,
         request_global_step: Optional[int] = None,
+        request_lora_name: Optional[str] = None,  # GPU Tracing: LoRA adapter name for non-generation clusters
     ) -> List[int]:
         await self._topology_ready.wait()
         event = asyncio.Event()
@@ -507,6 +878,8 @@ class SchedulerImpl:
                 alloc = self._state.active_allocations.pop(release_cluster_id, None)
                 if alloc is None:
                     raise RuntimeError(f"release_cluster_id {release_cluster_id!r} not found")
+                # GPU Tracing: End traces for released GPUs
+                self._end_traces_for_gpu_ids(alloc.gpu_ids)
                 self._state.idle_gpus |= set(alloc.gpu_ids)
             if self._has_any_pending_request_locked(cluster_id=request_cluster_id):
                 raise RuntimeError(f"Duplicate pending request for cluster_id={request_cluster_id!r} is not supported")
@@ -515,6 +888,7 @@ class SchedulerImpl:
                 request=Request(cluster_id=request_cluster_id, priority=request_priority, timestamp=float(self._request_seq)),
                 event=event,
                 global_step=request_global_step,
+                lora_name=request_lora_name,  # GPU Tracing: pass lora_name to pending request
             )
             self._state.pending_bucket(request_priority).append(pending)
             self._wakeup_event.set()
@@ -670,6 +1044,16 @@ class SchedulerImpl:
         try:
             async with self._lock:
                 self._cycle_counter += 1
+
+                # GPU Tracing: Cycle start marker
+                self._trace_cycle_marker(
+                    f"C{self._cycle_counter} Start",
+                    payload={
+                        "idle_gpus": len(self._state.idle_gpus),
+                        "active": len(self._state.active_allocations),
+                    },
+                )
+
                 planned_available_gpus = set(self._state.idle_gpus)
 
                 # Phase 0.5: planned release requests (blocking release hint from pipeline/coordinator).
@@ -834,6 +1218,10 @@ class SchedulerImpl:
             # Phase 6: commit (Phase 2 simulation: state-only).
             async with self._lock:
                 self._apply_plan_and_signal(plan)
+
+            # GPU Tracing: Cycle end marker + throttled flush (OUTSIDE lock to avoid I/O latency)
+            self._trace_cycle_marker(f"C{self._cycle_counter} End")
+            self._maybe_flush_trace()
 
         except asyncio.CancelledError:
             raise
@@ -1293,10 +1681,14 @@ class SchedulerImpl:
                 alloc.dp_rank_to_gpus.pop(dp_rank, None)
                 alloc.gpu_ids = [g for g in alloc.gpu_ids if g not in bundle]
                 self._state.idle_gpus |= bundle
+                # GPU Tracing: End traces for shrunk GPUs
+                self._end_traces_for_gpu_ids(list(bundle))
 
         for cluster_id in plan.clusters_to_remove:
             alloc = self._state.active_allocations.pop(cluster_id, None)
             if alloc is not None:
+                # GPU Tracing: End traces for removed cluster
+                self._end_traces_for_gpu_ids(alloc.gpu_ids)
                 self._state.idle_gpus |= set(alloc.gpu_ids)
 
         # Apply allocations.
@@ -1335,6 +1727,29 @@ class SchedulerImpl:
                 active_dp_ranks=active_dp_ranks,
                 dp_rank_to_gpus=dp_rank_to_gpus,
             )
+            # GPU Tracing: Start traces for initial allocation
+            if self._enable_gpu_tracing:
+                # Get lora_name from pending request
+                lora_name = None
+                for p in self._state.pending_bucket(priority):
+                    if p.request.cluster_id == op.cluster_id:
+                        lora_name = p.lora_name
+                        break
+                # Store in allocation for proactive allocation lookup
+                if lora_name:
+                    self._state.active_allocations[op.cluster_id].lora_name = lora_name
+                for gpu_id in sorted(op.gpus_to_allocate):
+                    # Extract DP rank for generation clusters
+                    dp_ranks = None
+                    if is_generation_cluster(op.cluster_id):
+                        for dp_rank, bundle in dp_rank_to_gpus.items():
+                            if gpu_id in bundle:
+                                dp_ranks = [dp_rank]
+                                break
+                    self._start_gpu_trace(
+                        gpu_id, op.cluster_id, pipeline_id, priority,
+                        "initial", dp_ranks, lora_name,
+                    )
             self._signal_pending_request(cluster_id=op.cluster_id, priority=priority, result=sorted(op.gpus_to_allocate))
 
         # Apply expansions (state commit; adapter.expand_workers executed in scheduling_cycle before commit).
@@ -1358,6 +1773,15 @@ class SchedulerImpl:
                 alloc.dp_rank_to_gpus[dp_rank] = sorted_needed[i * tp_size : (i + 1) * tp_size]
                 alloc.active_dp_ranks.add(dp_rank)
             alloc.gpu_ids = sorted(set(alloc.gpu_ids) | gpu_set)
+            # GPU Tracing: Start traces for proactive allocation
+            if self._enable_gpu_tracing:
+                for dp_rank in sorted(op.dp_ranks_to_add):
+                    bundle = alloc.dp_rank_to_gpus.get(dp_rank, [])
+                    for gpu_id in bundle:
+                        self._start_gpu_trace(
+                            gpu_id, op.cluster_id, pipeline_id,
+                            Priority.GENERATION, "proactive", [dp_rank],
+                        )
             if op.has_pending_request:
                 cluster_ids_to_signal.add(op.cluster_id)
         for cluster_id in cluster_ids_to_signal:
