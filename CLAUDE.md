@@ -2,9 +2,12 @@
 
 - DO NOT add new files, like ".md" ".txt" or test, unless explicitly told or approved by user. 
 - DO NOT make use of any new libraries or packages, unless explicitly told or approved by user.
+- NEVER response with table, use list or Bullet points instead. 
+- Human Understandability First: All new or modified code MUST be immediately understandable to a teammate through clear naming, small single-purpose functions, and zero unexplained magic values.
+- Typed Python Only: All new or modified Python code MUST annotate public APIs, minimize `Any` (use only for truly dynamic or untyped boundaries), and pass strict type checking (`mypy --strict`).
 - ALWAYS comment code changes: MUST add comments for short explanation first before changing existing code.
-- Copy-then-revise: When adding more than ~20 lines of new code, you MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class). Copy the closest match and adapt it, noting the source file. Only write from scratch if no similar pattern exists.
-- Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs at suspicious spots and key points to observe runtime state before touching any code.     
+- Copy-then-revise: When adding more than ~20 lines of new code, you MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class). Copy verbatim the closest match then apply revision, noting the source file. Only write from scratch if no similar pattern exists.
+- Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs     
 
 ## 1. Safety (Critical)
 - **No Secrets**: Never print, store, or commit tokens or keys.
@@ -25,16 +28,27 @@
 - **Reuse Code**: Don't reinvent the wheel; use existing patterns and libraries.
 
 ## 4. Communication
-- **Simple English**: Use short sentences and plain words. Avoid jargon (or define it in one sentence).
+- **Always English**: Always think and respond to user in English.
+- **Simple English**: Use short sentences and plain words in respnose. Avoid jargon (or define it in one sentence).
 - **Update Docs**: If you change behavior, paths, or commands, update docs in the same commit.
 - **Ask First**: If unclear, ask one short question before starting.
 
-## IDE Integration
+## 5. Code Understandability Rules
+- **Name for Intent**: Use domain-specific names that explain purpose; avoid single-letter names except simple loop indices.
+- **Keep Functions Small**: Prefer single-responsibility functions; split functions that become hard to explain quickly.
+- **No Magic Values**: Replace unexplained literals with well-named constants.
+- **Readable Control Flow**: Prefer simple branches and early returns; avoid deep nesting and clever one-liners.
+- **Typed Public Contracts**: Public functions/methods/classes MUST have explicit type annotations; use precise types, not vague ones.
+- **Minimize `Any`**: Use `Any` only at truly dynamic or untyped third-party boundaries.
+- **Comments Explain Why**: Add comments/docstrings only for non-obvious intent, constraints, or tradeoffs; do not narrate obvious code.
+- **Follow Local Style Tools**: Keep formatting/linting consistent with the subproject so reviews focus on behavior, not style noise.
+
+
+## 6. IDE Integration
 
 IMPORTANT: Prefer use the `pycharm-index` MCP server when applicable for code navigation and refactoring:
 
 IMPORTANT: When debugging, prefer using pycharm-debugger MCP tools to interact with the IDE debugger.
-
 
 # Repository Guidelines
 

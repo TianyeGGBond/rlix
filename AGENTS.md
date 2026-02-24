@@ -2,9 +2,11 @@
 
 - DO NOT add new files, like ".md" ".txt" or test, unless explicitly told or approved by user. 
 - DO NOT make use of any new libraries or packages, unless explicitly told or approved by user.
-- DO NOT response with table, use list or cc points instead. 
+- NEVER response with table, use list or Bullet points instead. 
+- Human Understandability First: Code is rejected unless it is immediately maintainable by a teammate; every contribution MUST use intent-based naming, modular single-purpose functions with no magic values, and explicit type contracts that remove ambiguity.
+- Typed Python Only: All new or modified Python code MUST annotate public APIs, minimize `Any` (use only for truly dynamic or untyped boundaries), and pass strict type checking (`mypy --strict`).
 - ALWAYS comment code changes: MUST add comments for short explanation first before changing existing code.
-- Copy-then-revise: When adding more than ~20 lines of new code, you MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class). Copy the closest match and adapt it, noting the source file. Only write from scratch if no similar pattern exists.
+- Copy-then-revise: When adding more than ~20 lines of new code, you MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class). Copy verbatim the closest match then apply revision, noting the source file. Only write from scratch if no similar pattern exists.
 - Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs at suspicious spots and key points to observe runtime state before touching any code.     
 
 ## 1. Safety (Critical)
@@ -31,7 +33,15 @@
 - **Update Docs**: If you change behavior, paths, or commands, update docs in the same commit.
 - **Ask First**: If unclear, ask one short question before starting.
 
-## IDE Integration
+## 5. Code Understandability Rules
+- **Semantic Intent (Name + Scope)**: Names must communicate domain intent, and each function should do one job; if a name needs `and`, split the function.
+- **Flat Logic (Anti-Nesting)**: Prefer guard clauses and early returns so the main path stays obvious; avoid nesting deeper than two levels.
+- **Explicit Interfaces (Typed Contracts)**: Public APIs MUST be typed, prefer `T | None`, and minimize `Any` to true dynamic/untyped boundaries.
+- **Why Layer (Intent Docs)**: Comments/docstrings explain non-obvious reasons, constraints, and tradeoffs; replace magic values with named constants.
+- **Zero Friction (Automated Style)**: Follow local lint/format tools so code reads consistently and reviews focus on behavior.
+
+
+## 6. IDE Integration
 
 IMPORTANT: Prefer use the `pycharm-index` MCP server when applicable for code navigation and refactoring:
 
