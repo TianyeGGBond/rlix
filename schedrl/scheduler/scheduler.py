@@ -237,6 +237,8 @@ class SchedulerImpl:
     )  # Total slice tracks created (for cap enforcement)
     # Queue Tracing: Maps priority short-key (e.g. "TRN") to its Perfetto queue sub-group wrapper
     _queue_groups: Dict[str, _QueueSubGroup] = field(init=False, default_factory=dict)
+    # Active GPU counter track for utilization visualization
+    _active_gpus_counter: Optional["CounterTrack"] = field(init=False, default=None)
 
     def __post_init__(self):
         self._state = SchedulerState()
@@ -370,6 +372,22 @@ class SchedulerImpl:
             self._queue_counter_tracks[key] = track
         return track
 
+    def _get_or_create_active_gpus_counter(self) -> Optional["CounterTrack"]:
+        """Get or create counter track for active GPU count. Returns None on failure."""
+        if self._active_gpus_counter is not None:
+            return self._active_gpus_counter
+
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return None
+
+        track = self._safe_trace_get(
+            self._scheduler_group.create_counter_track,
+            "active_gpus",
+        )
+        if track is not None:
+            self._active_gpus_counter = track
+        return track
+
     def _create_queue_slice_track(self, cluster_id: str, priority: Priority) -> Optional["NormalTrack"]:
         """Create a per-cluster slice track for queue visualization.
 
@@ -486,6 +504,20 @@ class SchedulerImpl:
         if counter_track:
             self._queue_depth[key] = depth  # Debug-only cache
             self._safe_trace(counter_track.count, now_ns, depth)
+
+    def _trace_active_gpus_update(self) -> None:
+        """Update active GPUs counter track with current utilization."""
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return
+
+        if self._num_gpus is None:
+            return  # Not initialized yet
+
+        counter = self._get_or_create_active_gpus_counter()
+        if counter:
+            active_count = self._num_gpus - len(self._state.idle_gpus)
+            now_ns = time.time_ns()
+            self._safe_trace(counter.count, now_ns, active_count)
 
     def _shutdown_close_queue_slices(self) -> None:
         """Close all open queue slices during shutdown.
@@ -646,6 +678,7 @@ class SchedulerImpl:
         self._queue_counter_tracks.clear()
         self._queue_depth.clear()
         self._queue_groups.clear()  # wrapper refs hold _parent (TraceGenerator) — must clear
+        self._active_gpus_counter = None
         self._scheduler_group = None
 
         # Step 4: Final flush via guarded helper
@@ -811,6 +844,7 @@ class SchedulerImpl:
                 if alloc is not None:
                     self._end_traces_for_gpu_ids(alloc.gpu_ids)
                     self._state.idle_gpus |= set(alloc.gpu_ids)
+                    self._trace_active_gpus_update()
 
             # Remove pending requests and close queue slices
             affected_priorities: Set[Priority] = set()
@@ -885,6 +919,8 @@ class SchedulerImpl:
         if self._enable_gpu_tracing:
             # Prefer explicit parameter, fall back to env var, then cwd
             self._init_tracing(trace_output_dir or env_trace_dir)
+            # Active GPU counter: emit initial value (all GPUs idle = 0 active)
+            self._trace_active_gpus_update()
 
     def _has_any_pending_request_locked(self, *, cluster_id: str) -> bool:
         for priority in Priority:
@@ -1127,6 +1163,7 @@ class SchedulerImpl:
             # GPU Tracing: End traces for released GPUs
             self._end_traces_for_gpu_ids(alloc.gpu_ids)
             self._state.idle_gpus |= set(alloc.gpu_ids)
+            self._trace_active_gpus_update()
             self._wakeup_event.set()
 
     async def release_and_request_gpus(
@@ -1168,6 +1205,7 @@ class SchedulerImpl:
                 # GPU Tracing: End traces for released GPUs
                 self._end_traces_for_gpu_ids(alloc.gpu_ids)
                 self._state.idle_gpus |= set(alloc.gpu_ids)
+                self._trace_active_gpus_update()
             if self._has_any_pending_request_locked(cluster_id=request_cluster_id):
                 raise RuntimeError(f"Duplicate pending request for cluster_id={request_cluster_id!r} is not supported")
             self._request_seq += 1
@@ -2012,6 +2050,7 @@ class SchedulerImpl:
                 self._state.idle_gpus |= bundle
                 # GPU Tracing: End traces for shrunk GPUs
                 self._end_traces_for_gpu_ids(list(bundle))
+                self._trace_active_gpus_update()
 
         for cluster_id in plan.clusters_to_remove:
             alloc = self._state.active_allocations.pop(cluster_id, None)
@@ -2019,6 +2058,7 @@ class SchedulerImpl:
                 # GPU Tracing: End traces for removed cluster
                 self._end_traces_for_gpu_ids(alloc.gpu_ids)
                 self._state.idle_gpus |= set(alloc.gpu_ids)
+                self._trace_active_gpus_update()
 
         # Apply allocations.
         for op in plan.signal_pending_allocation_ops:
@@ -2041,6 +2081,7 @@ class SchedulerImpl:
                 raise RuntimeError(f"Planned allocation has no pending waiter: cluster_id={op.cluster_id!r} priority={priority!r}")
             gpu_set = set(op.gpus_to_allocate)
             self._state.idle_gpus -= gpu_set
+            self._trace_active_gpus_update()
             pipeline_id, cluster_name = parse_cluster_id(op.cluster_id)
             tp_size = int(self._state.pipeline_registry[pipeline_id]["cluster_configs"][cluster_name].get("tp_size", 1))
             dp_rank_to_gpus = {}
@@ -2091,6 +2132,7 @@ class SchedulerImpl:
                 continue
             gpu_set = set(op.gpus_to_allocate)
             self._state.idle_gpus -= gpu_set
+            self._trace_active_gpus_update()
             alloc = self._state.active_allocations.get(op.cluster_id)
             if alloc is None:
                 alloc = ClusterAllocation(cluster_id=op.cluster_id, gpu_ids=[], priority=Priority.GENERATION)
