@@ -356,11 +356,11 @@ class SchedulerImpl:
         key = _PRIORITY_SHORT.get(priority, priority.name[:3])
         if key in self._queue_groups:
             return self._queue_groups[key]
-        # _safe_trace_get wraps the attribute lookup + call together here because
-        # create_group is a method on Group (guaranteed to exist).
+        # Perfetto sorts alphabetically: prefix with priority value so INIT(0) < TRN(1) < ... < GEN(6).
+        # "Queue_N_KEY" sorts after GPU tracks (uppercase G < Q) and in priority order by digit.
         raw_group = self._safe_trace_get(
             self._scheduler_group.create_group,
-            f"Queue_{key}",
+            f"Queue_{priority.value}_{key}",
         )
         if raw_group is None:
             logging.getLogger(__name__).debug(
@@ -400,9 +400,10 @@ class SchedulerImpl:
         if not self._enable_gpu_tracing or self._scheduler_group is None:
             return None
 
+        # Prefix "04_" forces alphabetical sort below marker tracks (01-03) and above GPU/Queue
         track = self._safe_trace_get(
             self._scheduler_group.create_counter_track,
-            "active_gpus",
+            "04_active_gpus",
         )
         if track is not None:
             self._active_gpus_counter = track
@@ -411,8 +412,8 @@ class SchedulerImpl:
     def _init_active_gpus_counter(self) -> None:
         """Eagerly create active_gpus counter track for correct ordering in Perfetto UI.
 
-        MUST be called BEFORE _init_gpu_tracks() to ensure counter appears above GPU tracks.
-        Track order in Perfetto is determined by creation order.
+        Perfetto sorts tracks alphabetically by name. The "04_" prefix places this counter
+        below marker tracks ("01_"-"03_") and above GPU/Queue tracks (uppercase letters).
         """
         if not self._enable_gpu_tracing:
             return
@@ -424,36 +425,35 @@ class SchedulerImpl:
             return None
         return self._safe_trace_get(self._scheduler_group.create_track, name)
 
-    def _init_exec_marker_track(self) -> None:
-        """Eagerly create marker track for exec instant events.
-
-        MUST be called FIRST among marker tracks to ensure correct ordering.
-        Track order in Perfetto is determined by creation order.
-        """
-        self._exec_marker_track = self._create_marker_track("exec_markers")
-
     def _init_enqueue_marker_track(self) -> None:
         """Eagerly create marker track for enqueue instant events.
 
-        MUST be called AFTER _init_exec_marker_track() and BEFORE _init_release_marker_track().
-        Track order in Perfetto is determined by creation order.
+        Perfetto sorts tracks alphabetically by name. The "01_" prefix places this track
+        at the very top (first) in the Perfetto UI.
         """
-        self._enqueue_marker_track = self._create_marker_track("enqueue_markers")
+        self._enqueue_marker_track = self._create_marker_track("01_enqueue_markers")
+
+    def _init_exec_marker_track(self) -> None:
+        """Eagerly create marker track for exec instant events.
+
+        Perfetto sorts tracks alphabetically by name. The "02_" prefix places this track
+        second in the Perfetto UI, below enqueue_markers.
+        """
+        self._exec_marker_track = self._create_marker_track("02_exec_markers")
 
     def _init_release_marker_track(self) -> None:
         """Eagerly create marker track for release instant events.
 
-        MUST be called AFTER _init_enqueue_marker_track() and BEFORE _init_active_gpus_counter().
-        Track order in Perfetto is determined by creation order.
+        Perfetto sorts tracks alphabetically by name. The "03_" prefix places this track
+        third in the Perfetto UI, below exec_markers.
         """
-        self._release_marker_track = self._create_marker_track("release_markers")
+        self._release_marker_track = self._create_marker_track("03_release_markers")
 
     def _init_queue_tracks(self) -> None:
         """Eagerly create queue groups and counter tracks in priority order.
 
-        MUST be called AFTER _init_gpu_tracks() to ensure correct UI ordering.
-        Creates Queue_<KEY> groups in priority order (highest priority first):
-        INIT, TRN, CRT, OLD, REF, VAL, GEN
+        Creates Queue_<N>_<KEY> groups. Perfetto sorts alphabetically, so the numeric
+        prefix N (priority.value) ensures INIT(0) < TRN(1) < ... < GEN(6) in the UI.
         """
         if not self._enable_gpu_tracing:
             return
@@ -1018,17 +1018,16 @@ class SchedulerImpl:
         if self._enable_gpu_tracing:
             # Prefer explicit parameter, fall back to env var, then cwd
             self._init_tracing(trace_output_dir or env_trace_dir)
-            # Eagerly create exec marker track FIRST for correct UI ordering (top of all tracks)
-            self._init_exec_marker_track()
-            # Eagerly create enqueue marker track for correct UI ordering (after exec_markers)
+            # Eagerly create all tracks. Perfetto sorts tracks alphabetically by name, so
+            # numeric prefixes ("01_", "02_", ...) in the names control the display order —
+            # not the creation order here.
+            # Desired UI order (top→bottom): 01_enqueue → 02_exec → 03_release →
+            #   04_active_gpus → GPU* → Queue_0_INIT … Queue_6_GEN
             self._init_enqueue_marker_track()
-            # Eagerly create release marker track for correct UI ordering (after enqueue_markers)
+            self._init_exec_marker_track()
             self._init_release_marker_track()
-            # Eagerly create active_gpus counter for correct UI ordering (after markers)
             self._init_active_gpus_counter()
-            # Eagerly create GPU tracks for correct UI ordering (after counter)
             self._init_gpu_tracks()
-            # Eagerly create queue tracks for correct UI ordering (after GPU tracks, in priority order)
             self._init_queue_tracks()
             # Active GPU counter: emit initial value (all GPUs idle = 0 active)
             self._trace_active_gpus_update()
