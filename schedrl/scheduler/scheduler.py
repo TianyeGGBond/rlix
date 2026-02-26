@@ -47,7 +47,8 @@ except ImportError:
 
 # GPU Tracing: Type-only imports for static type checking
 if TYPE_CHECKING:
-    from tg4perfetto import Group, NormalTrack
+    from tg4perfetto import CounterTrack, Group, NormalTrack
+    from tg4perfetto._tgen import GroupTrack  # GroupTrack not re-exported in __init__
 
 # GPU Tracing: TypeVar for safe trace call helper
 T = TypeVar("T")
@@ -55,7 +56,7 @@ T = TypeVar("T")
 # GPU Tracing: Short names for GPU trace labels - matches actual Priority enum values
 _PRIORITY_SHORT = {
     Priority.INITIALIZATION: "INIT",
-    Priority.ACTOR_TRAINING: "ACT",
+    Priority.ACTOR_TRAINING: "TRN",
     Priority.CRITIC_TRAINING: "CRT",
     Priority.OLD_LOG_PROBS: "OLD",
     Priority.REF_LOG_PROBS: "REF",
@@ -170,6 +171,35 @@ class _GPUAllocTraceContext:
 
 
 @dataclass(slots=True)
+class _QueueSubGroup:
+    """Named-track factory wrapping a tg4perfetto GroupTrack sub-group.
+
+    GroupTrack.create_track() creates tracks named after the group, not a caller-supplied name.
+    This wrapper holds GroupTrack's internal uuid and parent handles and calls _create_track
+    directly (same private method Group.create_track uses) to pass an explicit name.
+
+    Source pattern: _GPUAllocTraceContext in scheduler.py
+    """
+
+    # GroupTrack internal handles — accessed via gt._uuid and gt._parent after create_group()
+    _uuid: int
+    _parent: Any  # tg4perfetto.TraceGenerator at runtime; Any to avoid runtime import
+
+    def create_track(self, track_name: str) -> "NormalTrack":
+        """Create a named slice track under this sub-group."""
+        return self._parent._create_track(self._uuid, track_name, 0)
+
+    def create_counter_track(self, track_name: str) -> "CounterTrack":
+        """Create a named counter track under this sub-group."""
+        return self._parent._create_track(self._uuid, track_name, 1)
+
+    @classmethod
+    def from_group_track(cls, gt: "GroupTrack") -> "_QueueSubGroup":
+        """Extract handles from a freshly created GroupTrack."""
+        return cls(gt._uuid, gt._parent)
+
+
+@dataclass(slots=True)
 class SchedulerImpl:
     _state: SchedulerState = field(init=False)
     _lock: asyncio.Lock = field(init=False)
@@ -192,6 +222,21 @@ class SchedulerImpl:
     _trace_last_flush_ns: int = field(init=False, default=0)  # Throttled flush state
     _trace_flush_interval_ns: int = field(init=False, default=1_000_000_000)  # 1 second
     _trace_shutdown_started: bool = field(init=False, default=False)  # Shutdown guard for idempotency
+    # Queue Tracing: State fields for queue visualization
+    _pending_queue_trace_state: Dict[str, Tuple["NormalTrack", int, Priority]] = field(
+        init=False, default_factory=dict
+    )  # cluster_id -> (track, start_ns, priority)
+    _queue_counter_tracks: Dict[str, "CounterTrack"] = field(
+        init=False, default_factory=dict
+    )  # priority_key -> counter track
+    _queue_depth: Dict[str, int] = field(
+        init=False, default_factory=dict
+    )  # priority_key -> depth (debug-only, may diverge from trace)
+    _queue_track_count: int = field(
+        init=False, default=0
+    )  # Total slice tracks created (for cap enforcement)
+    # Queue Tracing: Maps priority short-key (e.g. "TRN") to its Perfetto queue sub-group wrapper
+    _queue_groups: Dict[str, _QueueSubGroup] = field(init=False, default_factory=dict)
 
     def __post_init__(self):
         self._state = SchedulerState()
@@ -278,6 +323,190 @@ class SchedulerImpl:
         if track is not None:
             self._gpu_tracks[gpu_id] = track
         return track
+
+    def _get_or_create_queue_group(self, priority: Priority) -> Optional[_QueueSubGroup]:
+        """Get or create the Queue_<KEY> sub-group wrapper for a priority tier.
+
+        Returns None if tracing is disabled or scheduler group is not initialized.
+        """
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return None
+        key = _PRIORITY_SHORT.get(priority, priority.name[:3])
+        if key in self._queue_groups:
+            return self._queue_groups[key]
+        # _safe_trace_get wraps the attribute lookup + call together here because
+        # create_group is a method on Group (guaranteed to exist).
+        raw_group = self._safe_trace_get(
+            self._scheduler_group.create_group,
+            f"Queue_{key}",
+        )
+        if raw_group is None:
+            logging.getLogger(__name__).debug(
+                f"Failed to create queue sub-group for priority {key}"
+            )
+            return None
+        sub_group = _QueueSubGroup.from_group_track(raw_group)
+        self._queue_groups[key] = sub_group
+        return sub_group
+
+    # Queue Tracing: Constants
+    _QUEUE_TRACK_CAP: int = 1000  # Max slice tracks before disabling queue slice creation
+
+    def _get_or_create_queue_counter_track(self, priority: Priority) -> Optional["CounterTrack"]:
+        """Get or create counter track for queue depth. Returns None on failure."""
+        key = _PRIORITY_SHORT.get(priority, priority.name[:3])
+        if key in self._queue_counter_tracks:
+            return self._queue_counter_tracks[key]
+
+        queue_group = self._get_or_create_queue_group(priority)
+        if queue_group is None:
+            return None
+        # create_counter_track is a method on _QueueSubGroup (our wrapper) — always exists
+        track = self._safe_trace_get(
+            queue_group.create_counter_track,
+            "depth",
+        )
+        if track is not None:
+            self._queue_counter_tracks[key] = track
+        return track
+
+    def _create_queue_slice_track(self, cluster_id: str, priority: Priority) -> Optional["NormalTrack"]:
+        """Create a per-cluster slice track for queue visualization.
+
+        Returns None on failure OR if track cap exceeded.
+        When cap is exceeded, counter tracks still work but slice tracks are skipped.
+        """
+        # Check cap BEFORE creating
+        if self._queue_track_count >= self._QUEUE_TRACK_CAP:
+            # Log once when cap first hit
+            if self._queue_track_count == self._QUEUE_TRACK_CAP:
+                logging.getLogger(__name__).warning(
+                    f"Queue slice track cap ({self._QUEUE_TRACK_CAP}) reached. "
+                    "Subsequent queue slices will not be traced (counters continue)."
+                )
+            self._queue_track_count += 1  # Increment to avoid repeated warnings
+            return None
+
+        queue_group = self._get_or_create_queue_group(priority)
+        if queue_group is None:
+            return None
+        # create_track is a method on _QueueSubGroup (our wrapper) — always exists
+        track = self._safe_trace_get(
+            queue_group.create_track,
+            cluster_id[:16],  # Truncate cluster_id to avoid long names
+        )
+        if track is not None:
+            self._queue_track_count += 1
+        return track
+
+    def _trace_queue_enqueue(self, cluster_id: str, priority: Priority, lora_name: Optional[str] = None) -> None:
+        """Start queue slice and increment counter when request is enqueued.
+
+        CRITICAL: Call AFTER pending_bucket().append() so len() reflects correct depth.
+        CRITICAL: Track handle stored AFTER successful open to avoid orphan state.
+        """
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return
+
+        now_ns = time.time_ns()
+        key = _PRIORITY_SHORT.get(priority, priority.name[:3])
+
+        # Create per-cluster track
+        slice_track = self._create_queue_slice_track(cluster_id, priority)
+
+        # Start slice FIRST
+        if slice_track:
+            label = f"[{key}] {cluster_id}"
+            if lora_name:
+                safe_lora = lora_name.replace("|", "_").replace(" ", "_")[:32]
+                label += f" | lora:{safe_lora}"
+            ok = self._safe_trace(slice_track.open, now_ns, label)
+            # CRITICAL: Only store state AFTER successful open
+            if ok:
+                # Fail fast: duplicate cluster_id means scheduler violated one-request-per-cluster invariant
+                assert cluster_id not in self._pending_queue_trace_state, (
+                    f"Duplicate queue trace enqueue for cluster_id={cluster_id!r}"
+                )
+                self._pending_queue_trace_state[cluster_id] = (slice_track, now_ns, priority)
+
+        # Counter: depth = current bucket size (AFTER append, so correct)
+        counter_track = self._get_or_create_queue_counter_track(priority)
+        if counter_track:
+            depth = len(self._state.pending_bucket(priority))
+            self._queue_depth[key] = depth  # Debug-only cache
+            self._safe_trace(counter_track.count, now_ns, depth)
+
+    def _trace_queue_slice_close(self, cluster_id: str) -> None:
+        """Close queue slice when request is fulfilled.
+
+        CRITICAL:
+        - Call BEFORE bucket.pop()
+        - ALWAYS pops pending state (prevents leaks)
+        - Uses stored track handle (no track creation on close)
+        - Uses DIRECT close (not _safe_trace) to work even when tracing disabled
+
+        Note: Direct close is safe here because we have a valid track handle from
+        successful open. On unexpected errors, disables tracing (consistent with _safe_trace_call).
+        """
+        # ALWAYS pop entry first to prevent state leaks
+        entry = self._pending_queue_trace_state.pop(cluster_id, None)
+        if entry is None:
+            return  # No pending trace state for this cluster
+
+        stored_track, _, stored_priority = entry
+
+        # Direct close - NOT via _safe_trace, so works even if tracing disabled
+        now_ns = time.time_ns()
+        if stored_track is not None:
+            try:
+                stored_track.close(now_ns)
+            except (IOError, OSError):
+                # I/O errors are expected - ignore
+                pass
+            except Exception as e:
+                # Unexpected error - log and disable tracing (consistent with _safe_trace_call)
+                logging.getLogger(__name__).warning(f"Queue trace close error, disabling tracing: {e}")
+                self._enable_gpu_tracing = False
+
+    def _trace_queue_counter_update(self, priority: Priority, depth: int) -> None:
+        """Update queue depth counter with explicit depth value.
+
+        CRITICAL:
+        - Call AFTER bucket.pop() with len(bucket) as depth
+        - Depth comes from real bucket length, not cache
+        - Separating this from slice_close allows correct ordering
+        """
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return
+
+        now_ns = time.time_ns()
+        key = _PRIORITY_SHORT.get(priority, priority.name[:3])
+
+        counter_track = self._get_or_create_queue_counter_track(priority)
+        if counter_track:
+            self._queue_depth[key] = depth  # Debug-only cache
+            self._safe_trace(counter_track.count, now_ns, depth)
+
+    def _shutdown_close_queue_slices(self) -> None:
+        """Close all open queue slices during shutdown.
+
+        CRITICAL:
+        - Does NOT gate on _enable_gpu_tracing (called after it's False)
+        - Uses stored track handles directly
+        - Called BEFORE _safe_final_flush()
+        """
+        if not self._pending_queue_trace_state:
+            return
+
+        now_ns = time.time_ns()
+        for cluster_id, (track, _, _) in list(self._pending_queue_trace_state.items()):
+            if track is not None:
+                # Direct call, no gating - we're in shutdown
+                try:
+                    track.close(now_ns)
+                except Exception:
+                    pass  # Ignore errors during shutdown
+        self._pending_queue_trace_state.clear()
 
     def _build_trace_label(
         self,
@@ -391,9 +620,10 @@ class SchedulerImpl:
 
         Order of operations:
         1. Check idempotency guard
-        2. Disable tracing flag (stops new trace calls)
-        3. Clear all trace state (prevent orphaned references)
-        4. Final flush (write remaining data)
+        2. Close all open queue slices FIRST (before disabling tracing)
+        3. Disable tracing flag (stops new trace calls)
+        4. Clear all trace state (prevent orphaned references)
+        5. Final flush (write remaining data)
         """
         if self._trace_shutdown_started:
             return
@@ -402,16 +632,23 @@ class SchedulerImpl:
         if self._trace_gen is None:
             return
 
-        # Step 1: Disable tracing to stop new calls
+        # Step 1: Close all open queue slices FIRST (before disabling tracing)
+        # This uses stored track handles, works even if we proceed to disable
+        self._shutdown_close_queue_slices()
+
+        # Step 2: Disable tracing to stop new calls
         self._enable_gpu_tracing = False
 
-        # Step 2: Clear all trace state before flush
+        # Step 3: Clear all trace state before flush
         # NormalTrack holds parent generator refs - must clear to prevent writes after flush
         self._gpu_tracks.clear()
         self._gpu_contexts.clear()
+        self._queue_counter_tracks.clear()
+        self._queue_depth.clear()
+        self._queue_groups.clear()  # wrapper refs hold _parent (TraceGenerator) — must clear
         self._scheduler_group = None
 
-        # Step 3: Final flush via guarded helper
+        # Step 4: Final flush via guarded helper
         self._safe_final_flush()
 
         self._trace_gen = None
@@ -518,37 +755,85 @@ class SchedulerImpl:
     async def unregister_pipeline(self, *, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
         async with self._lock:
+            # ============================================================
+            # PHASE 1: VALIDATE - Parse all cluster_ids, fail-fast if any malformed
+            # ============================================================
+            allocations_to_remove: List[str] = []
+            for cluster_id in self._state.active_allocations:
+                try:
+                    parsed_pipeline_id, _ = parse_cluster_id(cluster_id)
+                except ValueError as e:
+                    # CRITICAL: Malformed cluster_id indicates system corruption
+                    # Signal all waiters and trigger global fail-fast shutdown
+                    error_msg = f"Malformed cluster_id in active_allocations: {cluster_id!r}"
+                    self._signal_all_waiters_with_error(error=error_msg)
+                    await self._fail_fast_shutdown(reason=f"unregister_pipeline_invalid_cluster_id: {cluster_id!r}")
+                    raise RuntimeError(error_msg) from e
+                if parsed_pipeline_id == pipeline_id:
+                    allocations_to_remove.append(cluster_id)
+
+            pending_to_remove: Dict[Priority, List[PendingRequest]] = {}
+            for priority in Priority:
+                pending_to_remove[priority] = []
+                for pending in self._state.pending_bucket(priority):
+                    try:
+                        parsed_pipeline_id, _ = parse_cluster_id(pending.request.cluster_id)
+                    except ValueError as e:
+                        error_msg = f"Malformed cluster_id in pending bucket: {pending.request.cluster_id!r}"
+                        self._signal_all_waiters_with_error(error=error_msg)
+                        await self._fail_fast_shutdown(reason=f"unregister_pipeline_invalid_cluster_id: {pending.request.cluster_id!r}")
+                        raise RuntimeError(error_msg) from e
+                    if parsed_pipeline_id == pipeline_id:
+                        pending_to_remove[priority].append(pending)
+
+            planned_releases_to_remove: List[str] = []
+            for cluster_id in self._state.pending_planned_release_requests:
+                try:
+                    parsed_pipeline_id, _ = parse_cluster_id(cluster_id)
+                except ValueError as e:
+                    error_msg = f"Malformed cluster_id in pending_planned_release_requests: {cluster_id!r}"
+                    self._signal_all_waiters_with_error(error=error_msg)
+                    await self._fail_fast_shutdown(reason=f"unregister_pipeline_invalid_cluster_id: {cluster_id!r}")
+                    raise RuntimeError(error_msg) from e
+                if parsed_pipeline_id == pipeline_id:
+                    planned_releases_to_remove.append(cluster_id)
+
+            # ============================================================
+            # PHASE 2: MUTATE - Non-throwing operations only
+            # ============================================================
             self._state.pipeline_registry.pop(pipeline_id, None)
             self._state.latest_progress_by_pipeline.pop(pipeline_id, None)
             self._adapter_handle_cache.pop(pipeline_id, None)
 
-            # Single iteration: end traces + remove allocations for this pipeline
-            for cluster_id in list(self._state.active_allocations.keys()):
-                if not cluster_id.startswith(f"{pipeline_id}_"):
-                    continue
+            # Remove allocations
+            for cluster_id in allocations_to_remove:
                 alloc = self._state.active_allocations.pop(cluster_id, None)
                 if alloc is not None:
-                    # GPU Tracing: End traces for all GPUs held by this cluster
                     self._end_traces_for_gpu_ids(alloc.gpu_ids)
                     self._state.idle_gpus |= set(alloc.gpu_ids)
 
-            for priority in Priority:
+            # Remove pending requests and close queue slices
+            affected_priorities: Set[Priority] = set()
+            for priority, pendings in pending_to_remove.items():
                 bucket = self._state.pending_bucket(priority)
-                remaining: List[PendingRequest] = []
-                for pending in bucket:
-                    if not pending.request.cluster_id.startswith(f"{pipeline_id}_"):
-                        remaining.append(pending)
-                        continue
+                for pending in pendings:
+                    # Queue Tracing: Close slice before removing
+                    self._trace_queue_slice_close(pending.request.cluster_id)
                     pending.error = f"Pipeline {pipeline_id!r} unregistered"
                     pending.event.set()
-                bucket[:] = remaining
+                    if pending in bucket:
+                        bucket.remove(pending)
+                    affected_priorities.add(priority)
+                # Queue Tracing: Update counter for affected priorities
+                if priority in affected_priorities:
+                    self._trace_queue_counter_update(priority, len(bucket))
 
-            for cluster_id, req in list(self._state.pending_planned_release_requests.items()):
-                if not cluster_id.startswith(f"{pipeline_id}_"):
-                    continue
-                req.error = f"Pipeline {pipeline_id!r} unregistered"
-                req.event.set()
-                self._state.pending_planned_release_requests.pop(cluster_id, None)
+            # Remove planned releases
+            for cluster_id in planned_releases_to_remove:
+                req = self._state.pending_planned_release_requests.pop(cluster_id, None)
+                if req is not None:
+                    req.error = f"Pipeline {pipeline_id!r} unregistered"
+                    req.event.set()
 
             self._wakeup_event.set()
 
@@ -823,6 +1108,8 @@ class SchedulerImpl:
                 lora_name=lora_name,  # GPU Tracing: pass lora_name to pending request
             )
             self._state.pending_bucket(priority).append(pending)
+            # Queue Tracing: Track enqueue AFTER append (depth is correct)
+            self._trace_queue_enqueue(cluster_id, priority, lora_name)
             self._wakeup_event.set()
         await event.wait()
         if pending is None:
@@ -891,6 +1178,8 @@ class SchedulerImpl:
                 lora_name=request_lora_name,  # GPU Tracing: pass lora_name to pending request
             )
             self._state.pending_bucket(request_priority).append(pending)
+            # Queue Tracing: Track enqueue AFTER append (depth is correct)
+            self._trace_queue_enqueue(request_cluster_id, request_priority, request_lora_name)
             self._wakeup_event.set()
         await event.wait()
         if pending is None:
@@ -900,11 +1189,16 @@ class SchedulerImpl:
         return list(pending.result)
 
     def _signal_all_waiters_with_error(self, *, error: str) -> None:
+        # Queue Tracing: Close all queue slices (track from stored state)
         for priority in Priority:
             for pending in list(self._state.pending_bucket(priority)):
+                # Close slice before clearing
+                self._trace_queue_slice_close(pending.request.cluster_id)
                 pending.error = error
                 pending.event.set()
             self._state.pending_bucket(priority).clear()
+            # Queue Tracing: Single counter update to 0 after clear
+            self._trace_queue_counter_update(priority, 0)
         for _, req in list(self._state.pending_planned_release_requests.items()):
             req.error = error
             req.event.set()
@@ -1835,7 +2129,12 @@ class SchedulerImpl:
         for idx, pending in enumerate(bucket):
             if pending.request.cluster_id != cluster_id:
                 continue
+            # Queue Tracing: Close slice BEFORE pop (track from stored state)
+            self._trace_queue_slice_close(cluster_id)
+            # Pop from bucket
             bucket.pop(idx)
+            # Queue Tracing: Update counter AFTER pop with correct depth
+            self._trace_queue_counter_update(priority, len(bucket))
             pending.result = list(result or [])
             pending.event.set()
             return
