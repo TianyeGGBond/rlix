@@ -34,7 +34,7 @@
 - **Ask First**: If unclear, ask one short question before starting.
 
 ## 5. Code Understandability Rules
-- **Semantic Intent (Name + Scope)**: Names must communicate domain intent, and each function should do one job; if a name needs `and`, split the function.
+- **Semantic Intent (Name + Scope)**: Names must communicate domain intent, and each function should do one job; if a name needs `and`, split the function. NEVER use single-letter variable names — no exceptions, including loop indices.
 - **Flat Logic (Anti-Nesting)**: Prefer guard clauses and early returns so the main path stays obvious; avoid nesting deeper than two levels.
 - **Explicit Interfaces (Typed Contracts)**: Public APIs MUST be typed, prefer `T | None`, and minimize `Any` to true dynamic/untyped boundaries.
 - **Why Layer (Intent Docs)**: Comments/docstrings explain non-obvious reasons, constraints, and tradeoffs; replace magic values with named constants.

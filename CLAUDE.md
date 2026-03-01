@@ -34,7 +34,7 @@
 - **Ask First**: If unclear, ask one short question before starting.
 
 ## 5. Code Understandability Rules
-- **Name for Intent**: Use domain-specific names that explain purpose; avoid single-letter names except simple loop indices.
+- **Name for Intent**: Use domain-specific names that explain purpose. NEVER use single-letter variable names — no exceptions, including loop indices.
 - **Keep Functions Small**: Prefer single-responsibility functions; split functions that become hard to explain quickly.
 - **No Magic Values**: Replace unexplained literals with well-named constants.
 - **Readable Control Flow**: Prefer simple branches and early returns; avoid deep nesting and clever one-liners.
