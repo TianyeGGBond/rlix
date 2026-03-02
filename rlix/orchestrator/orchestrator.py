@@ -11,13 +11,13 @@ from typing import Any, Dict, Literal, Optional
 # Used as a prefix in pipeline_id for trace readability (e.g., "ft_abc123", "lora_abc123").
 PipelineType = Literal["ft", "lora"]
 
-from schedrl.protocol.request_id import validate_pipeline_id
-from schedrl.protocol.types import ORCHESTRATOR_ACTOR_NAME, SCHEDRL_NAMESPACE, SCHEDULER_ACTOR_NAME
-from schedrl.protocol.validation import RegisterValidationInput, validate_register_pipeline
-from schedrl.scheduler.resource_manager import get_or_create_resource_manager
-from schedrl.scheduler.scheduler import scheduler_actor_class
-from schedrl.utils.ray_head import get_head_node_id
-from schedrl.utils.ray_head import head_node_affinity_strategy
+from rlix.protocol.request_id import validate_pipeline_id
+from rlix.protocol.types import ORCHESTRATOR_ACTOR_NAME, RLIX_NAMESPACE, SCHEDULER_ACTOR_NAME
+from rlix.protocol.validation import RegisterValidationInput, validate_register_pipeline
+from rlix.scheduler.resource_manager import get_or_create_resource_manager
+from rlix.scheduler.scheduler import scheduler_actor_class
+from rlix.utils.ray_head import get_head_node_id
+from rlix.utils.ray_head import head_node_affinity_strategy
 import ray
 
 
@@ -43,18 +43,18 @@ def _kill_local_ray() -> None:
     # WARNING: Calling `ray stop --force` via subprocess from inside a Ray actor triggers
     # a deepcopy bug with Sentinel enum objects (Ray 2.47.1 + Python 3.10).
     # Use ray.shutdown() instead, which is safe to call from within Ray workers.
-    sys.stderr.write("[schedrl][WARN] _kill_local_ray() called from inside Ray actor - using ray.shutdown() instead of 'ray stop --force'\n")
+    sys.stderr.write("[rlix][WARN] _kill_local_ray() called from inside Ray actor - using ray.shutdown() instead of 'ray stop --force'\n")
     sys.stderr.flush()
     try:
         ray.shutdown()
     except Exception as e:
-        sys.stderr.write(f"[schedrl][WARN] ray.shutdown() failed: {e}\n")
+        sys.stderr.write(f"[rlix][WARN] ray.shutdown() failed: {e}\n")
         sys.stderr.flush()
 
 
 def _ensure_scheduler_singleton():
     try:
-        return ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+        return ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
     except ValueError:
         pass
 
@@ -64,7 +64,7 @@ def _ensure_scheduler_singleton():
         scheduler = (
             SchedulerActor.options(
                 name=SCHEDULER_ACTOR_NAME,
-                namespace=SCHEDRL_NAMESPACE,
+                namespace=RLIX_NAMESPACE,
                 scheduling_strategy=strategy,
                 max_restarts=0,
                 max_task_retries=0,
@@ -73,7 +73,7 @@ def _ensure_scheduler_singleton():
             .remote()
         )
     except Exception:
-        scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+        scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
 
     try:
         resource_manager = get_or_create_resource_manager()
@@ -82,7 +82,7 @@ def _ensure_scheduler_singleton():
         ray.get(resource_manager.snapshot.remote(wait_timeout_s=10.0, poll_interval_s=0.2))
         # Default: infer GPUs-per-node from Ray topology (portable for local smoke tests).
         # If set, this env var pins a stricter topology contract and must match observation.
-        required_gpus_per_node_raw = os.environ.get("SCHEDRL_REQUIRED_GPUS_PER_NODE")
+        required_gpus_per_node_raw = os.environ.get("RLIX_REQUIRED_GPUS_PER_NODE")
         if required_gpus_per_node_raw is None or required_gpus_per_node_raw.strip() == "":
             required_gpus_per_node = None
         else:
@@ -90,16 +90,16 @@ def _ensure_scheduler_singleton():
                 required_gpus_per_node = int(required_gpus_per_node_raw)
             except Exception as e:
                 raise RuntimeError(
-                    f"Invalid SCHEDRL_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected int"
+                    f"Invalid RLIX_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected int"
                 ) from e
             if required_gpus_per_node <= 0:
                 raise RuntimeError(
-                    f"Invalid SCHEDRL_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected > 0"
+                    f"Invalid RLIX_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected > 0"
                 )
         ray.get(resource_manager.init_topology.remote(required_gpus_per_node=required_gpus_per_node))
         ray.get(scheduler.initialize.remote(resource_manager=resource_manager))
     except Exception as e:
-        raise RuntimeError("Failed to initialize SchedRL scheduler actor") from e
+        raise RuntimeError("Failed to initialize Rlix scheduler actor") from e
     return scheduler
 
 
@@ -266,7 +266,7 @@ class Orchestrator:
                 continue
         if kill_lookup_failures or kill_failures:
             sys.stderr.write(
-                f"[schedrl][WARN] kill_pipeline(namespace={ray_namespace!r}) had {kill_lookup_failures} actor lookup failures "
+                f"[rlix][WARN] kill_pipeline(namespace={ray_namespace!r}) had {kill_lookup_failures} actor lookup failures "
                 f"and {kill_failures} ray.kill failures for pipeline_id={pipeline_id!r}\n"
             )
 
@@ -291,7 +291,7 @@ class Orchestrator:
                 ) from e
 
             sys.stderr.write(
-                f"[schedrl][ERROR] Found {len(unnamed_alive)} unnamed ALIVE actors in namespace {ray_namespace!r}; "
+                f"[rlix][ERROR] Found {len(unnamed_alive)} unnamed ALIVE actors in namespace {ray_namespace!r}; "
                 "using internal core_worker.get_actor_handle(...) to force kill them. "
                 "These actors should be named (or their handles retained) to avoid relying on Ray internals.\n"
             )
@@ -307,7 +307,7 @@ class Orchestrator:
                     handle = ray.worker.global_worker.core_worker.get_actor_handle(actor_id_obj)
                     ray.kill(handle, no_restart=True)
                 except Exception as e:
-                    sys.stderr.write(f"[schedrl][ERROR] Failed to force-kill unnamed actor_id={actor_id_hex!r}: {e}\n")
+                    sys.stderr.write(f"[rlix][ERROR] Failed to force-kill unnamed actor_id={actor_id_hex!r}: {e}\n")
 
         # Placement groups are owned by the RollResourceManager singleton actor;
         # Ray cleans them up automatically when that actor is killed.
@@ -316,11 +316,11 @@ class Orchestrator:
             try:
                 ray.get(shared_storage.delete_port_claims.remote(pipeline_id))
             except Exception as e:
-                sys.stderr.write(f"[schedrl][ERROR] SharedStorage.delete_port_claims failed for pipeline_id={pipeline_id!r}: {e}\n")
+                sys.stderr.write(f"[rlix][ERROR] SharedStorage.delete_port_claims failed for pipeline_id={pipeline_id!r}: {e}\n")
             try:
                 ray.get(shared_storage.delete_prefix.remote(f"{pipeline_id}:"))
             except Exception as e:
-                sys.stderr.write(f"[schedrl][ERROR] SharedStorage.delete_prefix failed for prefix={pipeline_id + ':'!r}: {e}\n")
+                sys.stderr.write(f"[rlix][ERROR] SharedStorage.delete_prefix failed for prefix={pipeline_id + ':'!r}: {e}\n")
 
         self._pipelines.pop(pipeline_id, None)
 
@@ -331,7 +331,7 @@ class Orchestrator:
 
     def shutdown(self, force: bool = True, reason: Optional[str] = None, source: Optional[str] = None) -> None:
         import traceback
-        sys.stderr.write(f"[schedrl][DEBUG] orchestrator.shutdown called: force={force!r} reason={reason!r} source={source!r}\n")
+        sys.stderr.write(f"[rlix][DEBUG] orchestrator.shutdown called: force={force!r} reason={reason!r} source={source!r}\n")
         sys.stderr.write("".join(traceback.format_stack()))
         sys.stderr.flush()
         if self._shutdown_started:

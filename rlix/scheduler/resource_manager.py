@@ -3,16 +3,16 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from schedrl.protocol.types import RESOURCE_MANAGER_ACTOR_NAME, SCHEDRL_NAMESPACE
-from schedrl.utils.ray_head import head_node_affinity_strategy
+from rlix.protocol.types import RESOURCE_MANAGER_ACTOR_NAME, RLIX_NAMESPACE
+from rlix.utils.ray_head import head_node_affinity_strategy
 import ray
 
 # ENG-123: Platform/resource assumption
-# SchedRL and ROLL resource keys differ: this module uses Ray's "GPU" resource
+# Rlix and ROLL resource keys differ: this module uses Ray's "GPU" resource
 # key (as returned by `ray.cluster_resources()` / `ray.nodes()`), whereas ROLL's
 # scheduler stack references `current_platform.ray_device_key`. For parity across
 # deployment platforms we would need to align these abstractions. For ENG-123 we
-# document that SchedRL currently targets CUDA-only setups where the Ray GPU
+# document that Rlix currently targets CUDA-only setups where the Ray GPU
 # resource key is present and meaningful. Prefer naming/standardizing the
 # platform-level device key if broader device types are required in future.
 
@@ -121,7 +121,7 @@ class ResourceManager:
         }
 
 
-def get_or_create_resource_manager(*, name: str = RESOURCE_MANAGER_ACTOR_NAME, namespace: str = SCHEDRL_NAMESPACE):
+def get_or_create_resource_manager(*, name: str = RESOURCE_MANAGER_ACTOR_NAME, namespace: str = RLIX_NAMESPACE):
     try:
         return ray.get_actor(name, namespace=namespace)
     except ValueError:

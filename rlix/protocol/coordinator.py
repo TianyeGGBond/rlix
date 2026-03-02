@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, List
 
-from schedrl.protocol.types import ActionResponse
+from rlix.protocol.types import ActionResponse
 
 
 class Coordinator(ABC):

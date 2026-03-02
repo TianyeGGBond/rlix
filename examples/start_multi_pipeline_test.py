@@ -1,12 +1,12 @@
 """
-SchedRL multi-pipeline example (ENG-123).
+RLix multi-pipeline example (ENG-123).
 
 This ports the fork reference configs (`pipeline1_sokoban_grpo.yaml`, `pipeline2_sokoban_grpo.yaml`) and provides a
-driver that runs 1+ pipelines concurrently under the SchedRL control plane.
+driver that runs 1+ pipelines concurrently under the RLix control plane.
 
 Usage (from repo root):
-  python external/ROLL_schedrl/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo
-  python external/ROLL_schedrl/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo,pipeline2_sokoban_grpo
+  python external/ROLL_rlix/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo
+  python external/ROLL_rlix/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo,pipeline2_sokoban_grpo
 """
 
 from __future__ import annotations
@@ -22,29 +22,29 @@ from dacite import from_dict
 from hydra import compose, initialize
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
-from schedrl.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, SCHEDRL_NAMESPACE
+from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, RLIX_NAMESPACE
 
 
 def _repo_root() -> Path:
     # Resolve the mono-repo root regardless of where this example is vendored.
     #
     # We intentionally avoid relying on a fixed `parents[N]` depth because this file
-    # lives under `external/ROLL_schedrl/...` in this workspace (vs `third_party/ROLL/...`
+    # lives under `external/ROLL_rlix/...` in this workspace (vs `third_party/ROLL/...`
     # in other layouts).
     start = Path(__file__).resolve()
     for parent in start.parents:
         git_dir = parent / ".git"
         if git_dir.exists() and git_dir.is_dir():
             return parent
-        if (parent / "AGENTS.md").exists() and (parent / "schedrl").is_dir():
+        if (parent / "AGENTS.md").exists() and (parent / "rlix").is_dir():
             return parent
     raise RuntimeError(f"Failed to locate repo root from {start}")
 
 
 def _resolve_roll_root(*, repo_root: Path) -> Path:
-    # Prefer the in-repo ROLL+SchedRL fork used by ENG-123.
+    # Prefer the in-repo ROLL+RLix fork used by ENG-123.
     candidates = [
-        repo_root / "external" / "ROLL_schedrl",
+        repo_root / "external" / "ROLL_rlix",
         repo_root / "third_party" / "ROLL",
         repo_root / "external" / "ROLL",
     ]
@@ -108,15 +108,15 @@ def _cluster_registry_inputs(*, pipeline_config: Any) -> tuple[Dict[str, int], D
         cluster_tp_configs[key] = int(getattr(cfg, "num_gpus_per_worker", 1))
 
     if "actor_infer" not in cluster_tp_configs:
-        raise RuntimeError("pipeline_config must include actor_infer device_mapping for SchedRL mode")
+        raise RuntimeError("pipeline_config must include actor_infer device_mapping for RLix mode")
     return cluster_tp_configs, cluster_device_mappings
 
 
 def _pipeline_type(pipeline_config: Any) -> str:
     """Return 'lora' if the config has LoRA adapters configured, else 'ft'.
 
-    Mirrors the same lora detection used in SchedRLCoordinator.create_pipeline_actor().
-    Source: schedrl/pipeline/coordinator.py
+    Mirrors the same lora detection used in RLixCoordinator.create_pipeline_actor().
+    Source: rlix/pipeline/coordinator.py
     """
     adapters = getattr(getattr(pipeline_config, "actor_train", None), "model_args", None)
     adapters = getattr(adapters, "adapters", None) if adapters is not None else None
@@ -127,11 +127,11 @@ def main() -> None:
     repo_root, roll_root = _ensure_import_paths()
 
     from roll.pipeline.agentic.agentic_config import AgenticConfig
-    from schedrl.pipeline.coordinator import SchedRLCoordinator, _get_pipeline_namespace
+    from rlix.pipeline.coordinator import RLixCoordinator, _get_pipeline_namespace
 
-    import schedrl
+    import rlix
 
-    parser = argparse.ArgumentParser(description="SchedRL multi-pipeline example")
+    parser = argparse.ArgumentParser(description="RLix multi-pipeline example")
     parser.add_argument(
         "--config_path",
         default="multi_pipeline",
@@ -160,7 +160,7 @@ def main() -> None:
     if not config_names:
         raise ValueError("--config_name must be non-empty")
 
-    # Make the driver + all Ray workers able to import `roll` and `schedrl`.
+    # Make the driver + all Ray workers able to import `roll` and `rlix`.
     # (Ray workers do not inherit the driver's `sys.path` mutations.)
     pythonpath_parts = [str(repo_root), str(roll_root)]
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
@@ -169,7 +169,7 @@ def main() -> None:
     worker_pythonpath = os.pathsep.join(pythonpath_parts)
 
     # This example is often run in a single-process "smoke test" setup without a pre-existing Ray cluster.
-    # Initialize a local Ray runtime so schedrl.init() does not require an external `ray start --head`.
+    # Initialize a local Ray runtime so rlix.init() does not require an external `ray start --head`.
     # Log before ray.init() — this is when the head node gRPC pool size is fixed.
     _grpc_pool = os.environ.get("RAY_grpc_server_thread_pool_size", "4")
     _omp = os.environ.get("OMP_NUM_THREADS", "1")
@@ -180,7 +180,7 @@ def main() -> None:
         # Actors that specify their own runtime_env override this, but it catches
         # any actor that does not set an explicit runtime_env.
         ray.init(
-            namespace=SCHEDRL_NAMESPACE,
+            namespace=RLIX_NAMESPACE,
             ignore_reinit_error=True,
             log_to_driver=True,
             runtime_env={"env_vars": {
@@ -193,7 +193,7 @@ def main() -> None:
 
     hydra_config_path, _ = _resolve_hydra_config_path(roll_root=roll_root, arg_config_path=args.config_path)
     GlobalHydra.instance().clear()
-    initialize(config_path=hydra_config_path, job_name="schedrl_multi_pipeline", version_base=None)
+    initialize(config_path=hydra_config_path, job_name="rlix_multi_pipeline", version_base=None)
 
     pipeline_configs: List[AgenticConfig] = []
     for idx, cn in enumerate(config_names, start=1):
@@ -219,12 +219,12 @@ def main() -> None:
         )
         pipeline_configs.append(pipeline_config)
 
-    # Ensure SchedRL control plane is up (creates orchestrator + scheduler actors).
-    orchestrator = schedrl.init(create_if_missing=True)
+    # Ensure RLix control plane is up (creates orchestrator + scheduler actors).
+    orchestrator = rlix.init(create_if_missing=True)
     if orchestrator is None:
-        raise RuntimeError("schedrl.init returned None (expected orchestrator actor handle on rank 0)")
+        raise RuntimeError("rlix.init returned None (expected orchestrator actor handle on rank 0)")
 
-    CoordinatorActor = ray.remote(SchedRLCoordinator)
+    CoordinatorActor = ray.remote(RLixCoordinator)
 
     coordinators = []
     pipeline_actors = []
@@ -265,8 +265,8 @@ def main() -> None:
                     "PYTHONPATH": worker_pythonpath,
                     "PIPELINE_ID": str(pipeline_id),
                     "ROLL_RAY_NAMESPACE": ray_namespace,
-                    "SCHEDRL_CONTROL_PLANE": "schedrl",
-                    "SCHEDRL_LIBRARY_MODE": "1",
+                    "RLIX_CONTROL_PLANE": "rlix",
+                    "RLIX_LIBRARY_MODE": "1",
                     # Propagate thread-limiting vars so coordinator + pipeline actors
                     # stay within container pids.max. Falls back to safe defaults if
                     # not set in the shell.

@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
-from schedrl.protocol.types import Priority
-from schedrl.scheduler.types import (
+from rlix.protocol.types import Priority
+from rlix.scheduler.types import (
     ClusterAllocation,
     ExecutionPlan,
     ValidationError,

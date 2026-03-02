@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""SchedRL Scheduler (ENG-123 Phase 2).
+"""Rlix Scheduler (ENG-123 Phase 2).
 
 Operational policy (ENG-123): fail-fast only. No recovery or rehydration is provided; on any
 scheduler restart, pipelines are expected to re-register and be re-admitted.
@@ -17,10 +17,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
-from schedrl.protocol.request_id import validate_pipeline_id
-from schedrl.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, SCHEDRL_NAMESPACE
-from schedrl.scheduler.state import SchedulerState
-from schedrl.scheduler.types import (
+from rlix.protocol.request_id import validate_pipeline_id
+from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, RLIX_NAMESPACE
+from rlix.scheduler.state import SchedulerState
+from rlix.scheduler.types import (
     ClusterAllocation,
     ExecutionPlan,
     PendingPlannedReleaseRequest,
@@ -33,7 +33,7 @@ from schedrl.scheduler.types import (
     parse_cluster_id,
     validate_cluster_id,
 )
-from schedrl.scheduler.validation import ValidationInputs, normalize_progress_oldest_ts, validate_execution_plan
+from rlix.scheduler.validation import ValidationInputs, normalize_progress_oldest_ts, validate_execution_plan
 
 import ray
 
@@ -775,7 +775,7 @@ class SchedulerImpl:
         # Guard: tg4perfetto must be available when tracing is explicitly requested
         if not _TG4PERFETTO_AVAILABLE:
             raise RuntimeError(
-                "SCHEDRL_ENABLE_GPU_TRACING is set but tg4perfetto is not installed."
+                "RLIX_ENABLE_GPU_TRACING is set but tg4perfetto is not installed."
                 " Install it with: pip install tg4perfetto"
             )
 
@@ -783,7 +783,7 @@ class SchedulerImpl:
         ts = time.strftime("%Y%m%d_%H%M%S")
         self._trace_file_path = os.path.join(
             trace_output_dir or os.getcwd(),
-            f"schedrl_gpu_timeline_{ts}.perfetto-trace",
+            f"rlix_gpu_timeline_{ts}.perfetto-trace",
         )
 
         try:
@@ -1074,8 +1074,8 @@ class SchedulerImpl:
 
         # GPU Tracing: Enable tracing if parameter or env var is set
         # NOTE: Both env vars are read here (in scheduler actor) for consistency
-        env_tracing = os.environ.get("SCHEDRL_ENABLE_GPU_TRACING", "").lower() in ("1", "true")
-        env_trace_dir = os.environ.get("SCHEDRL_TRACE_OUTPUT_DIR")
+        env_tracing = os.environ.get("RLIX_ENABLE_GPU_TRACING", "").lower() in ("1", "true")
+        env_trace_dir = os.environ.get("RLIX_TRACE_OUTPUT_DIR")
         self._enable_gpu_tracing = enable_gpu_tracing or env_tracing
 
         if self._enable_gpu_tracing:
@@ -1962,14 +1962,14 @@ class SchedulerImpl:
 
     async def _fail_fast_shutdown(self, *, reason: str) -> None:
         try:
-            orchestrator = ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+            orchestrator = ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=RLIX_NAMESPACE)
         except Exception as e:
-            sys.stderr.write(f"[schedrl][ERROR] Failed to resolve orchestrator actor for shutdown: {type(e).__name__}: {e}\n")
+            sys.stderr.write(f"[rlix][ERROR] Failed to resolve orchestrator actor for shutdown: {type(e).__name__}: {e}\n")
             return
         try:
             orchestrator.shutdown.remote(force=True, reason=reason, source="scheduler")
         except Exception as e:
-            sys.stderr.write(f"[schedrl][ERROR] Failed to call orchestrator.shutdown: {type(e).__name__}: {e}\n")
+            sys.stderr.write(f"[rlix][ERROR] Failed to call orchestrator.shutdown: {type(e).__name__}: {e}\n")
             return
 
     def _snapshot_generation_dp_workers(
@@ -2047,7 +2047,7 @@ class SchedulerImpl:
         epsilon: float = 0.0,
     ) -> Set[int]:
         # Ported from ROLL_multi_pipeline CentralizedGPUSchedulerImpl._plan_generation_gap_ratio_alternative,
-        # adapted to SchedRL-standard progress reporting (percent_completed / step_target_trajectories).
+        # adapted to RLix-standard progress reporting (percent_completed / step_target_trajectories).
 
         def _round_half_up(value: float) -> int:
             return int(math.floor(value + 0.5))
@@ -2489,7 +2489,7 @@ class SchedulerImpl:
         global_step: Optional[int] = None,
         timeout_s: Optional[float] = None,
     ) -> List[int]:
-        """Blocking planned release API (SchedRL checklist).
+        """Blocking planned release API (RLix checklist).
 
         Phase 2 implementation is state-only: scheduler selects dp_ranks_to_remove for the generation cluster from
         allocation state and blocks until the scheduler commits a shrink in its next cycle.

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
-from schedrl.protocol.request_id import validate_pipeline_id
+from rlix.protocol.request_id import validate_pipeline_id
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,6 +1,8 @@
 # Code Review Plan: ENG-123 SchedRL Extraction + Multi-LoRA Pipeline
 
 **Date**: 2026-03-01
+**Status**: Executed 2026-03-01. See [Execution Notes](#execution-notes) at end of document for deviations from plan.
+**Post-Review Migration**: 2026-03-02 — `roll/schedrl_adapter/` migrated to `schedrl/pipeline/`. See [Migration Notes](#migration-notes) for file path mappings.
 **Scope**:
 - `schedrl/`: baseline `b0774f3` (inclusive) through HEAD — 31 commits (`b0774f3` is the first new commit; `git rev-list --count b0774f3^..HEAD -- schedrl/` = 31)
 - `external/ROLL_schedrl`: baseline `88baa61b` (exclusive) through HEAD — 59 commits (`git rev-list --count 88baa61b..HEAD` = 59)
@@ -19,8 +21,8 @@
 Before this work, multi-pipeline time-sharing logic lived in a fork (`ROLL_multi_pipeline`). ENG-123 extracts the scheduler core into a standalone Ray-based library (`schedrl/`) and re-integrates it with upstream ROLL via a thin adapter layer.
 
 Ownership boundary enforced by the plan:
-- `schedrl/` owns: protocol/types, client, central scheduler Ray actor, planner, state
-- `roll/schedrl_adapter/` owns: ROLL-specific mechanics (DP subset lifecycle, abort+ACK, progress mapping, GPU cluster management)
+- `schedrl/` owns: protocol/types, client, central scheduler Ray actor, planner, state, pipeline coordinator (migrated from `roll/schedrl_adapter/`)
+- `schedrl/pipeline/` owns: ROLL-specific mechanics (DP subset lifecycle, abort+ACK, progress mapping, GPU cluster management) — **migrated from `roll/schedrl_adapter/` on 2026-03-02**
 
 Key constraints that drive many design decisions:
 - **Library Mode only** (job-owned scheduler, no shared Service Mode daemon) for ENG-123
@@ -47,7 +49,7 @@ These invariants are referenced across multiple groups. Check each once centrall
 - **INV-3 Adapter lock ordering**: `_op_lock` serializes `resize_infer` and weight sync. `_resize_sync_lock` serializes resize and sync in the pipeline. These two locks must never be held in incompatible order — verify no call path acquires `_resize_sync_lock` then `_op_lock`. (Groups 7, 11)
 - **INV-4 Selective adapter sync only**: After training adapter A, only A's weights are broadcast. Adapter B's resident weights must be untouched and uncorrupted. (Groups 4, 6, 7, 8)
 - **INV-5 No mixed-adapter batch**: A single inference batch must never contain requests for two different `lora_name` values. Must be enforced at the vLLM strategy layer. (Groups 6, 8)
-- **INV-6 No policy leakage into adapter**: `roll/schedrl_adapter/` must contain zero gap-ratio logic or priority assignments. All scheduling policy lives in `schedrl/scheduler/`. (Groups 2, 3, 7)
+- **INV-6 No policy leakage into coordinator**: `schedrl/pipeline/` (formerly `roll/schedrl_adapter/`) must contain zero gap-ratio logic or priority assignments. All scheduling policy lives in `schedrl/scheduler/`. (Groups 2, 3, 7)
 - **INV-7 Boundary enforcement**: `schedrl/` must have zero ROLL-specific imports (`from roll` / `import roll`). (All groups touching `schedrl/`)
 - **INV-8 Timeouts from env vars only**: All timeouts in `schedrl/` must come from `_get_env_timeout_s`, never hardcoded literals. (Groups 1, 3, 4)
 
@@ -76,11 +78,14 @@ Commits within each group are listed **oldest → newest** (natural reading orde
 ## Review Workflow
 
 ### Step 0 — Workspace isolation
-- Each agent runs in its assigned review worktree (detached, pinned to group end-state commit).
-- Single-repo groups: one worktree pinned to last commit in `range_commits`.
-- Mixed-repo groups: two worktrees — main repo (last `S:` commit) and `external/ROLL_schedrl` (last `R:` commit). Coordinator verifies both HEADs match `range_commits` before spawning agents.
+- Each group gets a worktree under `code_review/output/group_{NN}/` pinned to its end-state commit, so human reviewers can browse the exact code state referenced by findings.
+- Single-repo `[S]` groups: `G{NN}/` at the group's last `[S]` commit.
+- Single-repo `[R]` groups: `G{NN}/` (ROLL_schedrl worktree) at the group's last `[R]` commit.
+- Mixed-repo groups: two worktrees — `G{NN}_S/` (main repo, last `[S]` commit) and `G{NN}_R/` (`external/ROLL_schedrl`, last `[R]` commit).
+- Agents read diffs via `git show <hash>` during review. Worktrees serve as pinned end-state snapshots for human follow-up.
+- Worktrees are **kept** after the review (not cleaned up) so findings can reference exact file paths.
 - Main tree read-only. No commits, rebases, merges, or pushes.
-- Report directory: `repo_review/output/group_{NN}/` (must be git-ignored; never included in merge-target commits)
+- Report directory: `code_review/output/group_{NN}/` (must be git-ignored; never included in merge-target commits)
 
 ### Step 0.1 — Freeze commit range
 - Record ordered commit list, pipe-delimited with repo tags. Example: `S:d227f2b|S:e34693f|...|R:cc1a3fb|...|R:d338f06`
@@ -541,7 +546,7 @@ Before full rollout, run the complete agent workflow on **Group 2** (Tier-1, 7 c
 
 ### Rule Updates
 
-- **24.1**: Both-empty or both-non-empty raises `ValueError` (strict XOR). `SchedRLAdapter.resize_infer` and `SchedRLConcurrentPipeline.resize_infer` both enforce this. Note: `RolloutScheduler.shrink_sampler`/`expand_sampler` still delegate to `shrink_workers.remote()`/`expand_workers.remote()` (Rule 2.1 unchanged).
+- **24.1**: Both-empty or both-non-empty raises `ValueError` (strict XOR). `SchedRLCoordinator.resize_infer` and `SchedRLFullFinetunePipeline.resize_infer` both enforce this. Note: `RolloutScheduler.shrink_sampler`/`expand_sampler` still delegate to `shrink_workers.remote()`/`expand_workers.remote()` (Rule 2.1 unchanged).
 
 ### Meta-rules
 
@@ -640,7 +645,7 @@ Reading order matters here: `b0774f3` defines the types that every subsequent co
 
 The first ROLL-side wiring to `schedrl/`. This group introduces three major things simultaneously:
 1. **Shrink-to-zero** in ROLL's `generate_scheduler` — a previously unsupported lifecycle state (`active_dp_ranks = {}`)
-2. The `SchedRLAdapter` Ray actor and `SchedRLConcurrentPipeline` — the first concrete implementation of the `Adapter` contract
+2. The `SchedRLCoordinator` Ray actor and `SchedRLFullFinetunePipeline` — the first concrete implementation of the `Coordinator` contract
 3. **Pipeline-scoped isolation** — each pipeline gets its own Ray namespace, named actor prefix, and port space
 
 The shrink-to-zero ordering is the most safety-critical part of this group. The ENG-123 plan mandates a strict 7-step sequence:
@@ -664,8 +669,8 @@ Violating this order can cause new requests to hit an empty worker set, or GPUs 
 - `roll/utils/context_managers.py`, `roll/utils/functionals.py`
 
 **`33ef906`** `feat(schedrl): add ROLL adapter entrypoint`
-- `roll/schedrl_adapter/adapter.py` (new, +313) — `SchedRLAdapter` Ray actor; driver scripts call this to register/admit pipelines
-- `roll/schedrl_adapter/concurrent_pipeline.py` (new, +471) — `SchedRLConcurrentPipeline` running under per-pipeline `runtime_env`
+- `schedrl/pipeline/coordinator.py` (new, +313) — `SchedRLCoordinator` Ray actor; driver scripts call this to register/admit pipelines
+- `schedrl/pipeline/full_finetune_pipeline.py` (new, +471) — `SchedRLFullFinetunePipeline` running under per-pipeline `runtime_env`
 
 **`c379a30`** `fix(config): avoid eval in worker config`
 - `roll/configs/worker_config.py` — replaces `eval()` with `ast.literal_eval()` for structured config parsing
@@ -677,8 +682,8 @@ Violating this order can cause new requests to hit an empty worker set, or GPUs 
 - New example files: `examples/multi_pipeline/`
 
 **`57a9caf`** `refactor(schedrl_adapter): simplify adapter API and static cluster GPU mgmt`
-- `roll/schedrl_adapter/adapter.py` — removes `_require_ray()` pattern; merges `ensure_coordinator + start_pipeline` into `create_coordinator`; `resize_infer` returns `ActionResponse`; sets `max_concurrency=1000`
-- `roll/schedrl_adapter/concurrent_pipeline.py` — renames `_SchedRLAgenticPipeline` to `SchedRLConcurrentPipeline`; adds GPU request/release for static clusters (`actor_train`, `actor_infer`, `critic`, `reference`); reference model offload during shrink/expand
+- `schedrl/pipeline/coordinator.py` — removes `_require_ray()` pattern; merges `ensure_coordinator + start_pipeline` into `create_coordinator`; `resize_infer` returns `ActionResponse`; sets `max_concurrency=1000`
+- `schedrl/pipeline/full_finetune_pipeline.py` — renames `_SchedRLAgenticPipeline` to `SchedRLFullFinetunePipeline`; adds GPU request/release for static clusters (`actor_train`, `actor_infer`, `critic`, `reference`); reference model offload during shrink/expand
 
 **`eb70e07`** `feat(roll): propagate SchedRL env vars via runtime_env for Ray actors`
 - `roll/utils/constants.py` (+25) — `schedrl_env_vars()` helper
@@ -708,7 +713,7 @@ Violating this order can cause new requests to hit an empty worker set, or GPUs 
 ### Audit Focus
 
 - [MECHANICAL] **`500e320` (shrink-to-zero — highest scrutiny)**: Verify the 7-step shrink ordering is implemented exactly. `suspend()` (setting `need_suspend=True`) must be called **before** any routing metadata is cleared. Confirm `active_dp_ranks={}` no longer raises. Verify the atomic lock covers the entire shrink sequence — no partial shrink is visible to incoming requests.
-- [JUDGMENT] **`33ef906` (adapter entrypoint)**: Does `SchedRLAdapter` contain only framework mechanics — zero scheduler policy? Does `SchedRLConcurrentPipeline` correctly acquire/release GPU clusters for all four cluster types (`actor_train`, `actor_infer`, `critic`, `reference`)? Are there races between acquire and release across pipelines?
+- [JUDGMENT] **`33ef906` (coordinator entrypoint)**: Does `SchedRLCoordinator` contain only framework mechanics — zero scheduler policy? Does `SchedRLFullFinetunePipeline` correctly acquire/release GPU clusters for all four cluster types (`actor_train`, `actor_infer`, `critic`, `reference`)? Are there races between acquire and release across pipelines?
 - [MECHANICAL] **`c379a30`**: Confirm no remaining `eval()` on user-controlled input anywhere in `worker_config.py`.
 - [JUDGMENT] **`21aad9c` (resize_infer)**: Is the abort ACK semantics correct — ACK must mean "not in-flight" (safe for retry) rather than "successfully completed"?
 - [MECHANICAL] **`21aad9c` (resize_infer)**: Is `PIPELINE_ID` prefix applied consistently to **all** named Ray actors (not just some)?
@@ -719,7 +724,7 @@ Violating this order can cause new requests to hit an empty worker set, or GPUs 
 ### Definition of Done
 - [ ] [MECHANICAL] INV-1 confirmed: 7-step shrink ordering verified in `500e320` (`generate_scheduler.py`)
 - [ ] [MECHANICAL] INV-2 confirmed: abort ACK semantics verified in `21aad9c` — ACK means "not in-flight"
-- [ ] [MECHANICAL] INV-6 confirmed: `SchedRLAdapter` contains zero scheduler policy (no gap-ratio, no Priority)
+- [ ] [MECHANICAL] INV-6 confirmed: `SchedRLCoordinator` contains zero scheduler policy (no gap-ratio, no Priority)
 - [ ] [MECHANICAL] `PIPELINE_ID` prefix applied to all named Ray actors (grep `21aad9c` for consistency)
 - [ ] [MECHANICAL] No remaining `eval()` on user input in `worker_config.py` after `c379a30`
 - [ ] [MECHANICAL] All 7 commits reviewed with per-commit template filled
@@ -774,8 +779,8 @@ The `[R]` side (`d945a80`) is the largest single change in this group — a majo
 - `roll/third_party/megatron/model_update.py`
 
 **`[R] d945a80`** `feat(roll): major SchedRL concurrent_pipeline refactor and vLLM compatibility`
-- `roll/schedrl_adapter/concurrent_pipeline.py` (+360) — explicit `initialize_pipeline()` for lazy init; `build_latest_bucket_cache` wrapper; reduces `max_concurrency` 1000 → 32
-- `roll/schedrl_adapter/adapter.py` — adds `PYTHONPATH` to pipeline env vars
+- `schedrl/pipeline/full_finetune_pipeline.py` (+360) — explicit `initialize_pipeline()` for lazy init; `build_latest_bucket_cache` wrapper; reduces `max_concurrency` 1000 → 32
+- `schedrl/pipeline/coordinator.py` — adds `PYTHONPATH` to pipeline env vars
 - `roll/distributed/executor/cluster.py`, `worker.py` — thread limit env vars
 - `roll/third_party/vllm/vllm_0_8_4/__init__.py` (+63) — patches vLLM v1 `_dummy_run` for `numpy.int64` tensor indexing; adds `bucket_bytes` format support in `update_parameter_in_bucket`
 
@@ -783,7 +788,7 @@ The `[R]` side (`d945a80`) is the largest single change in this group — a majo
 - Example YAMLs, `start_multi_pipeline_test.py`, `requirements_common.txt`, `requirements_torch260_vllm.txt` — reduces GPU/TP sizes for single-node; adds `VLLM_USE_V1=1`; relaxes Ray version pin
 
 **`[R] d338f06`** `feat(roll): adapt to simplified SchedRL API with state verification`
-- `roll/schedrl_adapter/concurrent_pipeline.py`, `adapter.py` — removes `planned_release_gpu_ids` from `notify_ready_to_release`; adds `release_and_request_static_cluster` for atomic train→critic GPU handoff; adds `RollResourceManagerProxy` singleton for shared placement groups; adds state verification after shrink/expand; `get_active_dp_ranks()` for post-shrink verification; coordinator scheduled in node-0 PG bundle with `num_gpus=0.01`
+- `schedrl/pipeline/full_finetune_pipeline.py`, `schedrl/pipeline/coordinator.py` — removes `planned_release_gpu_ids` from `notify_ready_to_release`; adds `release_and_request_static_cluster` for atomic train→critic GPU handoff; adds `RollResourceManagerProxy` singleton for shared placement groups; adds state verification after shrink/expand; `get_active_dp_ranks()` for post-shrink verification; coordinator scheduled in node-0 PG bundle with `num_gpus=0.01`
 
 ### Curated Audit Rules
 
@@ -834,7 +839,7 @@ This group fixes two major correctness/performance issues discovered during inte
 - `roll/utils/collective/collective.py` — `init_collective_group` and `create_collective_group` accept `timeout_s`; `get_group_by_name`/`destroy_collective_group` raise `KeyError` instead of logging silently; adds `teardown_collective_groups()` to `InferenceStrategy`
 
 **`451bd31`** `feat(model_update): comm_plan-based selective sync with NCCL teardown fix`
-- `roll/schedrl_adapter/model_update_service.py` (major rewrite) — `sync_selected_workers` selects one sender per PP rank (`dp_rank==0, tp_rank==0, cp_rank==0`) via `_select_sender_ranks_by_pp()`; `_build_comm_plan_for_sender()` allocates dedicated NCCL group per PP rank excluding colocated targets; groups destroyed inside `selective_sync_active_cache` **before** `dist.barrier()`
+- `schedrl/pipeline/model_update_service.py` (major rewrite) — `sync_selected_workers` selects one sender per PP rank (`dp_rank==0, tp_rank==0, cp_rank==0`) via `_select_sender_ranks_by_pp()`; `_build_comm_plan_for_sender()` allocates dedicated NCCL group per PP rank excluding colocated targets; groups destroyed inside `selective_sync_active_cache` **before** `dist.barrier()`
 - `roll/third_party/megatron/model_update.py`
 
 **`6670bab`** `feat(cluster): add resolve_topology flag to skip blocking ray.get in async actors`
@@ -845,17 +850,17 @@ This group fixes two major correctness/performance issues discovered during inte
 - `roll/distributed/scheduler/resource_manager.py` — `RollResourceManagerProxy` local PG allocation
 
 **`f4a24cd`** `fix(pipeline): re-offload actor_train after checkpoint to prevent GPU residual OOM`
-- `roll/schedrl_adapter/concurrent_pipeline.py`
+- `schedrl/pipeline/full_finetune_pipeline.py`
 - Root cause: `megatron_strategy.save_checkpoint()` calls `load_states()` internally but never calls `offload_states()`. Fix: `defer_actor_train_release_for_checkpoint` ensures `do_checkpoint()` runs first, then `offload_states()`, then GPU release.
 
 **`09841f3`** `fix(misc): sync resize_infer, asyncio fixes, request tracing logs, config updates`
-- `roll/schedrl_adapter/adapter.py` — `resize_infer` changed from `async` to `sync` (`ray.get` instead of `asyncio.wrap_future`)
+- `schedrl/pipeline/coordinator.py` — `resize_infer` changed from `async` to `sync` (`ray.get` instead of `asyncio.wrap_future`)
 - `roll/pipeline/agentic/environment_worker.py` — uses `asyncio.get_running_loop()` instead of deprecated `get_event_loop()`; guards `ThreadPoolExecutor` against `max_workers=0`; `pool.shutdown(wait=False)`
 - `roll/distributed/scheduler/generate_scheduler.py`, `rollout_scheduler.py` — request tracing logs
 - `roll/pipeline/agentic/agentic_pipeline.py` — config updates
 
 **`880493a`** `refactor(schedrl): move notify_ready_to_release to end of pipeline loop`
-- `roll/schedrl_adapter/concurrent_pipeline.py` — removes per-step `notify_ready_to_release`; performs single final release at end of pipeline loop (aligns with `ROLL_multi_pipeline` pattern)
+- `schedrl/pipeline/full_finetune_pipeline.py` — removes per-step `notify_ready_to_release`; performs single final release at end of pipeline loop (aligns with `ROLL_multi_pipeline` pattern)
 
 ### Curated Audit Rules
 
@@ -1016,11 +1021,11 @@ Read `0ae269b` (the pipeline implementation) before the supporting commits (`d10
 - `roll/pipeline/base_worker.py` (+13) — `train_step_lora` RPC on `ActorWorker` base class, delegates to strategy
 
 **`0ae269b`** `feat(multi-lora): add SchedRLMultiLoraPipeline implementation`
-- `roll/schedrl_adapter/multi_lora_pipeline.py` (new, +679) — the core pipeline: sequential per-adapter training loop; `sleep_level=2`; GPU handoff via SchedRL `notify_ready_to_release`; per-adapter step with `train_step_lora` + `promote_active_adapter_checkpoint`
+- `schedrl/pipeline/multi_lora_pipeline.py` (new, +679) — the core pipeline: sequential per-adapter training loop; `sleep_level=2`; GPU handoff via SchedRL `notify_ready_to_release`; per-adapter step with `train_step_lora` + `promote_active_adapter_checkpoint`
 
 **`02378f4`** `feat(multi-lora): add pipeline registration and shared RequestScheduler support`
-- `roll/schedrl_adapter/adapter.py` (+13) — multi-LoRA pipeline registration with SchedRL
-- `roll/schedrl_adapter/concurrent_pipeline.py` (+66) — exposes shared `RequestScheduler` instance for `multi_lora_pipeline` to reference
+- `schedrl/pipeline/coordinator.py` (+13) — multi-LoRA pipeline registration with SchedRL
+- `schedrl/pipeline/full_finetune_pipeline.py` (+66) — exposes shared `RequestScheduler` instance for `multi_lora_pipeline` to reference
 
 **`507f740`** `feat(multi-lora): add per-adapter cache, RNG state, and selective sync support`
 - `roll/distributed/strategy/megatron_strategy.py` (+184) — per-adapter bucket cache; saves/restores RNG state on adapter switch; selective sync scoped to trained adapter; `load_states` optimization
@@ -1030,7 +1035,7 @@ Read `0ae269b` (the pipeline implementation) before the supporting commits (`d10
 - `roll/distributed/scheduler/rollout_scheduler.py`
 
 **`d1b80bf`** `feat(multi-lora): add adapters_to_sync support in model update service`
-- `roll/schedrl_adapter/model_update_service.py` (+3) — filters model update to only sync specified adapters
+- `schedrl/pipeline/model_update_service.py` (+3) — filters model update to only sync specified adapters
 - `roll/third_party/megatron/model_update.py` (+156/-49) — per-adapter selective sync
 
 **`5c31db9`** `fix(multi-lora): PP support and per-adapter optimizer fixes`
@@ -1108,7 +1113,7 @@ Also handles legacy config backward compatibility: if only `lora_rank`/`lora_tar
 - `roll/pipeline/sft/sft_worker.py` — docstring updates
 - `roll/distributed/scheduler/generate_scheduler.py` — multi-LoRA aware generation scheduling
 - `roll/distributed/scheduler/rollout_scheduler.py` — `resume`, `get_inflight_counts`, `offload_dp_ranks` RPCs
-- `roll/schedrl_adapter/multi_lora_pipeline.py` — fixes trained-adapter detection to use `lora_name` (was `domain`)
+- `schedrl/pipeline/multi_lora_pipeline.py` — fixes trained-adapter detection to use `lora_name` (was `domain`)
 - `roll/pipeline/agentic/agentic_config.py`, `roll/distributed/scheduler/initialize.py`, `roll/pipeline/agentic/env_manager/base_config.py`
 
 **`4eb6706`** `chore(utils): add lora_name support to collective utilities`
@@ -1116,7 +1121,7 @@ Also handles legacy config backward compatibility: if only `lora_rank`/`lora_tar
 
 **`7efa3ba`** `fix(sft): ensure lora_name broadcast before validation in train_step_lora`
 - `roll/distributed/strategy/megatron_strategy.py` — moves `_broadcast_non_tensor_batch + get_data_input` before `ensure_lora_name_in_batch` so non-root TP/PP ranks receive `lora_name` via broadcast before validation
-- `roll/schedrl_adapter/multi_lora_pipeline.py` — adds `_verify_lora_model_update` call after `expand_sampler`
+- `schedrl/pipeline/multi_lora_pipeline.py` — adds `_verify_lora_model_update` call after `expand_sampler`
 
 **`e472375`** `feat(multi-lora): update strategy, workers, and scheduler for multi-LoRA support`
 - `roll/distributed/strategy/megatron_strategy.py` — LoRA adapter load/offload; per-adapter weight routing
@@ -1125,7 +1130,7 @@ Also handles legacy config backward compatibility: if only `lora_rank`/`lora_tar
 - `roll/distributed/scheduler/generate_scheduler.py` — multi-LoRA aware generation
 - `roll/pipeline/agentic/agentic_config.py` — `multi_lora_config` fields
 - `roll/third_party/megatron/model_update.py` — per-adapter selective model update
-- `roll/schedrl_adapter/concurrent_pipeline.py` — passes `lora_name` through dispatch
+- `schedrl/pipeline/full_finetune_pipeline.py` — passes `lora_name` through dispatch
 - `roll/pipeline/agentic/env/deepeyes/env.py`, `env/gem/math_env.py`
 
 ### Curated Audit Rules
@@ -1276,8 +1281,8 @@ For the intermediate refactor commits (`db5a7c3` through `41de4dc`), skim for co
 - `external/ROLL_schedrl` (submodule bump to `e703995`)
 
 **`[R] 2da6eff`** `feat(adapter): pass lora_name to scheduler for GPU trace labels`
-- `roll/schedrl_adapter/concurrent_pipeline.py` (+9) — adds `lora_name` parameter to `_request_static_cluster()` and `_release_and_request_static_cluster()`
-- `roll/schedrl_adapter/multi_lora_pipeline.py` — extracts trained adapters from `batch.non_tensor_batch` as comma-separated string
+- `schedrl/pipeline/full_finetune_pipeline.py` (+9) — adds `lora_name` parameter to `_request_static_cluster()` and `_release_and_request_static_cluster()`
+- `schedrl/pipeline/multi_lora_pipeline.py` — extracts trained adapters from `batch.non_tensor_batch` as comma-separated string
 
 ### Curated Audit Rules
 
@@ -1329,11 +1334,11 @@ There are also two separate checkpoint OOM fixes (`f4a24cd` in Group 4 and `10ec
 
 **`[S] 0c66eba`** + **`[R] a81b69f`** `feat(multi-lora): per-adapter run loop, adapter sync, and load_states optimization`
 - `[S]`: `schedrl/scheduler/scheduler.py`, `schedrl/scheduler/types.py`, `schedrl/orchestrator/orchestrator.py`
-- `[R]`: `roll/schedrl_adapter/multi_lora_pipeline.py`, `roll/schedrl_adapter/adapter.py`, `roll/distributed/strategy/megatron_strategy.py`, `roll/distributed/executor/worker.py`
+- `[R]`: `schedrl/pipeline/multi_lora_pipeline.py`, `schedrl/pipeline/coordinator.py`, `roll/distributed/strategy/megatron_strategy.py`, `roll/distributed/executor/worker.py`
 - Replaces single-rollout `run()` with per-adapter `lora_step` loop; `barrier_mode=False`; `ray.wait` for first-ready tag; Phase 16 uses `train_step_lora + promote_active_adapter_checkpoint` per dirty adapter; `adapter.sync_adapter_weights()` called directly from pipeline; `_resize_sync_lock` serializes resize and sync; CPU bucket cache built while GPU weights resident
 
 **`[R] f7ca74f`** `fix(multi-pipeline): thread limits and barrier_mode removal`
-- Example configs, `roll/schedrl_adapter/adapter.py`, `roll/schedrl_adapter/multi_lora_pipeline.py`, `roll/third_party/vllm/worker.py`, `roll/distributed/strategy/megatron_strategy.py`
+- Example configs, `schedrl/pipeline/coordinator.py`, `schedrl/pipeline/multi_lora_pipeline.py`, `roll/third_party/vllm/worker.py`, `roll/distributed/strategy/megatron_strategy.py`
 - Adds thread-limiting env vars (`OMP/MKL/OPENBLAS_NUM_THREADS`, `RAY_grpc_server_thread_pool_size`) to stay within container `pids.max`; removes `barrier_mode` from `AgenticMultiLoraPipeline`
 
 **`[R] 5f5fe22`** `fix(examples): use HuggingFace and set actor_infer lora_rank to 8`
@@ -1341,17 +1346,17 @@ There are also two separate checkpoint OOM fixes (`f4a24cd` in Group 4 and `10ec
 
 **`[R] 458c53a`** `fix(vllm): stream base weights one-at-a-time and free sender GPU bucket`
 - `roll/third_party/vllm/worker.py` (major) — streaming receiver: reload model first, then yield one buffer at a time via generator; peak = model + 1 buffer (was model + N buffers)
-- `roll/schedrl_adapter/adapter.py` — frees sender GPU bucket after broadcast
+- `schedrl/pipeline/coordinator.py` — frees sender GPU bucket after broadcast
 
 **`[R] 447880c`** `fix(adapter): validate offload_nccl and scope LoRA verify to expanded ranks`
-- `roll/schedrl_adapter/adapter.py` — `_validate_offload_nccl`: startup check that every active cluster has `offload_nccl=True` when `sleep_level=2` is active (NCCL buffers ~400-500 MB/process accumulate without this)
-- `roll/schedrl_adapter/concurrent_pipeline.py`, `roll/schedrl_adapter/multi_lora_pipeline.py` — scopes LoRA adapter verification to only expanded ranks
+- `schedrl/pipeline/coordinator.py` — `_validate_offload_nccl`: startup check that every active cluster has `offload_nccl=True` when `sleep_level=2` is active (NCCL buffers ~400-500 MB/process accumulate without this)
+- `schedrl/pipeline/full_finetune_pipeline.py`, `schedrl/pipeline/multi_lora_pipeline.py` — scopes LoRA adapter verification to only expanded ranks
 
 **`[R] 59d38d1`** `fix(examples): reduce sequence_length and enable dynamic batching`
 - Example YAML configs only — `sequence_length: 2048 → 1024`; enables `use_dynamic_batching_in_infer`
 
 **`[R] 3af0811`** `fix(adapter): close HEAD gaps in concurrent_pipeline run()`
-- `roll/schedrl_adapter/concurrent_pipeline.py` — adds `_broadcast_non_tensor_batch=True` after rollout; hoists `is_offload_states=True`; adds `shutdown()` for rollout schedulers; adds TODO comments for remaining gaps (Gap A: ref_log_probs, Gap B: batch_balance, Gap D: val())
+- `schedrl/pipeline/full_finetune_pipeline.py` — adds `_broadcast_non_tensor_batch=True` after rollout; hoists `is_offload_states=True`; adds `shutdown()` for rollout schedulers; adds TODO comments for remaining gaps (Gap A: ref_log_probs, Gap B: batch_balance, Gap D: val())
 
 **`[R] 10ec933`** `fix(pipeline): offload GPU states after checkpoint to prevent OOM on infer expand`
 - `roll/pipeline/base_pipeline.py`, `roll/pipeline/base_worker.py`, example YAML configs
@@ -1363,7 +1368,7 @@ There are also two separate checkpoint OOM fixes (`f4a24cd` in Group 4 and `10ec
 - `examples/multi_pipeline/multi_lora_pipeline1.yaml`, `multi_lora_pipeline2.yaml` — renames adapter names in example configs
 
 **`[R] e703995`** `fix(multi-lora): use deque for fair FIFO wait order in get_batch loop`
-- `roll/schedrl_adapter/multi_lora_pipeline.py` (+19/-10) — previous data structure caused starvation; uses `deque` with `rotate()` for fair round-robin across adapters
+- `schedrl/pipeline/multi_lora_pipeline.py` (+19/-10) — previous data structure caused starvation; uses `deque` with `rotate()` for fair round-robin across adapters
 
 ### Curated Audit Rules
 
@@ -1408,9 +1413,9 @@ rg --glob '*.py' "from roll|import roll" schedrl/
 ```
 Expected: **zero matches**. Any match is P0 — schedrl/ must not depend on ROLL.
 
-**INV-6 No scheduler policy in the adapter** — `roll/schedrl_adapter/` must not contain gap-ratio logic or priority assignments:
+**INV-6 No scheduler policy in the coordinator** — `schedrl/pipeline/` (formerly `roll/schedrl_adapter/`) must not contain gap-ratio logic or priority assignments:
 ```bash
-rg --glob '*.py' "gap_ratio|Priority\." external/ROLL_schedrl/roll/schedrl_adapter/
+rg --glob '*.py' "gap_ratio|Priority\." schedrl/pipeline/
 ```
 Expected: **zero matches**. Any match is P1 — scheduling policy belongs in `schedrl/scheduler/`.
 
@@ -1440,7 +1445,7 @@ Expected: **at least one match** showing an assertion or raise. Zero matches mea
 
 **`offload_nccl` validation at boot** — must fail-fast if `offload_nccl=True` is missing when `sleep_level=2`:
 ```bash
-rg -n "_validate_offload_nccl" external/ROLL_schedrl/roll/schedrl_adapter/adapter.py
+rg -n "_validate_offload_nccl" schedrl/pipeline/coordinator.py
 ```
 Expected: **at least one match** showing a call during initialization. Zero matches means the check was removed or never wired (P1).
 
@@ -1449,3 +1454,166 @@ Expected: **at least one match** showing a call during initialization. Zero matc
 git show 4873ee5 -- external/ROLL_schedrl
 ```
 Expected: output shows `Subproject commit e703995...`. If the hash differs, the submodule bump is stale (P0).
+
+---
+
+## Execution Notes
+
+**Executed**: 2026-03-01
+**Coordinator model**: Claude Opus 4.6
+**Agent model**: Claude Sonnet (as specified in plan)
+
+### Deviations from Plan
+
+#### 1. One agent per group (not per unit)
+
+**Plan**: One agent per review unit (GATE rule, CHECK rule, AF item, DoD item) — ~200+ agents total with topo_level dependency ordering.
+
+**Actual**: One agent per group. Each agent received all units (min gate + extended GATE + CHECK + AF + DoD) and produced a single `review_findings.yaml`. Decision made to save tokens — the per-unit dependency graph and topo_level machinery was not needed.
+
+**Impact**: No formal dependency resolution between units. Agents checked all units in a single pass. JUDGMENT items were flagged as NEEDS_HUMAN inline rather than queued at level checkpoints.
+
+#### 2. No formal unit enumeration
+
+**Plan**: Step 1 of CLAUDE.md — enumerate all units, compute `depends_on`, topological sort, assign `topo_level`, write `unit_enumeration.yaml` per group.
+
+**Actual**: Skipped. Unit lists were embedded directly in agent prompts from the plan text. No `unit_enumeration.yaml` files produced.
+
+#### 3. Worktree usage
+
+**Plan (revised)**: Create worktrees for every group under `code_review/output/group_{NN}/` named `G{NN}` (or `G{NN}_S`/`G{NN}_R` for mixed-repo groups), pinned to end-state commit. Keep worktrees for human review.
+
+**Actual (initial run)**: Agents used `git show <hash>` for diffs. Only Group 3 got temporary worktrees during the run.
+
+**Post-run**: Worktrees created for all 11 groups under `code_review/output/group_{NN}/`. Layout:
+- `[S]`-only groups (1, 5): `G01/`, `G05/` pinned to last `[S]` commit
+- `[R]`-only groups (2, 4, 6, 7, 8, 9): `G02/`, `G04/`, `G06/`, `G07/`, `G08/`, `G09/` pinned to last `[R]` commit
+- Mixed groups (3, 10, 11): `G{NN}_S/` + `G{NN}_R/` pinned to last `[S]` and `[R]` commits respectively
+
+#### 4. Simplified output schema
+
+**Plan**: Schema A per-unit files (`{unit_id}_v{n}.yaml`) + Schema B merged group report.
+
+**Actual**: Single `review_findings.yaml` per group containing all unit verdicts and findings. Format follows Schema A fields but all units are in one file. No Schema B merged reports — replaced by a single `review_summary.yaml` across all groups.
+
+**Output structure**:
+```
+code_review/output/
+  review_summary.yaml          # cross-group summary with all P0-P3 findings
+  group_01/review_findings.yaml
+  group_02/review_findings.yaml
+  ...
+  group_11/review_findings.yaml
+```
+
+#### 5. Output directory path
+
+**Plan**: `repo_review/output/group_{NN}/`
+
+**Actual**: `code_review/output/group_{NN}/`
+
+#### 6. No per-level human checkpoints
+
+**Plan**: Step 3 per-level loop — after each topo_level, coordinator validates verdicts, queues unresolved items for human checkpoint, waits for human resolution before proceeding to next level.
+
+**Actual**: No intermediate checkpoints. All findings collected after agents complete. P0/P1 items and NEEDS_HUMAN items presented to human at the end in `review_summary.yaml`.
+
+#### 7. No reruns
+
+**Plan**: Maximum 1 rerun per unit. BAD_SCHEMA or unstable verdicts trigger rerun.
+
+**Actual**: No reruns. Each group agent got one pass. SKIPPED items (e.g., NO_ANCHOR for rules not applicable to the group's commits) logged as-is.
+
+#### 8. No pilot run
+
+**Plan**: Section H — pilot run on Group 2 first, validate output schema, then proceed.
+
+**Actual**: Skipped. All Tier 1 groups launched together.
+
+#### 9. Tier execution order
+
+**Plan**: Tier 1 → human checkpoint → Tier 2 → human checkpoint → Tier 3.
+
+**Actual**:
+- Tier 1 (Groups 1, 2, 4, 7, 10, 11) — run first, in parallel
+- Tier 2 + Tier 3 (Groups 3, 5, 6, 8, 9) — run second, all in parallel
+- No human checkpoint between tiers
+
+#### 10. Cross-cutting checks
+
+**Plan**: Run after all groups complete. 8 commands with expected results.
+
+**Actual**: All 8 cross-cutting checks executed as planned. Results included in `review_summary.yaml`.
+
+### Verification
+
+- Commit counts verified: 31 `[S]` + 59 `[R]` = 90 total (matches plan)
+- `range_fingerprint`: `sha256:d89084a6f05955c676b3b5d9694a77fd2599573e2ebce3c4dbcba124e68b9476`
+- All 11 groups reviewed — no group skipped
+- All cross-cutting checks executed
+
+### Summary of Findings
+
+Full details in `code_review/output/review_summary.yaml`.
+
+- **P0**: 2 findings (Group 2: RULE-4.1 active_dp_ranks cleared before need_suspend, RULE-13.1 shrink ordering violated)
+- **P1**: 10 findings across Groups 1, 2, 3, 5, 6, 10, 11
+- **P2**: 12 findings across Groups 1, 4, 7, 8, 9, 11
+- **P3**: 4 findings (Groups 4, 8, 9)
+- **NEEDS_HUMAN**: 10 items across Groups 2, 3, 7, 11 (JUDGMENT items requiring human review)
+
+---
+
+## Migration Notes {#migration-notes}
+
+**Date**: 2026-03-02
+**Commit**: `e9acf73` (main repo), `77306792` (ROLL_schedrl submodule)
+
+### File Path Migrations
+
+Files reviewed in `external/ROLL_schedrl/roll/schedrl_adapter/` have been migrated to `schedrl/pipeline/`:
+
+| Original Path (ROLL_schedrl) | New Path (schedrl) | Notes |
+|------------------------------|--------------------|-------|
+| `roll/schedrl_adapter/adapter.py` | `schedrl/pipeline/coordinator.py` | Class renamed: `SchedRLAdapter` → `SchedRLCoordinator` |
+| `roll/schedrl_adapter/concurrent_pipeline.py` | `schedrl/pipeline/full_finetune_pipeline.py` | Class renamed: `SchedRLConcurrentPipeline` → `SchedRLFullFinetunePipeline` |
+| `roll/schedrl_adapter/multi_lora_pipeline.py` | `schedrl/pipeline/multi_lora_pipeline.py` | No class rename |
+| `roll/schedrl_adapter/model_update_service.py` | `schedrl/pipeline/model_update_service.py` | No class rename |
+| `roll/schedrl_adapter/utils.py` | `schedrl/pipeline/utils.py` | No changes |
+| `examples/multi_pipeline/` | `examples/` | Configs moved to root examples/ |
+
+### Terminology Changes
+
+| Old Term | New Term | Context |
+|----------|----------|---------|
+| `Adapter` | `Coordinator` | Control-plane entity (protocol ABC) |
+| `SchedRLAdapter` | `SchedRLCoordinator` | Implementation class |
+| `ADAPTER_ACTOR_NAME_PREFIX` | `COORDINATOR_ACTOR_NAME_PREFIX` | Actor name constant |
+| `sync_adapter_weights` | `sync_lora_weights` | Method for LoRA weight sync |
+| `_tag_to_adapter` | `_tag_to_lora` | Internal variable |
+| `max_steps_per_adapter` | `max_steps_per_lora` | Config field |
+
+**Preserved** (external API): `model_args.adapters`, `max_resident_adapters`, `lora_optimizer_mode='per_adapter'`
+
+### Impact on Review Groups
+
+| Group | Status | Notes |
+|-------|--------|-------|
+| Group 2 | ⚠️ PARTIAL | `adapter.py` migrated; `generate_scheduler.py`, `vllm_strategy.py` remain in ROLL |
+| Group 3 | ⚠️ PARTIAL | `concurrent_pipeline.py` migrated; megatron/vllm changes remain in ROLL |
+| Group 6 | ✅ APPLICABLE | All files remain in ROLL_schedrl |
+| Group 7 | ⚠️ PARTIAL | `multi_lora_pipeline.py` migrated; megatron/vllm changes remain in ROLL |
+| Group 8 | ⚠️ PARTIAL | Pipeline files migrated; env managers, vllm_strategy remain in ROLL |
+| Group 9 | ⚠️ PARTIAL | Example configs migrated; `agentic_multi_lora_pipeline.py` remains in ROLL |
+| Group 10 | ⚠️ PARTIAL | Pipeline files migrated |
+| Group 11 | ✅ APPLICABLE | Bug fixes in remaining ROLL files |
+
+### Reading the Review
+
+When reading this review document, substitute the new paths:
+- References to `roll/schedrl_adapter/adapter.py` → `schedrl/pipeline/coordinator.py`
+- References to `roll/schedrl_adapter/concurrent_pipeline.py` → `schedrl/pipeline/full_finetune_pipeline.py`
+- References to `roll/schedrl_adapter/multi_lora_pipeline.py` → `schedrl/pipeline/multi_lora_pipeline.py`
+- References to `roll/schedrl_adapter/model_update_service.py` → `schedrl/pipeline/model_update_service.py`
+- References to `SchedRLAdapter` → `SchedRLCoordinator`
+- References to `SchedRLConcurrentPipeline` → `SchedRLFullFinetunePipeline`

@@ -5,8 +5,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-from schedrl.protocol.request_id import validate_pipeline_id
-from schedrl.protocol.types import Priority
+from rlix.protocol.request_id import validate_pipeline_id
+from rlix.protocol.types import Priority
 
 
 @dataclass(slots=True)

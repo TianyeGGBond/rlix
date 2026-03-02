@@ -6,10 +6,11 @@ fi
 git config --global user.name "Tao Luo"
 git config --global user.email "taoluo321@outlook.com"
 
-git clone git@github.com:taoluo/_SchedRL.git SchedRL
-cd SchedRL
-git submodule update --remote --init --checkout external/ROLL_schedrl
+git clone git@github.com:taoluo/_RLix.git RLix
+cd RLix
+git submodule update --remote --init --checkout external/ROLL_rlix
 # git submodule update --remote --init --checkout external/ROLL_upstream_main
 # git submodule update --remote --init --checkout external/ROLL_multi_lora
 # git submodule update --remote --init --checkout external/ROLL_multi_pipeline
 
+    

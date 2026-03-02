@@ -10,9 +10,9 @@ import ray
 import torch
 from codetiming import Timer
 
-from schedrl.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ActionResponse, Priority, SCHEDULER_ACTOR_NAME, SCHEDRL_NAMESPACE
+from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ActionResponse, Priority, SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
 
-from schedrl.pipeline.utils import _get_env_timeout_s
+from rlix.pipeline.utils import _get_env_timeout_s
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import AgenticPipeline
@@ -39,17 +39,17 @@ from roll.utils.train_infer_corrections import apply_train_infer_correction_to_b
 logger = get_logger()
 
 
-class SchedRLFullFinetunePipeline(AgenticPipeline):
-    """SchedRL-controlled variant of ROLL AgenticPipeline (ENG-123 Phase 3).
+class RlixFullFinetunePipeline(AgenticPipeline):
+    """Rlix-controlled variant of ROLL AgenticPipeline (ENG-123 Phase 3).
 
     Key differences from upstream AgenticPipeline.run():
-    - Before each rollout, request generation GPUs from SchedRL (scheduler drives expand via coordinator).
-    - After each rollout, shrink actor_infer to zero and release allocation back to SchedRL.
+    - Before each rollout, request generation GPUs from Rlix (scheduler drives expand via coordinator).
+    - After each rollout, shrink actor_infer to zero and release allocation back to Rlix.
     - Validation runs synchronously to avoid racing with shrink/release.
     """
 
     def __init__(self, *, pipeline_id: str, pipeline_config: Any):
-        # In SchedRL mode we should follow the ConcurrentAgenticPipeline semantics:
+        # In Rlix mode we should follow the ConcurrentAgenticPipeline semantics:
         if not isinstance(pipeline_id, str) or pipeline_id == "":
             raise ValueError("pipeline_id must be non-empty str")
         self._pipeline_id = pipeline_id
@@ -58,13 +58,13 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
         # Ray actor can run with max_concurrency>1; guard init so resize/run can't race it.
         self._init_lock = threading.Lock()
         try:
-            self._schedrl_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+            self._rlix_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
         except Exception as e:
-            # Expectation: the central schedrl scheduler actor ('schedrl:scheduler')
+            # Expectation: the central rlix scheduler actor ('rlix:scheduler')
             # must already be created before the pipeline is instantiated.
             # Fail loudly with a clear message to aid debugging of startup ordering.
             raise RuntimeError(
-                f"Failed to resolve {SCHEDULER_ACTOR_NAME} in namespace '{SCHEDRL_NAMESPACE}'. "
+                f"Failed to resolve {SCHEDULER_ACTOR_NAME} in namespace '{RLIX_NAMESPACE}'. "
                 "The pipeline expects the central scheduler actor to be present before startup; "
                 "ensure the orchestrator created it earlier or that startup ordering is correct."
             ) from e
@@ -76,9 +76,9 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
         self._coordinator_handle: Any = None
 
     def _get_coordinator_handle(self) -> Any:
-        """Resolve and cache the per-pipeline SchedRLCoordinator actor handle.
+        """Resolve and cache the per-pipeline RlixCoordinator actor handle.
 
-        Named 'schedrl:coordinator:{pipeline_id}' in the pipeline namespace.
+        Named 'rlix:coordinator:{pipeline_id}' in the pipeline namespace.
         The coordinator serializes resize_infer and sync_lora_weights via _resize_sync_lock.
         """
         if self._coordinator_handle is not None:
@@ -95,7 +95,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
         return self._coordinator_handle
 
     def initialize_pipeline(self) -> ActionResponse:
-        # In SchedRL mode we should follow the ConcurrentAgenticPipeline semantics:
+        # In RLix mode we should follow the ConcurrentAgenticPipeline semantics:
         """Initialize pipeline clusters/schedulers and prepare selective sync cache before first rollout."""
         with self._init_lock:
             if self._initialized:
@@ -112,7 +112,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             from roll.pipeline.base_pipeline import BasePipeline
             from roll.utils.functionals import RunningMoments
             from roll.utils.kl_controller import get_kl_controller
-            from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
+            from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
 
             pipeline_config = self._pipeline_config
             BasePipeline.__init__(self, pipeline_config)
@@ -186,7 +186,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                     name=reward_name,
                     get_if_exists=True,
                     namespace=RAY_NAMESPACE,
-                    runtime_env={"env_vars": schedrl_env_vars()},
+                    runtime_env={"env_vars": rlix_env_vars()},
                     scheduling_strategy=NodeAffinitySchedulingStrategy(
                         node_id=ray.get_runtime_context().get_node_id(),
                         soft=False,
@@ -210,7 +210,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 "NUMEXPR_NUM_THREADS": "1",
                 "TOKENIZERS_PARALLELISM": "false",
             }
-            control_env_vars.update(schedrl_env_vars())
+            control_env_vars.update(rlix_env_vars())
 
             self.generate_scheduler = RequestScheduler.options(
                 name=request_scheduler_name,
@@ -232,7 +232,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             self.train_rollout_scheduler = ray.remote(RolloutScheduler).options(
                 name=f"RolloutScheduler-{self._pipeline_id}-train",
                 namespace=RAY_NAMESPACE,
-                runtime_env={"env_vars": schedrl_env_vars()},
+                runtime_env={"env_vars": rlix_env_vars()},
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -248,7 +248,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             self.val_rollout_scheduler = ray.remote(RolloutScheduler).options(
                 name=f"RolloutScheduler-{self._pipeline_id}-val",
                 namespace=RAY_NAMESPACE,
-                runtime_env={"env_vars": schedrl_env_vars()},
+                runtime_env={"env_vars": rlix_env_vars()},
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -269,7 +269,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 name="val_dataset_manager",
                 get_if_exists=True,
                 namespace=RAY_NAMESPACE,
-                runtime_env={"env_vars": schedrl_env_vars()},
+                runtime_env={"env_vars": rlix_env_vars()},
             ).remote()
 
             # Infer resize serialization boundary (ENG-123).
@@ -283,7 +283,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             self._infer_resize_lock = threading.Lock()
 
             # INIT PHASE: Initialize clusters with central scheduler coordination and strict offload ordering.
-            from schedrl.protocol.types import Priority
+            from rlix.protocol.types import Priority
 
             init_global_step = -1
             self._request_static_cluster(
@@ -393,15 +393,15 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             else:
                 self.partial_gpu_mode = False
 
-            # Namespace contract: in SchedRL mode, require explicit per-pipeline env vars (fail fast).
+            # Namespace contract: in Rlix mode, require explicit per-pipeline env vars (fail fast).
             ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE", "roll")
-            if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+            if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
                 env_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
                 pipeline_id_env = os.environ.get("PIPELINE_ID")
                 if not env_namespace:
-                    raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
+                    raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires ROLL_RAY_NAMESPACE to be set")
                 if not pipeline_id_env:
-                    raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+                    raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
                 if pipeline_id_env != self._pipeline_id:
                     raise RuntimeError(
                         f"PIPELINE_ID mismatch for coordinator: env PIPELINE_ID={pipeline_id_env!r} "
@@ -413,16 +413,16 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             # The initial (-1) cache bucket is built during actor_train init above under INITIALIZATION allocation.
 
             # Create ModelUpdateService in the per-pipeline namespace. This is used by
-            # RequestScheduler.expand_workers() in SchedRL mode to sync selected dp ranks after load.
-            from schedrl.pipeline.model_update_service import ModelUpdateService
+            # RequestScheduler.expand_workers() in Rlix mode to sync selected dp ranks after load.
+            from rlix.pipeline.model_update_service import ModelUpdateService
 
             runtime_env = {
                 "env_vars": {
                     "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
                     "PIPELINE_ID": os.environ.get("PIPELINE_ID", self._pipeline_id),
                     "ROLL_RAY_NAMESPACE": ray_namespace,
-                    "SCHEDRL_CONTROL_PLANE": os.environ.get("SCHEDRL_CONTROL_PLANE", "schedrl"),
-                    "SCHEDRL_LIBRARY_MODE": os.environ.get("SCHEDRL_LIBRARY_MODE", "1"),
+                    "RLIX_CONTROL_PLANE": os.environ.get("RLIX_CONTROL_PLANE", "rlix"),
+                    "RLIX_LIBRARY_MODE": os.environ.get("RLIX_LIBRARY_MODE", "1"),
                 }
             }
             svc = ModelUpdateService.options(
@@ -441,7 +441,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             ray.get(svc.__ray_ready__.remote())
 
             # Start from a well-defined state (ENG-123):
-            # - disable routing until we request GPUs from SchedRL.
+            # - disable routing until we request GPUs from RLix.
             # NOTE: avoid local suspend()/resume() state transitions; shrink-to-zero is the single
             # source of truth for pausing generation traffic, and expand-from-zero resumes internally.
             dp_ranks = self._actor_infer_all_dp_ranks()
@@ -455,7 +455,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 raise RuntimeError(
                     f"Initialization failed: active_dp_ranks not empty after shrink. "
                     f"train_active={sorted(train_active)}, val_active={sorted(val_active)}. "
-                    f"This indicates state desync between SchedRL and ROLL."
+                    f"This indicates state desync between RLix and ROLL."
                 )
 
             self._initialized = True
@@ -464,7 +464,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
     def _shrink_workers(self, *, dp_ranks_to_remove: List[int]) -> Dict[str, Any]:
         """Pipeline-local shrink helper (ENG-123).
 
-        In SchedRL mode with shared RequestScheduler, a single call performs:
+        In RLix mode with shared RequestScheduler, a single call performs:
         - routing-only shrink (updates shared active_dp_ranks)
         - physical offload (skip_offload=False)
         """
@@ -480,7 +480,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
     def _expand_workers(self, *, dp_ranks_to_add: List[int], train_skip_load: bool) -> Dict[str, Any]:
         """Pipeline-local expand helper (ENG-123).
 
-        In SchedRL mode with shared RequestScheduler, a single call performs:
+        In RLix mode with shared RequestScheduler, a single call performs:
         - weight load (skip_load=train_skip_load)
         - routing-only expand (updates shared active_dp_ranks)
         """
@@ -503,11 +503,11 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
     def _actor_infer_device_mapping(self) -> List[int]:
         mapping = getattr(self.pipeline_config.actor_infer, "device_mapping", None)
         if mapping is None:
-            raise RuntimeError("actor_infer.device_mapping must be set for SchedRL mode")
+            raise RuntimeError("actor_infer.device_mapping must be set for Rlix mode")
         if not isinstance(mapping, list):
             raise RuntimeError(f"actor_infer.device_mapping must be list[int], got {type(mapping).__name__}")
         if not mapping:
-            raise RuntimeError("actor_infer.device_mapping must be non-empty for SchedRL mode")
+            raise RuntimeError("actor_infer.device_mapping must be non-empty for Rlix mode")
         if not all(isinstance(x, int) and x >= 0 for x in mapping):
             raise RuntimeError("actor_infer.device_mapping must be list[int>=0]")
         return list(mapping)
@@ -528,7 +528,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
         self, *, cluster_id: str, priority: Any, global_step: int, lora_name: Optional[str] = None
     ) -> List[int]:
         allocated = ray.get(
-            self._schedrl_scheduler.request_gpus.remote(
+            self._rlix_scheduler.request_gpus.remote(
                 cluster_id=str(cluster_id),
                 priority=priority,
                 global_step=global_step,
@@ -536,14 +536,14 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             )
         )
         if not isinstance(allocated, list):
-            raise RuntimeError(f"schedrl:scheduler.request_gpus returned non-list: {type(allocated).__name__}")
+            raise RuntimeError(f"rlix:scheduler.request_gpus returned non-list: {type(allocated).__name__}")
         allocated = [int(x) for x in allocated]
         if not allocated:
-            raise RuntimeError(f"schedrl:scheduler allocated empty GPU list for cluster_id={cluster_id!r}")
+            raise RuntimeError(f"rlix:scheduler allocated empty GPU list for cluster_id={cluster_id!r}")
         return allocated
 
     def _release_static_cluster(self, *, cluster_id: str, global_step: int) -> None:
-        ray.get(self._schedrl_scheduler.release_gpus.remote(cluster_id=str(cluster_id), global_step=global_step))
+        ray.get(self._rlix_scheduler.release_gpus.remote(cluster_id=str(cluster_id), global_step=global_step))
 
     def _release_and_request_static_cluster(
         self,
@@ -556,7 +556,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
         request_lora_name: Optional[str] = None,
     ) -> List[int]:
         allocated = ray.get(
-            self._schedrl_scheduler.release_and_request_gpus.remote(
+            self._rlix_scheduler.release_and_request_gpus.remote(
                 release_cluster_id=str(release_cluster_id),
                 release_global_step=int(release_global_step),
                 request_cluster_id=str(request_cluster_id),
@@ -566,23 +566,23 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             )
         )
         if not isinstance(allocated, list):
-            raise RuntimeError(f"schedrl:scheduler.release_and_request_gpus returned non-list: {type(allocated).__name__}")
+            raise RuntimeError(f"rlix:scheduler.release_and_request_gpus returned non-list: {type(allocated).__name__}")
         allocated = [int(x) for x in allocated]
         if not allocated:
-            raise RuntimeError(f"schedrl:scheduler allocated empty GPU list for cluster_id={request_cluster_id!r}")
+            raise RuntimeError(f"rlix:scheduler allocated empty GPU list for cluster_id={request_cluster_id!r}")
         return allocated
 
     def _notify_ready_to_release_actor_infer(self, *, global_step: int) -> List[int]:
-        timeout_s_raw = os.environ.get("SCHEDRL_NOTIFY_READY_TIMEOUT_S", "300")
+        timeout_s_raw = os.environ.get("RLIX_NOTIFY_READY_TIMEOUT_S", "300")
         try:
             timeout_s = float(timeout_s_raw)
         except ValueError as e:
-            raise RuntimeError(f"Invalid SCHEDRL_NOTIFY_READY_TIMEOUT_S={timeout_s_raw!r}") from e
+            raise RuntimeError(f"Invalid RLIX_NOTIFY_READY_TIMEOUT_S={timeout_s_raw!r}") from e
         if timeout_s <= 0:
-            raise RuntimeError(f"SCHEDRL_NOTIFY_READY_TIMEOUT_S must be > 0, got {timeout_s!r}")
+            raise RuntimeError(f"RLIX_NOTIFY_READY_TIMEOUT_S must be > 0, got {timeout_s!r}")
 
         released = ray.get(
-            self._schedrl_scheduler.notify_ready_to_release.remote(
+            self._rlix_scheduler.notify_ready_to_release.remote(
                 cluster_id=self._actor_infer_cluster_id,
                 global_step=global_step,
                 timeout_s=timeout_s,
@@ -592,7 +592,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             raise RuntimeError(f"notify_ready_to_release returned non-list: {type(released).__name__}")
         released = [int(x) for x in released]
         logger.info(
-            f"[schedrl][{self._pipeline_id}] notify_ready_to_release done: step={global_step} released={sorted(released)}"
+            f"[rlix][{self._pipeline_id}] notify_ready_to_release done: step={global_step} released={sorted(released)}"
         )
         return released
 
@@ -617,14 +617,14 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
 
         logger.info("Starting reorganized concurrent agentic pipeline")
 
-        # SchedRL: timeouts for notify/gpu-request are managed internally by SchedRL methods.
-        # SchedRL: model_update() removed — weights are promoted via promote_active_checkpoint after actor training.
+        # RLix: timeouts for notify/gpu-request are managed internally by RLix methods.
+        # RLix: model_update() removed — weights are promoted via promote_active_checkpoint after actor training.
         rollout_get_batch_timeout_s = _get_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
 
         
         batch = DataProto()
         batch.meta_info["global_step"] = 0
-        # SchedRL: has_active_allocation not available on SchedRL scheduler; skip assertion.
+        # RLix: has_active_allocation not available on RLix scheduler; skip assertion.
 
         for global_step in range(self.pipeline_config.max_steps):
             # Resume from checkpoint: skip steps already completed (mirrors AgenticPipeline.run()).
@@ -637,7 +637,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
             batch.meta_info["is_offload_states"] = True
             metrics = {}
 
-            logger.info(f"=========={self._pipeline_id} Step {global_step} ==========")  # SchedRL: use _pipeline_id
+            logger.info(f"=========={self._pipeline_id} Step {global_step} ==========")  # RLix: use _pipeline_id
 
             with Timer(name="per_step", logger=None) as step_timer:
                 # ============================================================
@@ -650,11 +650,11 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                     # ray.get(self.train_rollout_scheduler.suspend.remote(), timeout=10)
 
                     # Notify CentralScheduler that we're ready to release generation GPUs.
-                    # SchedRL: _notify_ready_to_release_actor_infer() wraps ray.get + internal timeout.
+                    # RLix: _notify_ready_to_release_actor_infer() wraps ray.get + internal timeout.
                     self._notify_ready_to_release_actor_infer(global_step=global_step - 1)
                     logger.info(f"run() {self._pipeline_id=} Phase 1: Suspended rollout and notified scheduler")
 
-                # SchedRL: Phase 3 model_update() removed.
+                # RLix: Phase 3 model_update() removed.
                 # Weights are promoted to infer workers via promote_active_checkpoint in Phase 16
                 # after actor training completes. expand_sampler loads promoted weights on next expand.
 
@@ -662,7 +662,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 # Phase 4.5: Request Generation GPUs, this triggers model update and gpu provisioning
                 # Reference: concurrent_agentic_pipeline_workflow.md lines 87-98
                 # ============================================================
-                # SchedRL: gpu_scheduler check removed — SchedRL scheduler is always present.
+                # RLix: gpu_scheduler check removed — RLix scheduler is always present.
                 allocated_actor_infer_gpus = None
                 actor_infer_num_gpus = len(
                     getattr(self.actor_infer.worker_config, 'device_mapping', [])
@@ -672,7 +672,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 if global_step > 0 and (self.pipeline_config.adv_estimator != "gae" or (
                         self.pipeline_config.adv_estimator == "gae" and self.pipeline_config.critic_warmup <= (global_step - 1))):
                     # Offload is enforced in _release_and_request_static_cluster().
-                    # SchedRL: no timeout param.
+                    # RLix: no timeout param.
                     allocated_actor_infer_gpus = self._release_and_request_static_cluster(
                         release_cluster_id=self._actor_train_cluster_id,
                         release_global_step=global_step - 1,
@@ -681,7 +681,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                         request_global_step=global_step,
                     )
                 else:
-                    # SchedRL: no timeout param.
+                    # RLix: no timeout param.
                     allocated_actor_infer_gpus = self._request_static_cluster(
                         cluster_id=self._actor_infer_cluster_id,
                         priority=Priority.GENERATION,
@@ -703,7 +703,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                         f"This will trigger partial worker expansion. "
                         f"Missing GPUs: {set(expected_gpus) - set(allocated_actor_infer_gpus)}"
                     )
-                # SchedRL: _validate_gpu_allocation() not defined; skip.
+                # RLix: _validate_gpu_allocation() not defined; skip.
                 assert len(allocated_actor_infer_gpus) != 0, 'shall not be empty for sched logic as we just released all gpus'
 
                 # ============================================================
@@ -757,7 +757,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 # Reference: concurrent_agentic_pipeline_workflow.md lines 133-151
                 # ============================================================
                 if self.pipeline_config.adv_estimator == "gae":
-                    # 1. Request GPUs (blocking). SchedRL: no timeout param.
+                    # 1. Request GPUs (blocking). RLix: no timeout param.
                     allocated_critic_gpus = self._request_static_cluster(
                         cluster_id=self._critic_cluster_id,
                         priority=Priority.VALUE_COMPUTE,
@@ -774,7 +774,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 # Phase 13: Old Log Probs Cycle (Priority.OLD_LOG_PROBS)
                 # Reference: concurrent_agentic_pipeline_workflow.md lines 176-193
                 # ============================================================
-                # 1. Request GPUs (blocking via PendingRequest). SchedRL: no timeout param.
+                # 1. Request GPUs (blocking via PendingRequest). RLix: no timeout param.
                 if self.pipeline_config.adv_estimator != "gae":
                      allocated_actor_train_gpus = self._request_static_cluster(
                         cluster_id=self._actor_train_cluster_id,
@@ -821,7 +821,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 metrics["time/cal_token_reward"] = timer.last
 
                 with Timer(name="compute_advantage", logger=None) as timer:
-                    # SchedRL: use agentic_compute_advantage (consistent with agentic_pipeline.py).
+                    # RLix: use agentic_compute_advantage (consistent with agentic_pipeline.py).
                     batch = agentic_compute_advantage(
                         data=batch,
                         gamma=self.pipeline_config.gamma,
@@ -850,7 +850,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 # Reference: concurrent_agentic_pipeline_workflow.md lines 207-225
                 # ============================================================
                 if self.pipeline_config.adv_estimator == "gae":
-                    # 1. Request GPUs (blocking). SchedRL: no timeout param.
+                    # 1. Request GPUs (blocking). RLix: no timeout param.
                     allocated_critic_gpus = self._release_and_request_static_cluster(
                         release_cluster_id=self._actor_train_cluster_id,
                         release_global_step=global_step,
@@ -870,7 +870,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                     # Offload is enforced in the upcoming GPU release/transfer call.
 
                     if self.pipeline_config.critic_warmup > global_step:
-                        # SchedRL: _release_static_cluster instead of _release_gpu.
+                        # RLix: _release_static_cluster instead of _release_gpu.
                         self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=global_step)
                     logger.info(f"run() {self._pipeline_id=} Phase 15: Critic training cycle completed")
 
@@ -879,7 +879,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 # Reference: concurrent_agentic_pipeline_workflow.md lines 229-247
                 # ============================================================
                 if self.pipeline_config.critic_warmup <= global_step:
-                    # 1. Request GPUs (blocking). SchedRL: no timeout param.
+                    # 1. Request GPUs (blocking). RLix: no timeout param.
                     if self.pipeline_config.adv_estimator == "gae":
                         allocated_actor_train_gpus = self._release_and_request_static_cluster(
                             release_cluster_id=self._critic_cluster_id,
@@ -944,7 +944,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                 # Phase 17: Metrics & Logging
                 # Reference: concurrent_agentic_pipeline_workflow.md lines 251-256
                 # ============================================================
-                # SchedRL: compute_rollout_traj_metrics replaces compute_data_metrics.
+                # RLix: compute_rollout_traj_metrics replaces compute_data_metrics.
                 data_metrics = compute_rollout_traj_metrics(batch)
                 metrics.update(data_metrics)
                 logger.info(f"run() {self._pipeline_id=} Phase 17: Metrics computation completed")
@@ -1007,7 +1007,7 @@ class SchedRLFullFinetunePipeline(AgenticPipeline):
                     f"Expand PRE-condition failed: ranks {sorted(expected_added)} should NOT be active. "
                     f"train already active: {sorted(already_active_train)}, val already active: {sorted(already_active_val)}. "
                     f"Current state: train={sorted(train_active_before)}, val={sorted(val_active_before)}. "
-                    f"This indicates state desync between SchedRL and ROLL."
+                    f"This indicates state desync between Rlix and ROLL."
                 )
             self._expand_workers(dp_ranks_to_add=list(dp_ranks_to_add), train_skip_load=False)
             # Verify expand: ranks should be added to active_dp_ranks

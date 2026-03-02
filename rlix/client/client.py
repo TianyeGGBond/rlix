@@ -5,9 +5,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from schedrl.orchestrator.orchestrator import AdmitResponse, Orchestrator
-from schedrl.protocol.types import ORCHESTRATOR_ACTOR_NAME, SCHEDRL_NAMESPACE
-from schedrl.utils.ray_head import head_node_affinity_strategy
+from rlix.orchestrator.orchestrator import AdmitResponse, Orchestrator
+from rlix.protocol.types import ORCHESTRATOR_ACTOR_NAME, RLIX_NAMESPACE
+from rlix.utils.ray_head import head_node_affinity_strategy
 import ray
 
 
@@ -26,10 +26,10 @@ def connect(
     env_vars: Optional[dict[str, str]] = None,
 ):
     if not ray.is_initialized():
-        ray.init(address=address, namespace=SCHEDRL_NAMESPACE, ignore_reinit_error=True, log_to_driver=True)
+        ray.init(address=address, namespace=RLIX_NAMESPACE, ignore_reinit_error=True, log_to_driver=True)
 
     # Ray actors don't inherit the driver's environment. Snapshot the full driver env
-    # so SchedRL actors (orchestrator, scheduler) see the same vars the driver sees.
+    # so Rlix actors (orchestrator, scheduler) see the same vars the driver sees.
     # Explicit env_vars overrides take priority over the driver snapshot.
     driver_env: dict[str, str] = {k: v for k, v in os.environ.items() if isinstance(v, str)}
     opts = ConnectOptions(address=address, create_if_missing=create_if_missing, env_vars=driver_env)
@@ -38,7 +38,7 @@ def connect(
 
 def _get_or_create_orchestrator(opts: ConnectOptions):
     try:
-        return ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+        return ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=RLIX_NAMESPACE)
     except ValueError:
         if not opts.create_if_missing:
             raise
@@ -53,7 +53,7 @@ def _get_or_create_orchestrator(opts: ConnectOptions):
                 ray.remote(Orchestrator)
                 .options(
                     name=ORCHESTRATOR_ACTOR_NAME,
-                    namespace=SCHEDRL_NAMESPACE,
+                    namespace=RLIX_NAMESPACE,
                     scheduling_strategy=strategy,
                     max_restarts=0,
                     max_task_retries=0,
@@ -63,7 +63,7 @@ def _get_or_create_orchestrator(opts: ConnectOptions):
             )
         except Exception:
             try:
-                return ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+                return ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=RLIX_NAMESPACE)
             except ValueError:
                 continue
     raise RuntimeError(f"Failed to create or get orchestrator actor {ORCHESTRATOR_ACTOR_NAME!r}")

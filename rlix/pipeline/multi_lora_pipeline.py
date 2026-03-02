@@ -1,6 +1,6 @@
-"""SchedRL Multi-LoRA Pipeline.
+"""Rlix Multi-LoRA Pipeline.
 
-Sequential cycle for lora-aware agentic training under SchedRL's sleep_level=2:
+Sequential cycle for lora-aware agentic training under Rlix's sleep_level=2:
   Expand -> Rollout (all tags) -> Shrink -> Train (dirty loras) -> Repeat
 
 Key constraints vs AgenticMultiLoraPipeline:
@@ -26,7 +26,7 @@ import torch
 from codetiming import Timer
 from ray.util.timer import _Timer
 
-from schedrl.protocol.types import ActionResponse, Priority
+from rlix.protocol.types import ActionResponse, Priority
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import compute_rollout_traj_metrics, compute_train_data_metrics
@@ -37,8 +37,8 @@ from roll.pipeline.agentic.utils import (
     dump_rollout_trajectories,
     get_agentic_response_level_mask,
 )
-from schedrl.pipeline.full_finetune_pipeline import SchedRLFullFinetunePipeline
-from schedrl.pipeline.utils import _get_env_timeout_s
+from rlix.pipeline.full_finetune_pipeline import RlixFullFinetunePipeline
+from rlix.pipeline.utils import _get_env_timeout_s
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     agg_loss,
@@ -54,8 +54,8 @@ from roll.utils.train_infer_corrections import apply_train_infer_correction_to_b
 logger = get_logger()
 
 
-class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
-    """SchedRL-controlled multi-LoRA agentic pipeline.
+class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
+    """Rlix-controlled multi-LoRA agentic pipeline.
 
     Cycle: Expand → Rollout (all tags) → Shrink → Train (dirty loras) → Repeat.
 
@@ -85,7 +85,7 @@ class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
         )
         if train_strategy_name != "megatron_train":
             raise RuntimeError(
-                f"SchedRLMultiLoraPipeline requires actor_train strategy_name='megatron_train', "
+                f"RlixMultiLoraPipeline requires actor_train strategy_name='megatron_train', "
                 f"got {train_strategy_name!r}"
             )
         train_strategy_config = (
@@ -94,20 +94,20 @@ class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
         lora_optimizer_mode = train_strategy_config.get("lora_optimizer_mode", "shared")
         if lora_optimizer_mode != "per_adapter":
             raise RuntimeError(
-                "SchedRLMultiLoraPipeline requires actor_train strategy_config.lora_optimizer_mode='per_adapter', "
+                "RlixMultiLoraPipeline requires actor_train strategy_config.lora_optimizer_mode='per_adapter', "
                 f"got {lora_optimizer_mode!r}"
             )
         adapters = getattr(pipeline_config.actor_train.model_args, "adapters", None) or {}
         if not adapters:
             raise RuntimeError(
-                "SchedRLMultiLoraPipeline requires actor_train.model_args.adapters to be non-empty"
+                "RlixMultiLoraPipeline requires actor_train.model_args.adapters to be non-empty"
             )
 
         # --- Static VRAM cap (Phase 2) ---
         max_resident = getattr(pipeline_config, "max_resident_adapters", None)
         if max_resident is not None and len(adapters) > int(max_resident):
             raise RuntimeError(
-                f"SchedRLMultiLoraPipeline: number of loras ({len(adapters)}) exceeds "
+                f"RlixMultiLoraPipeline: number of loras ({len(adapters)}) exceeds "
                 f"max_resident_adapters ({max_resident}). Reduce the lora count or raise the cap."
             )
 
@@ -115,19 +115,19 @@ class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
         base_env = pipeline_config.train_env_manager
         tags = list(base_env.tags) if getattr(base_env, "tags", None) else []
         if not tags:
-            raise RuntimeError("train_env_manager.tags must be non-empty for SchedRLMultiLoraPipeline")
+            raise RuntimeError("train_env_manager.tags must be non-empty for RlixMultiLoraPipeline")
         self._tag_to_lora: Dict[str, str] = {tag: normalize_domain(tag) for tag in tags}
         unknown = sorted({a for a in self._tag_to_lora.values() if a not in adapters})
         if unknown:
             raise RuntimeError(
-                f"SchedRLMultiLoraPipeline: env tags map to unknown loras: {unknown}. "
+                f"RlixMultiLoraPipeline: env tags map to unknown loras: {unknown}. "
                 f"Configured loras: {sorted(adapters.keys())}"
             )
 
         # --- Per-tag rollout schedulers ---
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
         from roll.distributed.scheduler.rollout_scheduler import RolloutScheduler
-        from roll.utils.constants import schedrl_env_vars
+        from roll.utils.constants import rlix_env_vars
 
         ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE", "roll")
         num_groups_partition = list(getattr(base_env, "num_groups_partition", []) or [])
@@ -153,7 +153,7 @@ class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
             self.rollout_schedulers[tag] = ray.remote(RolloutScheduler).options(
                 name=f"RolloutScheduler-{self._pipeline_id}-{tag}",
                 namespace=ray_namespace,
-                runtime_env={"env_vars": schedrl_env_vars()},
+                runtime_env={"env_vars": rlix_env_vars()},
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -186,7 +186,7 @@ class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
 
         self._rollout_schedulers_initialized = True
         logger.info(
-            f"[init][{self._pipeline_id}] SchedRLMultiLoraPipeline ready: "
+            f"[init][{self._pipeline_id}] RlixMultiLoraPipeline ready: "
             f"loras={sorted(adapters.keys())} tags={tags}"
         )
         return ActionResponse(success=True)
@@ -204,7 +204,7 @@ class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
           → Phase 15 (GAE only) → Phase 16 (train_step_lora + promote + sync) → Phase 17
         """
         self._ensure_initialized()
-        logger.info(f"Starting SchedRLMultiLoraPipeline run: {self._pipeline_id}")
+        logger.info(f"Starting RlixMultiLoraPipeline run: {self._pipeline_id}")
 
         rollout_get_batch_timeout_s = _get_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
 
@@ -567,7 +567,7 @@ class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
         logger.info(f"{self._pipeline_id} pipeline run() completed")
 
     def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
-        """SchedRL hook for per-tag scheduler shrink/expand."""
+        """Rlix hook for per-tag scheduler shrink/expand."""
         self._ensure_initialized()
         if not isinstance(dp_ranks_to_remove, list):
             raise ValueError("dp_ranks_to_remove must be list[int]")
@@ -584,7 +584,7 @@ class SchedRLMultiLoraPipeline(SchedRLFullFinetunePipeline):
             except Exception as e:
                 error_msg = str(e)
                 logger.fatal(
-                    f"[schedrl][{self._pipeline_id}] expand failed (possible partial TP group failure): {error_msg}"
+                    f"[rlix][{self._pipeline_id}] expand failed (possible partial TP group failure): {error_msg}"
                 )
                 raise RuntimeError(f"PARTIAL_TP_GROUP_FAILURE: {error_msg}") from e
 

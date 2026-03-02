@@ -4,17 +4,17 @@ import enum
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-# Ray namespace and actor name protocol constants shared across schedrl modules.
-SCHEDRL_NAMESPACE: str = "schedrl"
-SCHEDULER_ACTOR_NAME: str = "schedrl:scheduler"
-ORCHESTRATOR_ACTOR_NAME: str = "schedrl:orchestrator"
-RESOURCE_MANAGER_ACTOR_NAME: str = "schedrl:resource_manager"
+# Ray namespace and actor name protocol constants shared across rlix modules.
+RLIX_NAMESPACE: str = "rlix"
+SCHEDULER_ACTOR_NAME: str = "rlix:scheduler"
+ORCHESTRATOR_ACTOR_NAME: str = "rlix:orchestrator"
+RESOURCE_MANAGER_ACTOR_NAME: str = "rlix:resource_manager"
 # Prefix for per-pipeline coordinator actors: full name = f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}"
-COORDINATOR_ACTOR_NAME_PREFIX: str = "schedrl:coordinator:"
+COORDINATOR_ACTOR_NAME_PREFIX: str = "rlix:coordinator:"
 # Prefix for per-pipeline coordinator actors: full name = f"{PIPELINE_ACTOR_NAME_PREFIX}{pipeline_id}"
-PIPELINE_ACTOR_NAME_PREFIX: str = "schedrl:pipeline:"
-# Name for the ROLL-specific ResourceManager singleton actor (used when SCHEDRL_CONTROL_PLANE=schedrl)
-ROLL_RESOURCE_MANAGER_ACTOR_NAME: str = "schedrl:roll_resource_manager"
+PIPELINE_ACTOR_NAME_PREFIX: str = "rlix:pipeline:"
+# Name for the ROLL-specific ResourceManager singleton actor (used when RLIX_CONTROL_PLANE=rlix)
+ROLL_RESOURCE_MANAGER_ACTOR_NAME: str = "rlix:roll_resource_manager"
 
 
 @dataclass(frozen=True, slots=True)

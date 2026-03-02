@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from schedrl.client.client import connect
+from rlix.client.client import connect
 
 
 def init(*, create_if_missing: bool = True):

@@ -6,7 +6,7 @@
 - Human Understandability First: Code is rejected unless it is immediately maintainable by a teammate; every contribution MUST use intent-based naming, modular single-purpose functions with no magic values, and explicit type contracts that remove ambiguity.
 - Typed Python Only: All new or modified Python code MUST annotate public APIs, minimize `Any` (use only for truly dynamic or untyped boundaries), and pass strict type checking (`mypy --strict`).
 - ALWAYS comment code changes: MUST add comments for short explanation first before changing existing code.
-- Copy-then-revise: When adding more than ~20 lines of new code, you MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class). Copy verbatim the closest match then apply revision, noting the source file. Only write from scratch if no similar pattern exists.
+- Copy-then-revise: ALWAYS try copy verbatim use `cp` or `sed` cmd then apply revision, noting the source file, when adding more than ~20 lines of new code. You MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class).  Only write from scratch if no similar pattern exists.
 - Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs at suspicious spots and key points to observe runtime state before touching any code.     
 
 ## 1. Safety (Critical)

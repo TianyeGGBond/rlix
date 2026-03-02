@@ -7,9 +7,9 @@ from typing import Any, Dict, List
 
 import ray
 
-from schedrl.protocol.coordinator import Coordinator
-from schedrl.protocol.request_id import validate_pipeline_id
-from schedrl.protocol.types import ActionResponse, PIPELINE_ACTOR_NAME_PREFIX
+from rlix.protocol.coordinator import Coordinator
+from rlix.protocol.request_id import validate_pipeline_id
+from rlix.protocol.types import ActionResponse, PIPELINE_ACTOR_NAME_PREFIX
 
 
 def _get_pipeline_namespace(pipeline_id: str) -> str:
@@ -18,14 +18,14 @@ def _get_pipeline_namespace(pipeline_id: str) -> str:
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
     job_id = ray.get_runtime_context().get_job_id()
-    scratch_root = f"/tmp/schedrl/{pipeline_id}/{job_id}"
-    shared_root = "/tmp/schedrl/shared"
+    scratch_root = f"/tmp/rlix/{pipeline_id}/{job_id}"
+    shared_root = "/tmp/rlix/shared"
 
-    # Ensure Ray worker processes can import both `schedrl` (repo root) and `roll` (ROLL root)
+    # Ensure Ray worker processes can import both `rlix` (repo root) and `roll` (ROLL root)
     # even when started from non-repo working directories.
     this_file = Path(__file__).resolve()
-    repo_root = str(this_file.parents[3])   # .../SchedRL
-    roll_root = str(this_file.parents[2])   # .../SchedRL/external/ROLL_schedrl
+    repo_root = str(this_file.parents[3])   # .../RLix
+    roll_root = str(this_file.parents[2])   # .../RLix/external/ROLL_rlix
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
     pythonpath_parts = [repo_root, roll_root]
     if existing_pythonpath:
@@ -35,9 +35,9 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     env_vars = {
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
-        "SCHEDRL_CONTROL_PLANE": "schedrl",
+        "RLIX_CONTROL_PLANE": "rlix",
         # Used by upstream ROLL shims to avoid taking down the job-global Ray cluster.
-        "SCHEDRL_LIBRARY_MODE": "1",
+        "RLIX_LIBRARY_MODE": "1",
         "PYTHONPATH": pythonpath,
         # Shared weights/cache (big, reusable).
         "HF_HOME": f"{shared_root}/hf",
@@ -98,7 +98,7 @@ def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
 def _validate_offload_nccl(*, pipeline_config: Any) -> None:
     """Enforce offload_nccl=True on all clusters when sleep_level=2 is active.
 
-    sleep_level=2 is the SchedRL multi-pipeline mode where GPU VRAM is shared across
+    sleep_level=2 is the RLix multi-pipeline mode where GPU VRAM is shared across
     co-tenant pipelines. NCCL communicator buffers (~400-500 MB per process) accumulate
     on the GPU even when a cluster is sleeping. With 10+ co-tenant processes this can
     consume 4-5 GB of baseline VRAM, preventing KV-cache wake-up.
@@ -127,12 +127,12 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
         )
 
 
-class SchedRLCoordinator(Coordinator):
+class RlixCoordinator(Coordinator):
     """Per-pipeline coordinator actor (ENG-123 Phase 3).
 
     Contract:
     - Does NOT forward progress reports (progress is emitted in ROLL GroupQueueManager.put()).
-    - Exposes shrink/expand RPCs for the SchedRL scheduler (fail-fast).
+    - Exposes shrink/expand RPCs for the Rlix scheduler (fail-fast).
     """
 
     def __init__(
@@ -152,7 +152,7 @@ class SchedRLCoordinator(Coordinator):
 
         # Create the cluster-wide singleton ResourceManager actor before any pipeline actor.
         # The coordinator actor holds 0 GPU so the PG bundle ({GPU: N}) can always be satisfied.
-        # The actor is a namespace singleton (schedrl:roll_resource_manager) shared across
+        # The actor is a namespace singleton (rlix:roll_resource_manager) shared across
         # all concurrent pipeline actors.  We also capture node-0's placement group
         # and base GPU rank here to pin pipeline actors to a GPU node for CUDA visibility.
         from roll.distributed.scheduler.resource_manager import get_or_create_roll_resource_manager_actor
@@ -180,11 +180,11 @@ class SchedRLCoordinator(Coordinator):
         adapters = getattr(getattr(pipeline_config, "actor_train", None), "model_args", None)
         adapters = getattr(adapters, "adapters", None) if adapters is not None else None
         if adapters:
-            from schedrl.pipeline.multi_lora_pipeline import SchedRLMultiLoraPipeline
-            PipelineClass = SchedRLMultiLoraPipeline
+            from rlix.pipeline.multi_lora_pipeline import RlixMultiLoraPipeline
+            PipelineClass = RlixMultiLoraPipeline
         else:
-            from schedrl.pipeline.full_finetune_pipeline import SchedRLFullFinetunePipeline
-            PipelineClass = SchedRLFullFinetunePipeline
+            from rlix.pipeline.full_finetune_pipeline import RlixFullFinetunePipeline
+            PipelineClass = RlixFullFinetunePipeline
 
         PipelineActor = ray.remote(PipelineClass)
         # Safety: always inject env vars before constructing the pipeline actor, so callers can't

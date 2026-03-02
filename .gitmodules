@@ -1,5 +1,5 @@
-[submodule "external/ROLL_schedrl"]
-	path = external/ROLL_schedrl
+[submodule "external/ROLL_rlix"]
+	path = external/ROLL_rlix
 	url = git@github.com:taoluo/_rlos_ROLL.git
 	update = merge
 	branch = main

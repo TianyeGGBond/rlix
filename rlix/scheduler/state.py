@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set
 
-from schedrl.protocol.types import Priority, ProgressReport
-from schedrl.scheduler.types import ClusterAllocation, PendingPlannedReleaseRequest, PendingRequest
+from rlix.protocol.types import Priority, ProgressReport
+from rlix.scheduler.types import ClusterAllocation, PendingPlannedReleaseRequest, PendingRequest
 
 
 @dataclass(slots=True)

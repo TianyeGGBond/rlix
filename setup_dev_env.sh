@@ -11,7 +11,7 @@ git config --global user.name "Tao Luo"
 git config --global user.email "taoluo321@outlook.com"
 
 # export RAY_grpc_server_thread_pool_size=4 # reduce the thread usage to save limited pid resouce 
-cd external/ROLL_schedrl
+cd external/ROLL_rlix
 
 conda init && conda activate main # ensure we are in main env 
 # Warn if python is not 3.10, but do not exit

@@ -152,7 +152,7 @@ actor_infer:
       max_num_batched_tokens: 1024  # Match reduced sequence_length=1024
       max_num_seqs: 2
       enforce_eager: true
-      sleep_level: 2  # SchedRL requires sleep_level=2 for weight offload (vs sleep_level=1 for vanilla AgenticMultiLoraPipeline)
+      sleep_level: 2  # RLix requires sleep_level=2 for weight offload (vs sleep_level=1 for vanilla AgenticMultiLoraPipeline)
   device_mapping: "[0, 1, ]"
 
 reference:

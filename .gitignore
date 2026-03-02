@@ -58,6 +58,9 @@ wandb/
 # Ignore non-submodule external directories
 external/linux_reference/
 
+# Code review output (worktrees + findings)
+code_review/output/
+
 hack/
 .claude*/
 .gemini/
