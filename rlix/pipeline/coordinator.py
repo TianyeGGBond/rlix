@@ -36,8 +36,6 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
         "RLIX_CONTROL_PLANE": "rlix",
-        # Used by upstream ROLL shims to avoid taking down the job-global Ray cluster.
-        "RLIX_LIBRARY_MODE": "1",
         "PYTHONPATH": pythonpath,
         # Shared weights/cache (big, reusable).
         "HF_HOME": f"{shared_root}/hf",

@@ -266,7 +266,6 @@ def main() -> None:
                     "PIPELINE_ID": str(pipeline_id),
                     "ROLL_RAY_NAMESPACE": ray_namespace,
                     "RLIX_CONTROL_PLANE": "rlix",
-                    "RLIX_LIBRARY_MODE": "1",
                     # Propagate thread-limiting vars so coordinator + pipeline actors
                     # stay within container pids.max. Falls back to safe defaults if
                     # not set in the shell.

@@ -422,7 +422,6 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                     "PIPELINE_ID": os.environ.get("PIPELINE_ID", self._pipeline_id),
                     "ROLL_RAY_NAMESPACE": ray_namespace,
                     "RLIX_CONTROL_PLANE": os.environ.get("RLIX_CONTROL_PLANE", "rlix"),
-                    "RLIX_LIBRARY_MODE": os.environ.get("RLIX_LIBRARY_MODE", "1"),
                 }
             }
             svc = ModelUpdateService.options(
