@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from rlix.protocol.request_id import validate_pipeline_id
-from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, RLIX_NAMESPACE
+from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, get_pipeline_namespace, ORCHESTRATOR_ACTOR_NAME, Priority, ProgressReport, RLIX_NAMESPACE
 from rlix.scheduler.state import SchedulerState
 from rlix.scheduler.types import (
     ClusterAllocation,
@@ -1193,14 +1193,7 @@ class SchedulerImpl:
 
     async def get_pipeline_namespace(self, *, pipeline_id: str) -> str:
         validate_pipeline_id(pipeline_id)
-        async with self._lock:
-            info = self._state.pipeline_registry.get(pipeline_id)
-            if info is None:
-                raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
-            ray_namespace = info.get("namespace")
-            if not isinstance(ray_namespace, str) or ray_namespace == "":
-                raise RuntimeError(f"pipeline_id {pipeline_id!r} has invalid registered namespace {ray_namespace!r}")
-            return ray_namespace
+        return get_pipeline_namespace(pipeline_id)
 
     async def report_progress(self, report: ProgressReport) -> None:
         validate_pipeline_id(report.pipeline_id)
