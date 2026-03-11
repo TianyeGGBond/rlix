@@ -11,6 +11,15 @@ CUDA_TOOLKIT_VERSION="12.4"
 
 touch ~/.no_auto_tmux
 
+# --- GPU check: abort early if no working NVIDIA GPU is detected ---
+if ! nvidia-smi &> /dev/null; then
+  echo "ERROR: 'nvidia-smi' failed. No working NVIDIA GPU detected or driver is misconfigured." >&2
+  echo "This setup requires a machine with functional NVIDIA GPUs and matching drivers." >&2
+  exit 1
+fi
+echo "GPU check passed:"
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+
 # --- Git config + SSH ---
 if ! grep -q 'GIT_SSH_COMMAND' ~/.bashrc 2>/dev/null; then
   echo 'export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes"' >> ~/.bashrc
@@ -80,15 +89,28 @@ cd "${SCRIPT_DIR}/external/ROLL_rlix"
 uv pip install -r requirements_torch260_vllm.txt
 uv pip install --no-build-isolation "transformer-engine[pytorch]==2.2.0"
 
-# Install ROLL and RLix in editable mode so 'roll' and 'rlix' are importable
+# Install ROLL in editable mode so 'roll' is importable
 uv pip install -e "${SCRIPT_DIR}/external/ROLL_rlix"
-uv pip install -e "${SCRIPT_DIR}"
 
 # --- System packages for tracing ---
+# Must run before 'rlix' editable install: rlix depends on tg4perfetto which
+# requires protoc (protobuf-compiler) at build time.
 # Wait for any running apt/dpkg locks (e.g. unattended-upgrades) before installing
 while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do echo "Waiting for dpkg lock..."; sleep 5; done
 apt-get update && apt-get install -y protobuf-compiler libprotobuf-dev nvtop
-uv pip install "protobuf<3.21.0" "tg4perfetto>=0.0.6"
+
+# Use the pure-Python protobuf backend so tg4perfetto's generated stubs work
+# with any protobuf version. This avoids the <3.21.0 pin and conflicts with
+# wandb/other packages that require a newer protobuf.
+conda env config vars set PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+conda activate "${CONDA_ENV_NAME}"
+
+# Install tg4perfetto with --no-deps to skip its protobuf<3.21.0 constraint;
+# compatibility is handled via the pure-Python backend above.
+uv pip install --no-deps "tg4perfetto>=0.0.6"
+
+# Install RLix in editable mode so 'rlix' is importable
+uv pip install -e "${SCRIPT_DIR}"
 
 # --- Dev tools ---
 curl -fsSL https://claude.ai/install.sh | bash
