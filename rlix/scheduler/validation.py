@@ -59,6 +59,26 @@ def _max_dp_workers(inputs: ValidationInputs, cluster_id: str) -> int:
     return int(max_dp)
 
 
+def validate_dp_ranks_to_add(*, dp_ranks_to_add: List[int], max_dp_ranks: int) -> None:
+    """Validate dp_ranks_to_add for type and range bounds.
+
+    Args:
+        dp_ranks_to_add: List of DP ranks to validate.
+        max_dp_ranks: Maximum allowed DP rank value (exclusive upper bound).
+
+    Raises:
+        TypeError: If dp_ranks_to_add is not a list.
+        ValueError: If any rank is invalid (negative or exceeds max_dp_ranks).
+    """
+    if not isinstance(dp_ranks_to_add, list):
+        raise TypeError(f"dp_ranks_to_add must be list[int], got {type(dp_ranks_to_add).__name__}")
+    for rank in dp_ranks_to_add:
+        if not isinstance(rank, int) or rank < 0:
+            raise ValueError(f"dp_ranks_to_add must contain non-negative integers, got {rank!r}")
+        if rank >= max_dp_ranks:
+            raise ValueError(f"dp_ranks_to_add rank {rank} exceeds max_dp_ranks {max_dp_ranks}")
+
+
 def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) -> None:
     """Fail-fast validation for the scheduler execution plan (11 critical conditions).
 
@@ -240,6 +260,7 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
             sim_allocations[op.cluster_id] = alloc
 
         max_dp = _max_dp_workers(inputs, op.cluster_id)
+        validate_dp_ranks_to_add(dp_ranks_to_add=op.dp_ranks_to_add, max_dp_ranks=max_dp)
         if len(set(alloc.active_dp_ranks) | set(op.dp_ranks_to_add)) > max_dp:
             raise ValidationError(
                 "expansion exceeds max_dp_workers",
@@ -324,3 +345,4 @@ def normalize_progress_oldest_ts(oldest_unfinished_creation_ts: Optional[float],
     if oldest_unfinished_creation_ts is not None:
         return oldest_unfinished_creation_ts
     return fifo_timestamp
+

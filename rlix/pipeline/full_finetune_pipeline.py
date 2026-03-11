@@ -105,7 +105,6 @@ class RlixFullFinetunePipeline(AgenticPipeline):
             from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
             from roll.distributed.executor.cluster import Cluster
-            from roll.distributed.scheduler.generate_scheduler import RequestScheduler
             from roll.distributed.scheduler.rollout_scheduler import RolloutScheduler
             from roll.models.model_providers import default_tokenizer_provider
             from roll.pipeline.base_pipeline import BasePipeline
@@ -180,6 +179,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
 
             # Reward scheduler (named actor for env managers) if reward cluster exists.
             if self.reward:
+                from roll.distributed.scheduler.generate_scheduler import RequestScheduler
                 reward_name = f"RewardScheduler-{self._pipeline_id}"
                 self.reward_scheduler = RequestScheduler.options(
                     name=reward_name,
@@ -195,24 +195,6 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                     pipeline_config=self.pipeline_config,
                     resource_manager=self.resource_manager,
                 )
-
-            # shared RequestScheduler (named actor).
-            request_scheduler_name = f"RequestScheduler-{self._pipeline_id}"
-            self.generate_scheduler = RequestScheduler.options(
-                name=request_scheduler_name,
-                namespace=RAY_NAMESPACE,
-                get_if_exists=True,
-                runtime_env={"env_vars": rlix_env_vars()},
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=ray.get_runtime_context().get_node_id(),
-                    soft=False,
-                ),
-                max_concurrency=1024, # Large enough for shared use
-            ).remote(
-                infer_cluster=self.actor_infer,
-                pipeline_config=self.pipeline_config,
-                resource_manager=self.resource_manager,
-            )
 
             # Rollout schedulers (named actors).
             self.train_rollout_scheduler = ray.remote(RolloutScheduler).options(
@@ -432,15 +414,11 @@ class RlixFullFinetunePipeline(AgenticPipeline):
     def _shrink_workers(self, *, dp_ranks_to_remove: List[int]) -> Dict[str, Any]:
         """Pipeline-local shrink helper (ENG-123).
 
-        In RLix mode with shared RequestScheduler, a single call performs:
-        - routing-only shrink (updates shared active_dp_ranks)
-        - physical offload (skip_offload=False)
+        Single call to the train rollout scheduler performs routing update + physical offload.
         """
         if not isinstance(dp_ranks_to_remove, list) or not dp_ranks_to_remove:
             raise ValueError("dp_ranks_to_remove must be a non-empty list[int]")
         with self._infer_resize_lock:
-            # Both train and val share self.generate_scheduler.
-            # One call with skip_offload=False is sufficient.
             return ray.get(
                 self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks_to_remove, skip_offload=False)
             )
@@ -448,14 +426,11 @@ class RlixFullFinetunePipeline(AgenticPipeline):
     def _expand_workers(self, *, dp_ranks_to_add: List[int], train_skip_load: bool) -> Dict[str, Any]:
         """Pipeline-local expand helper (ENG-123).
 
-        In RLix mode with shared RequestScheduler, a single call performs:
-        - weight load (skip_load=train_skip_load)
-        - routing-only expand (updates shared active_dp_ranks)
+        Single call to the train rollout scheduler performs weight load + routing update.
         """
         if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
         with self._infer_resize_lock:
-            # Both train and val share self.generate_scheduler.
             return ray.get(
                 self.train_rollout_scheduler.expand_sampler.remote(
                     dp_ranks_to_add, skip_load=bool(train_skip_load)
@@ -524,7 +499,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
         request_lora_name: Optional[str] = None,
     ) -> List[int]:
         allocated = ray.get(
-            self._rlix_scheduler.release_and_request_gpus.remote(
+            self._rlix_scheduler.release_then_request_gpus.remote(
                 release_cluster_id=str(release_cluster_id),
                 release_global_step=int(release_global_step),
                 request_cluster_id=str(request_cluster_id),
@@ -534,7 +509,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
             )
         )
         if not isinstance(allocated, list):
-            raise RuntimeError(f"rlix:scheduler.release_and_request_gpus returned non-list: {type(allocated).__name__}")
+            raise RuntimeError(f"rlix:scheduler.release_then_request_gpus returned non-list: {type(allocated).__name__}")
         allocated = [int(x) for x in allocated]
         if not allocated:
             raise RuntimeError(f"rlix:scheduler allocated empty GPU list for cluster_id={request_cluster_id!r}")

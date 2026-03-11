@@ -171,11 +171,13 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 resource_manager=self.resource_manager,
                 infer_cluster=self.actor_infer,
                 mode="train",
-                # RolloutScheduler discovers RequestScheduler via named actor lookup internally.
             )
 
-        # Shut down parent's single global val_rollout_scheduler (replaced by per-tag schedulers below).
-        ray.get(self.val_rollout_scheduler.shutdown.remote())
+        # Null parent's single global schedulers (replaced by per-tag schedulers below).
+        # Not shut down — RolloutScheduler.shutdown() tears down env actors which are
+        # reused by the per-tag schedulers created next.
+        self.train_rollout_scheduler = None
+        self.val_rollout_scheduler = None
 
         # Per-tag val rollout schedulers (mirrors train schedulers for per-adapter eval).
         from roll.pipeline.agentic.agentic_config import EnvManagerConfig
@@ -242,11 +244,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 resource_manager=self.resource_manager,
                 infer_cluster=self.actor_infer,
                 mode="val",
-                # RolloutScheduler discovers RequestScheduler via named actor lookup internally.
             )
-
-        # Point parent's handle to first per-tag scheduler for parent code compatibility.
-        self.val_rollout_scheduler = list(self.val_rollout_schedulers.values())[0]
 
         # Build and promote initial per-lora caches so first expand can sync all loras.
         all_loras = list(dict.fromkeys(self._tag_to_lora.values()))
@@ -679,8 +677,8 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                     ])
 
                 # (d) Push updated lora weights to active infer workers directly via
-                # the coordinator actor. The coordinator looks up generate_scheduler itself and
-                # queries active_dp_ranks inside _resize_sync_lock to avoid race conditions.
+                # the coordinator actor. The coordinator uses locally bookkept active_dp_ranks
+                # (updated by resize_infer under _resize_sync_lock) to avoid race conditions.
                 # If all workers are sleeping (preempted by concurrent pipelines),
                 # the coordinator skips sync and expand_worker handles it on next wake.
                 ray.get(self._get_coordinator_handle().sync_lora_weights.remote(

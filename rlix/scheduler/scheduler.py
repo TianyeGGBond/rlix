@@ -1336,7 +1336,7 @@ class SchedulerImpl:
             self._trace_release_marker(cluster_id, alloc.gpu_ids)
             self._wakeup_event.set()
 
-    async def release_and_request_gpus(
+    async def release_then_request_gpus(
         self,
         *,
         release_cluster_id: str,
@@ -1397,7 +1397,7 @@ class SchedulerImpl:
             self._wakeup_event.set()
         await event.wait()
         if pending is None:
-            raise RuntimeError("release_and_request_gpus internal error: pending request not created")
+            raise RuntimeError("release_then_request_gpus internal error: pending request not created")
         if pending.error is not None:
             raise RuntimeError(pending.error)
         return list(pending.result)
@@ -2472,6 +2472,13 @@ class SchedulerImpl:
             pending.result = list(result or [])
             pending.event.set()
             return
+        # FIX: Check if pipeline was unregistered - benign race
+        pipeline_id, _ = parse_cluster_id(cluster_id)
+        if pipeline_id not in self._state.pipeline_registry:
+            # Pipeline was unregistered, pending was already removed by unregister_pipeline
+            # This is a benign race, not an error
+            return
+        # Pipeline still registered but no pending found - actual error
         raise RuntimeError(f"No pending request found for cluster_id={cluster_id!r} priority={priority!r}")
 
     async def notify_ready_to_release(

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import copy
 import math
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import ray
 
@@ -26,22 +27,14 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     scratch_root = f"/tmp/rlix/{pipeline_id}/{job_id}"
     shared_root = "/tmp/rlix/shared"
 
-    # Ensure Ray worker processes can import both `rlix` (repo root) and `roll` (ROLL root)
-    # even when started from non-repo working directories.
-    this_file = Path(__file__).resolve()
-    repo_root = str(this_file.parents[3])   # .../RLix
-    roll_root = str(this_file.parents[2])   # .../RLix/external/ROLL_rlix
-    existing_pythonpath = os.environ.get("PYTHONPATH", "")
-    pythonpath_parts = [repo_root, roll_root]
-    if existing_pythonpath:
-        pythonpath_parts.append(existing_pythonpath)
-    pythonpath = os.pathsep.join(pythonpath_parts)
+    # NOTE: Requires pip-installed rlix and roll packages.
+    # Ray workers inherit the driver's Python environment, so packages
+    # installed via pip are automatically available without PYTHONPATH.
 
     env_vars = {
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
         "RLIX_CONTROL_PLANE": "rlix",
-        "PYTHONPATH": pythonpath,
         # Shared weights/cache (big, reusable).
         "HF_HOME": f"{shared_root}/hf",
         "HUGGINGFACE_HUB_CACHE": f"{shared_root}/hf/hub",
@@ -65,6 +58,18 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
         env_vars["OMP_NUM_THREADS"], env_vars["RAY_grpc_server_thread_pool_size"],
     )
     return env_vars
+
+
+def _validate_config_schema(*, pipeline_config: Any) -> None:
+    """Validate that pipeline_config has all required attributes.
+
+    Raises ValueError if any required attribute is missing.
+    This prevents silent failures when config keys are renamed or missing.
+    """
+    required_attrs = ["actor_train", "actor_infer"]
+    for attr in required_attrs:
+        if not hasattr(pipeline_config, attr):
+            raise ValueError(f"pipeline_config missing required attribute: {attr!r}")
 
 
 def _validate_cpu_only_reward(*, pipeline_config: Any) -> None:
@@ -156,6 +161,7 @@ class RlixCoordinator(Coordinator):
         self._ray_namespace = get_pipeline_namespace(pipeline_id)
         self._pipeline_env_vars = _build_pipeline_env_vars(pipeline_id=pipeline_id, ray_namespace=self._ray_namespace)
 
+        _validate_config_schema(pipeline_config=pipeline_config)
         _validate_cpu_only_reward(pipeline_config=pipeline_config)
         _validate_vllm_sleep_level(pipeline_config=pipeline_config)
         _validate_offload_nccl(pipeline_config=pipeline_config)
@@ -175,6 +181,9 @@ class RlixCoordinator(Coordinator):
         # Serializes resize_infer and sync_lora_weights: prevents a weight sync from
         # racing with a concurrent shrink/expand triggered by the central scheduler.
         self._resize_sync_lock = threading.Lock()
+        # Bookkeep active infer dp ranks locally; updated atomically under _resize_sync_lock
+        # by resize_infer (shrink/expand). Used by sync_lora_weights to avoid remote actor lookup.
+        self._active_infer_dp_ranks: Set[int] = set()
 
         # Serializes concurrent report_progress_from_scheduler calls when max_concurrency > 1.
         # Separate from _resize_sync_lock — no shared state between progress and resize paths.
@@ -215,7 +224,8 @@ class RlixCoordinator(Coordinator):
         PipelineActor = ray.remote(PipelineClass)
         # Safety: always inject env vars before constructing the pipeline actor, so callers can't
         # accidentally create a pipeline with missing system_envs.
-        self._inject_pipeline_env_vars(pipeline_config=pipeline_config)
+        # Deep copy to prevent env var leaks when same config object is reused across pipelines.
+        pipeline_config = self._inject_pipeline_env_vars(pipeline_config=pipeline_config)
 
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
         self._pipeline_actor = PipelineActor.options(
@@ -302,7 +312,13 @@ class RlixCoordinator(Coordinator):
         # Fire-and-forget: progress is a background signal; same pattern as existing direct reports.
         self._rlix_scheduler.report_progress.remote(aggregated)
 
-    def _inject_pipeline_env_vars(self, *, pipeline_config: Any) -> None:
+    def _inject_pipeline_env_vars(self, *, pipeline_config: Any) -> Any:
+        """Deep copy pipeline_config and inject env vars into the copy.
+
+        Returns a modified deep copy to prevent env var leaks when the same config
+        object is reused across multiple pipelines.
+        """
+        config = copy.deepcopy(pipeline_config)
         envs = dict(self._pipeline_env_vars)
 
         def _update_system_envs(obj: Any) -> None:
@@ -317,32 +333,30 @@ class RlixCoordinator(Coordinator):
             system_envs.update(envs)
 
         # Worker clusters
-        _update_system_envs(getattr(pipeline_config, "actor_train", None))
-        _update_system_envs(getattr(pipeline_config, "actor_infer", None))
-        _update_system_envs(getattr(pipeline_config, "reference", None))
-        _update_system_envs(getattr(pipeline_config, "critic", None))
-        _update_system_envs(getattr(pipeline_config, "reward", None))
+        _update_system_envs(getattr(config, "actor_train", None))
+        _update_system_envs(getattr(config, "actor_infer", None))
+        _update_system_envs(getattr(config, "reference", None))
+        _update_system_envs(getattr(config, "critic", None))
+        _update_system_envs(getattr(config, "reward", None))
 
         # Env managers (spawn env actors/workers)
-        _update_system_envs(getattr(pipeline_config, "train_env_manager", None))
-        _update_system_envs(getattr(pipeline_config, "val_env_manager", None))
+        _update_system_envs(getattr(config, "train_env_manager", None))
+        _update_system_envs(getattr(config, "val_env_manager", None))
+
+        return config
 
     def sync_lora_weights(self, *, loras_to_sync: List[str]) -> None:
         """Push trained LoRA weights to currently-awake infer workers.
 
-        Ranks are queried INSIDE _resize_sync_lock by looking up the generate_scheduler
-        actor directly, so the set cannot change between query and use (resize_infer also
-        acquires this lock before shrinking/expanding).
+        Active ranks come from local _active_infer_dp_ranks bookkeeping (updated by
+        resize_infer under the same _resize_sync_lock), so the set cannot change between
+        query and use.
         If all infer workers are sleeping (preempted by concurrent pipelines), sync is
         skipped — sleeping workers receive the updated LoRA via expand_worker on wake.
         """
         with self._resize_sync_lock:
-            # Look up generate_scheduler by its well-known name and query ranks atomically.
-            from roll.utils.constants import RAY_NAMESPACE
-            generate_scheduler = ray.get_actor(
-                f"RequestScheduler-{self._pipeline_id}", namespace=RAY_NAMESPACE
-            )
-            active_ranks = sorted(ray.get(generate_scheduler.get_active_dp_ranks.remote()))
+            # Use locally bookkept active dp ranks (updated by resize_infer under same lock).
+            active_ranks = sorted(self._active_infer_dp_ranks)
             if not active_ranks:
                 # All infer workers preempted/sleeping; expand_worker syncs on next wake.
                 return
@@ -399,4 +413,9 @@ class RlixCoordinator(Coordinator):
                 dp_ranks_to_add=list(dp_ranks_to_add),
             )
             ray.get(ref)
+            # Update active dp ranks bookkeeping after successful resize.
+            if dp_ranks_to_remove:
+                self._active_infer_dp_ranks -= set(dp_ranks_to_remove)
+            else:
+                self._active_infer_dp_ranks |= set(dp_ranks_to_add)
         return ActionResponse(success=True)
