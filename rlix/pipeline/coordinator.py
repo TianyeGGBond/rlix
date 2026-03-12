@@ -166,6 +166,9 @@ class RlixCoordinator(Coordinator):
         _validate_vllm_sleep_level(pipeline_config=pipeline_config)
         _validate_offload_nccl(pipeline_config=pipeline_config)
 
+        # Config flag for post-sync weight verification (disabled by default).
+        self._verify_model_after_sync: bool = bool(pipeline_config.verify_model_after_sync)
+
         # Create the cluster-wide singleton ResourceManager actor before any pipeline actor.
         # The coordinator actor holds 0 GPU so the PG bundle ({GPU: N}) can always be satisfied.
         # The actor is a namespace singleton (rlix:roll_resource_manager) shared across
@@ -345,7 +348,7 @@ class RlixCoordinator(Coordinator):
 
         return config
 
-    def sync_lora_weights(self, *, loras_to_sync: List[str], verify: bool = True) -> None:
+    def sync_lora_weights(self, *, loras_to_sync: List[str]) -> None:
         """Push trained LoRA weights to currently-awake infer workers.
 
         Active ranks come from local _active_infer_dp_ranks bookkeeping (updated by
@@ -371,7 +374,8 @@ class RlixCoordinator(Coordinator):
                     f"in namespace {self._ray_namespace!r}"
                 ) from e
             ray.get(model_update_service.sync_selected_workers.remote(
-                active_ranks, adapters_to_sync=list(loras_to_sync), verify=verify,
+                active_ranks, adapters_to_sync=list(loras_to_sync),
+                verify=self._verify_model_after_sync,
             ))
 
     def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> ActionResponse:
