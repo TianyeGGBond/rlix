@@ -173,11 +173,10 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 mode="train",
             )
 
-        # Null parent's single global schedulers (replaced by per-tag schedulers below).
-        # Not shut down — RolloutScheduler.shutdown() tears down env actors which are
-        # reused by the per-tag schedulers created next.
-        self.train_rollout_scheduler = None
-        self.val_rollout_scheduler = None
+        # Keep parent's single global schedulers alive — setting to None drops Ray references,
+        # which kills the actors and their child env workers that per-tag schedulers depend on.
+        # Per-tag schedulers below create their own env workers; the parent schedulers are unused
+        # but must stay referenced until pipeline shutdown.
 
         # Per-tag val rollout schedulers (mirrors train schedulers for per-adapter eval).
         from roll.pipeline.agentic.agentic_config import EnvManagerConfig
