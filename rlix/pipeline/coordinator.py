@@ -345,7 +345,7 @@ class RlixCoordinator(Coordinator):
 
         return config
 
-    def sync_lora_weights(self, *, loras_to_sync: List[str]) -> None:
+    def sync_lora_weights(self, *, loras_to_sync: List[str], verify: bool = True) -> None:
         """Push trained LoRA weights to currently-awake infer workers.
 
         Active ranks come from local _active_infer_dp_ranks bookkeeping (updated by
@@ -371,7 +371,7 @@ class RlixCoordinator(Coordinator):
                     f"in namespace {self._ray_namespace!r}"
                 ) from e
             ray.get(model_update_service.sync_selected_workers.remote(
-                active_ranks, adapters_to_sync=list(loras_to_sync)
+                active_ranks, adapters_to_sync=list(loras_to_sync), verify=verify,
             ))
 
     def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> ActionResponse:

@@ -143,7 +143,9 @@ class ModelUpdateService:
         comm_plan = {src_rank: comm_plan_args}
         return comm_plan, group_name, sorted(tgt_ranks_in_group)
 
-    def sync_selected_workers(self, tgt_dp_ranks: List[int], adapters_to_sync: list[str] | None = None) -> None:
+    def sync_selected_workers(
+        self, tgt_dp_ranks: List[int], adapters_to_sync: list[str] | None = None, verify: bool = True,
+    ) -> None:
         tgt_dp_ranks = sorted(set(int(r) for r in tgt_dp_ranks))
         if not tgt_dp_ranks:
             raise ValueError("tgt_dp_ranks must be non-empty")
@@ -237,7 +239,7 @@ class ModelUpdateService:
                         adapters_to_sync=adapters_to_sync,
                     )
                 )
-            self._ray_get_with_timeout(
+            sync_results = self._ray_get_with_timeout(
                 sync_refs,
                 timeout_s=self._timeout_s,
                 desc=(
@@ -254,6 +256,33 @@ class ModelUpdateService:
             ) from exc
         # NCCL groups are destroyed inside selective_sync_active_cache (owner side) before returning.
         # ray.get(sync_refs) above confirms teardown is complete.
+
+        # Post-sync verification: compare sender stats against receiver live weights.
+        # Only the cache owner returns non-None with weight_stats; non-owners return None.
+        if verify:
+            sender_stats: dict = {}
+            for result in sync_results:
+                if isinstance(result, dict) and result.get("weight_stats"):
+                    sender_stats = result["weight_stats"]
+                    break
+            if sender_stats:
+                verify_refs = [
+                    self.tgt_cluster.rank2worker[int(dp_rank)].verify_model.remote(
+                        expected_stats=sender_stats
+                    )
+                    for dp_rank in tgt_dp_ranks
+                ]
+                self._ray_get_with_timeout(
+                    verify_refs,
+                    timeout_s=self._timeout_s,
+                    desc=(
+                        "[ModelUpdateService] verify_model "
+                        f"pipeline_id={self.pipeline_id} sync_id={sync_id} tgt_dp_ranks={tgt_dp_ranks}"
+                    ),
+                )
+                logger.info(
+                    f"[ModelUpdateService] verify_model_ok pipeline_id={self.pipeline_id} sync_id={sync_id}"
+                )
 
         logger.info(
             f"[ModelUpdateService] sync_selected_workers_exit pipeline_id={self.pipeline_id} sync_id={sync_id}"
