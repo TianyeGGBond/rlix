@@ -2,7 +2,7 @@
 	path = external/ROLL_rlix
 	url = git@github.com:taoluo/_rlos_ROLL.git
 	update = merge
-	branch = main
+	branch = rlix
 [submodule "external/SkyRL"]
 	path = external/SkyRL
 	url = git@github.com:NovaSky-AI/SkyRL.git
