@@ -20,11 +20,11 @@ logging_dir: ./output/lora_pipeline1/logs
 output_dir: ./output/lora_pipeline1
 render_save_dir: /tmp/roll_output/lora_pipeline1/render
 
-track_with: wandb
-tracker_kwargs:
-  entity: "khd6t7hdhn-university-of-pennsylvania"
-  project: "rlix"
-  api_key: "${oc.env:WANDB_API_KEY}"
+# track_with: wandb
+# tracker_kwargs:
+#   entity: "khd6t7hdhn-university-of-pennsylvania"
+#   project: "rlix"
+#   api_key: "${oc.env:WANDB_API_KEY}"
 
 
 system_envs:

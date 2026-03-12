@@ -11,11 +11,11 @@ hydra:
   output_subdir: null
 
 # pipeline_cls: roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline
-track_with: wandb
-tracker_kwargs:
-  entity: "khd6t7hdhn-university-of-pennsylvania"
-  project: "rlix"
-  api_key: "${oc.env:WANDB_API_KEY}"
+# track_with: wandb
+# tracker_kwargs:
+#   entity: "khd6t7hdhn-university-of-pennsylvania"
+#   project: "rlix"
+#   api_key: "${oc.env:WANDB_API_KEY}"
 
 
 exp_name: "agent_train_sokoban_multi_lora2"
