@@ -7,6 +7,8 @@ set -eo pipefail
 
 CONDA_ENV_NAME="rlix"
 PYTHON_VERSION="3.10"
+GIT_USER_NAME="${GIT_USER_NAME:-Tao Luo}"
+GIT_USER_EMAIL="${GIT_USER_EMAIL:-taoluo321@outlook.com}"
 CUDA_CHANNEL_LABEL="cuda-12.4.1"
 CUDA_NVCC_VERSION="12.4.131"
 CUDA_CUDART_DEV_VERSION="12.4.127"
@@ -16,6 +18,44 @@ CUDA_CUSPARSE_DEV_VERSION="12.3.1.170"
 CUDA_CUSOLVER_DEV_VERSION="11.6.1.9"
 CUDA_NVTX_VERSION="12.4.127"
 CUDNN_VERSION="9.1.1.17"
+INSTALL_GIT_SETUP=1
+INSTALL_DEV_TOOLS=1
+
+print_usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  --skip-git-setup   Skip SSH and git identity setup.
+  --skip-dev-tools   Skip Claude Code, iFlow, and Codex installation.
+  -h, --help         Show this help message.
+
+Environment overrides:
+  GIT_USER_NAME      Git user.name to configure when git setup is enabled.
+  GIT_USER_EMAIL     Git user.email to configure when git setup is enabled.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-git-setup)
+      INSTALL_GIT_SETUP=0
+      ;;
+    --skip-dev-tools)
+      INSTALL_DEV_TOOLS=0
+      ;;
+    -h|--help)
+      print_usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown option '$1'" >&2
+      print_usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
 
 touch ~/.no_auto_tmux
 
@@ -29,13 +69,17 @@ echo "GPU check passed:"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
 # --- Git config + SSH ---
-if ! grep -q 'GIT_SSH_COMMAND' ~/.bashrc 2>/dev/null; then
-  echo 'export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes"' >> ~/.bashrc
-fi
-export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes"
+if [[ "${INSTALL_GIT_SETUP}" -eq 1 ]]; then
+  if ! grep -q 'GIT_SSH_COMMAND' ~/.bashrc 2>/dev/null; then
+    echo 'export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes"' >> ~/.bashrc
+  fi
+  export GIT_SSH_COMMAND="ssh -i /workspace/.ssh/id_ed25519 -o IdentitiesOnly=yes"
 
-git config --global user.name "Tao Luo"
-git config --global user.email "taoluo321@outlook.com"
+  git config --global user.name "${GIT_USER_NAME}"
+  git config --global user.email "${GIT_USER_EMAIL}"
+else
+  echo "Skipping git and SSH setup."
+fi
 
 # --- Install Miniconda if conda is not available ---
 if ! command -v conda &> /dev/null; then
@@ -157,16 +201,20 @@ uv pip install --no-deps "tg4perfetto>=0.0.6"
 uv pip install -e "${SCRIPT_DIR}"
 
 # --- Dev tools ---
-curl -fsSL https://claude.ai/install.sh | bash
-if ! grep -q 'HOME/.local/bin' ~/.bashrc 2>/dev/null; then
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+if [[ "${INSTALL_DEV_TOOLS}" -eq 1 ]]; then
+  curl -fsSL https://claude.ai/install.sh | bash
+  if ! grep -q 'HOME/.local/bin' ~/.bashrc 2>/dev/null; then
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+  fi
+  # Install iflow first so it provisions node/npm before codex.
+  bash -c "$(curl -fsSL https://gist.githubusercontent.com/taoluo/d5ada7e9210c34e4108988bf1b34681d/raw/9e155e480db1d1efea37975b8f47b2b865a27cc0/iflow_cli_install.sh)"
+  # Source nvm so npm is available for codex install.
+  export NVM_DIR="$HOME/.nvm"
+  # shellcheck disable=SC1091
+  source "$NVM_DIR/nvm.sh"
+  npm i -g @openai/codex
+else
+  echo "Skipping dev tool installation."
 fi
-# Install iflow first (it sets up node/npm via nvm)
-bash -c "$(curl -fsSL https://gist.githubusercontent.com/taoluo/d5ada7e9210c34e4108988bf1b34681d/raw/9e155e480db1d1efea37975b8f47b2b865a27cc0/iflow_cli_install.sh)"
-# Source nvm so npm is available for codex install
-export NVM_DIR="$HOME/.nvm"
-# shellcheck disable=SC1091
-source "$NVM_DIR/nvm.sh"
-npm i -g @openai/codex
 
 echo "Done! Run 'conda activate ${CONDA_ENV_NAME}' to use the environment."
