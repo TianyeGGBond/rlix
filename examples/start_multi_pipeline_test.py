@@ -1,19 +1,17 @@
 """
-RLix multi-pipeline example (ENG-123).
+RLix multi-pipeline example.
 
-This ports the fork reference configs (`pipeline1_sokoban_grpo.yaml`, `pipeline2_sokoban_grpo.yaml`) and provides a
-driver that runs 1+ pipelines concurrently under the RLix control plane.
+Runs 1+ RL training pipelines concurrently under the RLix control plane.
 
-Usage (from repo root):
-  python external/ROLL_rlix/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo
-  python external/ROLL_rlix/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo,pipeline2_sokoban_grpo
+Usage:
+  python examples/start_multi_pipeline_test.py --config_name full_finetune_pipeline1
+  python examples/start_multi_pipeline_test.py --config_name full_finetune_pipeline1,full_finetune_pipeline2
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -26,68 +24,23 @@ from rlix.pipeline import COORDINATOR_MAX_CONCURRENCY
 from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, RLIX_NAMESPACE
 
 
-def _repo_root() -> Path:
-    # Resolve the mono-repo root regardless of where this example is vendored.
-    #
-    # We intentionally avoid relying on a fixed `parents[N]` depth because this file
-    # lives under `external/ROLL_rlix/...` in this workspace (vs `third_party/ROLL/...`
-    # in other layouts).
-    start = Path(__file__).resolve()
-    for parent in start.parents:
-        git_dir = parent / ".git"
-        if git_dir.exists() and git_dir.is_dir():
-            return parent
-        if (parent / "AGENTS.md").exists() and (parent / "rlix").is_dir():
-            return parent
-    raise RuntimeError(f"Failed to locate repo root from {start}")
-
-
-def _resolve_roll_root(*, repo_root: Path) -> Path:
-    # Prefer the in-repo ROLL+RLix fork used by ENG-123.
-    candidates = [
-        repo_root / "external" / "ROLL_rlix",
-        repo_root / "third_party" / "ROLL",
-        repo_root / "external" / "ROLL",
-    ]
-    for candidate in candidates:
-        if (candidate / "roll").is_dir():
-            return candidate.resolve()
-    raise RuntimeError(f"Failed to locate ROLL root under repo_root={repo_root} (tried {candidates})")
-
-
-def _ensure_import_paths() -> tuple[Path, Path]:
-    repo_root = _repo_root()
-    roll_root = _resolve_roll_root(repo_root=repo_root)
-    sys.path.insert(0, str(repo_root))
-    sys.path.insert(0, str(roll_root))
-    return repo_root, roll_root
-
-
-def _resolve_hydra_config_path(*, roll_root: Path, arg_config_path: str) -> tuple[str, Path]:
+def _resolve_hydra_config_path(arg_config_path: str) -> tuple[str, Path]:
+    """Resolve the Hydra config directory relative to this script's location."""
     script_dir = Path(__file__).resolve().parent
-    examples_dir = (roll_root / "examples").resolve()
     config_path = Path(arg_config_path)
 
+    # Absolute path — use as-is.
     if config_path.is_absolute():
         return str(config_path), config_path
 
-    script_relative_dir = (script_dir / config_path).resolve()
-    if script_relative_dir.is_dir():
-        return str(config_path), script_relative_dir
-
-    examples_relative_dir = (examples_dir / config_path).resolve()
-    if examples_relative_dir.is_dir():
-        hydra_config_path = os.path.relpath(examples_relative_dir, script_dir)
-        return hydra_config_path, examples_relative_dir
-
-    roll_relative_dir = (roll_root / config_path).resolve()
-    if roll_relative_dir.is_dir():
-        hydra_config_path = os.path.relpath(roll_relative_dir, script_dir)
-        return hydra_config_path, roll_relative_dir
+    # Relative to script directory (e.g. "rlix_test" -> examples/rlix_test/).
+    resolved = (script_dir / config_path).resolve()
+    if resolved.is_dir():
+        return str(config_path), resolved
 
     raise FileNotFoundError(
         f"Config directory not found. Received --config_path={arg_config_path!r} "
-        f"(tried {script_relative_dir}, {examples_relative_dir}, {roll_relative_dir})"
+        f"(tried {resolved})"
     )
 
 
@@ -116,7 +69,7 @@ def _cluster_registry_inputs(*, pipeline_config: Any) -> tuple[Dict[str, int], D
 def _pipeline_type(pipeline_config: Any) -> str:
     """Return 'lora' if the config has LoRA adapters configured, else 'ft'.
 
-    Mirrors the same lora detection used in RlixCoordinator.create_pipeline_actor().
+    Mirrors the same lora detection used in PipelineCoordinator.create_pipeline_actor().
     Source: rlix/pipeline/coordinator.py
     """
     adapters = getattr(getattr(pipeline_config, "actor_train", None), "model_args", None)
@@ -125,22 +78,20 @@ def _pipeline_type(pipeline_config: Any) -> str:
 
 
 def main() -> None:
-    repo_root, roll_root = _ensure_import_paths()
-
     from roll.pipeline.agentic.agentic_config import AgenticConfig
-    from rlix.pipeline.coordinator import RlixCoordinator, get_pipeline_namespace
+    from rlix.pipeline.coordinator import PipelineCoordinator, get_pipeline_namespace
 
     import rlix
 
     parser = argparse.ArgumentParser(description="RLix multi-pipeline example")
     parser.add_argument(
         "--config_path",
-        default="multi_pipeline",
-        help="Path to config directory (relative to third_party/ROLL/examples/)",
+        default="rlix_test",
+        help="Path to config directory (relative to examples/)",
     )
     parser.add_argument(
         "--config_name",
-        default="pipeline1_sokoban_grpo",
+        default="full_finetune_pipeline1",
         help="Comma-separated config file names (without .yaml)",
     )
     parser.add_argument(
@@ -161,25 +112,13 @@ def main() -> None:
     if not config_names:
         raise ValueError("--config_name must be non-empty")
 
-    # Make the driver + all Ray workers able to import `roll` and `rlix`.
-    # (Ray workers do not inherit the driver's `sys.path` mutations.)
-    pythonpath_parts = [str(repo_root), str(roll_root)]
-    existing_pythonpath = os.environ.get("PYTHONPATH", "")
-    if existing_pythonpath:
-        pythonpath_parts.append(existing_pythonpath)
-    worker_pythonpath = os.pathsep.join(pythonpath_parts)
-
-    # This example is often run in a single-process "smoke test" setup without a pre-existing Ray cluster.
-    # Initialize a local Ray runtime so rlix.init() does not require an external `ray start --head`.
-    # Log before ray.init() — this is when the head node gRPC pool size is fixed.
+    # Initialize a local Ray runtime if one is not already running.
     _grpc_pool = os.environ.get("RAY_grpc_server_thread_pool_size", "4")
     _omp = os.environ.get("OMP_NUM_THREADS", "1")
     print(f"[ENV] RAY_grpc_server_thread_pool_size={_grpc_pool}")
     print(f"[ENV] OMP_NUM_THREADS={_omp}")
     if not ray.is_initialized():
         # Pass thread-limiting vars as the Ray-side global default runtime_env.
-        # Actors that specify their own runtime_env override this, but it catches
-        # any actor that does not set an explicit runtime_env.
         ray.init(
             namespace=RLIX_NAMESPACE,
             ignore_reinit_error=True,
@@ -192,7 +131,7 @@ def main() -> None:
             }},
         )
 
-    hydra_config_path, _ = _resolve_hydra_config_path(roll_root=roll_root, arg_config_path=args.config_path)
+    hydra_config_path, _ = _resolve_hydra_config_path(arg_config_path=args.config_path)
     GlobalHydra.instance().clear()
     initialize(config_path=hydra_config_path, job_name="rlix_multi_pipeline", version_base=None)
 
@@ -225,7 +164,7 @@ def main() -> None:
     if orchestrator is None:
         raise RuntimeError("rlix.init returned None (expected orchestrator actor handle on rank 0)")
 
-    CoordinatorActor = ray.remote(RlixCoordinator)
+    CoordinatorActor = ray.remote(PipelineCoordinator)
 
     coordinators = []
     pipeline_actors = []
@@ -260,17 +199,14 @@ def main() -> None:
             max_restarts=0,
             max_task_retries=0,
             max_concurrency=COORDINATOR_MAX_CONCURRENCY,
-            # Ray does not reliably propagate env vars from parent actors. Explicitly inject the
-            # per-pipeline namespace + control-plane contract for this pipeline actor process.
+            # Inject per-pipeline namespace + control-plane contract for this pipeline actor.
             runtime_env={
                 "env_vars": {
-                    "PYTHONPATH": worker_pythonpath,
                     "PIPELINE_ID": str(pipeline_id),
                     "ROLL_RAY_NAMESPACE": ray_namespace,
                     "RLIX_CONTROL_PLANE": "rlix",
                     # Propagate thread-limiting vars so coordinator + pipeline actors
-                    # stay within container pids.max. Falls back to safe defaults if
-                    # not set in the shell.
+                    # stay within container pids.max.
                     "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
                     "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
                     "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),

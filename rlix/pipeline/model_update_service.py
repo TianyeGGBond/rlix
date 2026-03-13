@@ -14,7 +14,7 @@ logger = get_logger()
 
 @ray.remote
 class ModelUpdateService:
-    """Per-pipeline service for selective sync on expand (ENG-123 Phase 4).
+    """Per-pipeline service for selective sync on expand.
 
     Contract:
     - Scheduler-side trigger only: no promotion forwarding, no validation, no coalescing.

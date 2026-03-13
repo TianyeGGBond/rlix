@@ -40,8 +40,8 @@ from roll.utils.train_infer_corrections import apply_train_infer_correction_to_b
 logger = get_logger()
 
 
-class RlixFullFinetunePipeline(AgenticPipeline):
-    """Rlix-controlled variant of ROLL AgenticPipeline (ENG-123 Phase 3).
+class RollFullFinetunePipeline(AgenticPipeline):
+    """Rlix-controlled variant of ROLL AgenticPipeline.
 
     Key differences from upstream AgenticPipeline.run():
     - Before each rollout, request generation GPUs from Rlix (scheduler drives expand via coordinator).
@@ -71,7 +71,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
         self._coordinator_handle: Any = None
 
     def _get_coordinator_handle(self) -> Any:
-        """Resolve and cache the per-pipeline RlixCoordinator actor handle.
+        """Resolve and cache the per-pipeline PipelineCoordinator actor handle.
 
         Named 'rlix:coordinator:{pipeline_id}' in the pipeline namespace.
         The coordinator serializes resize_infer and sync_lora_weights via _resize_sync_lock.
@@ -231,7 +231,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                 runtime_env={"env_vars": rlix_env_vars()},
             ).remote()
 
-            # Infer resize serialization boundary (ENG-123).
+            # Infer resize serialization boundary.
             infer_strategy_config = self.actor_infer.worker_config.strategy_args.strategy_config
             tp_size = int(infer_strategy_config.get("tensor_parallel_size", 1))
             pp_size = int(infer_strategy_config.get("pipeline_parallel_size", 1))
@@ -393,7 +393,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
             )
             ray.get(svc.__ray_ready__.remote())
 
-            # Start from a well-defined state (ENG-123):
+            # Start from a well-defined state:
             # - disable routing until we request GPUs from RLix.
             # NOTE: avoid local suspend()/resume() state transitions; shrink-to-zero is the single
             # source of truth for pausing generation traffic, and expand-from-zero resumes internally.
@@ -405,7 +405,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
             return ActionResponse(success=True)
 
     def _shrink_workers(self, *, dp_ranks_to_remove: List[int]) -> Dict[str, Any]:
-        """Pipeline-local shrink helper (ENG-123).
+        """Pipeline-local shrink helper.
 
         Single call to the train rollout scheduler performs routing update + physical offload.
         """
@@ -417,7 +417,7 @@ class RlixFullFinetunePipeline(AgenticPipeline):
             )
 
     def _expand_workers(self, *, dp_ranks_to_add: List[int], train_skip_load: bool) -> Dict[str, Any]:
-        """Pipeline-local expand helper (ENG-123).
+        """Pipeline-local expand helper.
 
         Single call to the train rollout scheduler performs weight load + routing update.
         """

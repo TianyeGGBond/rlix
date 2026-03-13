@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-"""Rlix Scheduler (ENG-123 Phase 2).
+"""Rlix Scheduler.
 
-Operational policy (ENG-123): fail-fast only. No recovery or rehydration is provided; on any
+Operational policy: fail-fast only. No recovery or rehydration is provided; on any
 scheduler restart, pipelines are expected to re-register and be re-admitted.
 """
 
@@ -85,7 +85,7 @@ def _validate_and_canonicalize_device_mapping(
 
     Canonical form: sorted GPU ids.
 
-    ENG-123 topology contract:
+    Topology contract:
     - For tp_size in {2,4,8}: each TP group must be contiguous and within a single node boundary.
     - For tp_size that is a multiple of 8: each TP group must be contiguous and aligned to node boundaries,
       spanning whole nodes (required_gpus_per_node GPUs per node assumed by global GPU id layout).
@@ -1103,8 +1103,8 @@ class SchedulerImpl:
             if not device_mapping and cluster_name != "reward":
                 raise ValueError(f"device_mapping must be non-empty for cluster {cluster_name!r}")
             if cluster_name == "reward" and device_mapping:
-                # TODO(ENG-123): support GPU reward clusters (Phase 3 restricts reward to CPU-only).
-                raise ValueError("ENG-123 Phase 3 only supports CPU-only reward: reward.device_mapping must be empty")
+                # TODO: support GPU reward clusters (currently restricted to CPU-only).
+                raise ValueError("reward cluster only supports CPU-only mode: reward.device_mapping must be empty")
             if device_mapping and len(device_mapping) != len(set(device_mapping)):
                 raise ValueError(f"device_mapping has duplicates for cluster {cluster_name!r}")
             num_gpus = self._num_gpus
@@ -1884,7 +1884,7 @@ class SchedulerImpl:
 
         Order: shrinks → close GPU traces → expands → open GPU traces.
         Tracing happens here so timestamps reflect actual RPC completion, not state-commit time.
-        Matches fork behavior in external/ROLL_multi_pipeline/.../centralized_gpu_scheduler.py Phase 5.
+        Order matches ROLL's centralized_gpu_scheduler Phase 5 convention.
 
         # TODO: only block an expand on the shrinks it actually depends on (i.e. its target GPUs
         # overlap with GPUs being freed). Expands targeting already-idle GPUs can run concurrently

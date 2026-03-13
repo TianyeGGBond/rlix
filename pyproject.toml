@@ -4,13 +4,56 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rlix"
-version = "0.0.0"
-description = "Ray-based multi-pipeline GPU time-sharing"
+version = "0.1.0"
+description = "Ray-based multi-pipeline GPU time-sharing library for reinforcement learning"
+readme = "README.md"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
+authors = [
+    {name = "Tao Luo"},
+]
+keywords = ["ray", "gpu", "scheduling", "reinforcement-learning", "multi-pipeline", "time-sharing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Machine Learning",
+]
 dependencies = [
     "tg4perfetto>=0.0.6",
     "protobuf<3.21.0",
+    "roll @ git+https://github.com/rlops/ROLL.git",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest", "mypy", "black", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/rlops/rlix"
+Documentation = "https://github.com/rlops/rlix#readme"
+Repository = "https://github.com/rlops/rlix"
+Issues = "https://github.com/rlops/rlix/issues"
 
 [tool.setuptools.packages.find]
 include = ["rlix*"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.black]
+line-length = 119
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 119
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]

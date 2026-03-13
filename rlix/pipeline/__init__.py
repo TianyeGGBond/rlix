@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from rlix.pipeline.coordinator import RlixCoordinator, COORDINATOR_MAX_CONCURRENCY
-from rlix.pipeline.full_finetune_pipeline import RlixFullFinetunePipeline
-from rlix.pipeline.multi_lora_pipeline import RlixMultiLoraPipeline
+from rlix.pipeline.coordinator import PipelineCoordinator, COORDINATOR_MAX_CONCURRENCY
+from rlix.pipeline.full_finetune_pipeline import RollFullFinetunePipeline
+from rlix.pipeline.multi_lora_pipeline import RollMultiLoraPipeline
 
 __all__ = [
-    "RlixCoordinator",
+    "PipelineCoordinator",
     "COORDINATOR_MAX_CONCURRENCY",
-    "RlixFullFinetunePipeline",
-    "RlixMultiLoraPipeline",
+    "RollFullFinetunePipeline",
+    "RollMultiLoraPipeline",
 ]

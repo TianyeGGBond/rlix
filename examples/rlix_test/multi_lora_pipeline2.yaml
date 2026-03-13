@@ -1,9 +1,5 @@
 defaults:
   - ../config/traj_envs@_here_
-  - ../config/deepspeed_zero@_here_
-  - ../config/deepspeed_zero2@_here_
-  - ../config/deepspeed_zero3@_here_
-  - ../config/deepspeed_zero3_cpuoffload@_here_
 
 hydra:
   run:
@@ -156,7 +152,7 @@ actor_infer:
       max_num_batched_tokens: 1024  # Match reduced sequence_length=1024
       max_num_seqs: 2
       enforce_eager: true
-      sleep_level: 2  # RLix requires sleep_level=2 for weight offload (ENG-123 Phase 3 guard in adapter init).
+      sleep_level: 2  # RLix requires sleep_level=2 for weight offload.
   device_mapping: "[0, 1, ]"
 
 reference:

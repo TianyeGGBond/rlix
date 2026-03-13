@@ -40,8 +40,8 @@ def validate_register_pipeline(inp: RegisterValidationInput) -> None:
         if not device_mapping and cluster_name != "reward":
             raise ValueError(f"device_mapping must be non-empty for cluster {cluster_name!r}")
         if cluster_name == "reward" and device_mapping:
-            # TODO(ENG-123): support GPU reward clusters (Phase 3 restricts reward to CPU-only).
-            raise ValueError("ENG-123 Phase 3 only supports CPU-only reward: reward.device_mapping must be empty")
+            # TODO: support GPU reward clusters (currently restricted to CPU-only).
+            raise ValueError("reward cluster only supports CPU-only mode: reward.device_mapping must be empty")
         if device_mapping and len(device_mapping) != len(set(device_mapping)):
             raise ValueError(f"device_mapping has duplicates for cluster {cluster_name!r}")
 

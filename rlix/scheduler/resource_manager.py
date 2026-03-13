@@ -7,11 +7,11 @@ from rlix.protocol.types import RESOURCE_MANAGER_ACTOR_NAME, RLIX_NAMESPACE
 from rlix.utils.ray_head import head_node_affinity_strategy
 import ray
 
-# ENG-123: Platform/resource assumption
+# Platform/resource assumption
 # Rlix and ROLL resource keys differ: this module uses Ray's "GPU" resource
 # key (as returned by `ray.cluster_resources()` / `ray.nodes()`), whereas ROLL's
 # scheduler stack references `current_platform.ray_device_key`. For parity across
-# deployment platforms we would need to align these abstractions. For ENG-123 we
+# deployment platforms we would need to align these abstractions. We
 # document that Rlix currently targets CUDA-only setups where the Ray GPU
 # resource key is present and meaningful. Prefer naming/standardizing the
 # platform-level device key if broader device types are required in future.
@@ -26,7 +26,7 @@ class ResourceManager:
 
         Returns the finalized required_gpus_per_node.
 
-        Contract (ENG-123): fail-fast if GPU-per-node is inconsistent across GPU nodes.
+        Contract: fail-fast if GPU-per-node is inconsistent across GPU nodes.
         """
         if self.required_gpus_per_node is not None:
             raise RuntimeError("ResourceManager topology already initialized")

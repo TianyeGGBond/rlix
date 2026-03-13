@@ -38,7 +38,7 @@ from roll.pipeline.agentic.utils import (
     dump_rollout_trajectories,
     get_agentic_response_level_mask,
 )
-from rlix.pipeline.full_finetune_pipeline import RlixFullFinetunePipeline
+from rlix.pipeline.full_finetune_pipeline import RollFullFinetunePipeline
 from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
@@ -55,7 +55,7 @@ from roll.utils.train_infer_corrections import apply_train_infer_correction_to_b
 logger = get_logger()
 
 
-class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
+class RollMultiLoraPipeline(RollFullFinetunePipeline):
     """Rlix-controlled multi-LoRA agentic pipeline.
 
     Cycle: Expand → Rollout (all tags) → Shrink → Train (dirty loras) → Repeat.
@@ -85,7 +85,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         )
         if train_strategy_name != "megatron_train":
             raise RuntimeError(
-                f"RlixMultiLoraPipeline requires actor_train strategy_name='megatron_train', "
+                f"RollMultiLoraPipeline requires actor_train strategy_name='megatron_train', "
                 f"got {train_strategy_name!r}"
             )
         # Isolated multi-adapter config validation (is_lora_optimizer_isolated, use_distributed_optimizer,
@@ -94,7 +94,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         adapters = getattr(pipeline_config.actor_train.model_args, "adapters", None) or {}
         if not adapters:
             raise RuntimeError(
-                "RlixMultiLoraPipeline requires actor_train.model_args.adapters to be non-empty"
+                "RollMultiLoraPipeline requires actor_train.model_args.adapters to be non-empty"
             )
 
         # Create per-LoRA trackers for independent per-adapter metric logging.
@@ -103,7 +103,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         # TODO: support GAE with per-LoRA critics: frozen backbone + per-LoRA adapters + per-LoRA value heads.
         if self.pipeline_config.adv_estimator == "gae":
             raise NotImplementedError(
-                "RlixMultiLoraPipeline does not support adv_estimator='gae'. "
+                "RollMultiLoraPipeline does not support adv_estimator='gae'. "
                 "A single shared critic cannot produce accurate advantages across different LoRA tasks. "
                 "Requires per-LoRA critic adapters and per-LoRA value heads on a shared backbone "
                 "(not yet implemented). Use 'grpo' or 'reinforce_plus_plus' instead."
@@ -113,7 +113,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         max_resident = getattr(pipeline_config, "max_resident_adapters", None)
         if max_resident is not None and len(adapters) > int(max_resident):
             raise RuntimeError(
-                f"RlixMultiLoraPipeline: number of loras ({len(adapters)}) exceeds "
+                f"RollMultiLoraPipeline: number of loras ({len(adapters)}) exceeds "
                 f"max_resident_adapters ({max_resident}). Reduce the lora count or raise the cap."
             )
 
@@ -121,12 +121,12 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
         base_env = pipeline_config.train_env_manager
         tags = list(base_env.tags) if getattr(base_env, "tags", None) else []
         if not tags:
-            raise RuntimeError("train_env_manager.tags must be non-empty for RlixMultiLoraPipeline")
+            raise RuntimeError("train_env_manager.tags must be non-empty for RollMultiLoraPipeline")
         self._tag_to_lora: Dict[str, str] = {tag: normalize_domain(tag) for tag in tags}
         unknown = sorted({a for a in self._tag_to_lora.values() if a not in adapters})
         if unknown:
             raise RuntimeError(
-                f"RlixMultiLoraPipeline: env tags map to unknown loras: {unknown}. "
+                f"RollMultiLoraPipeline: env tags map to unknown loras: {unknown}. "
                 f"Configured loras: {sorted(adapters.keys())}"
             )
 
@@ -267,7 +267,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
 
         self._rollout_schedulers_initialized = True
         logger.info(
-            f"[init][{self._pipeline_id}] RlixMultiLoraPipeline ready: "
+            f"[init][{self._pipeline_id}] RollMultiLoraPipeline ready: "
             f"loras={sorted(adapters.keys())} tags={tags}"
         )
         return ActionResponse(success=True)
@@ -340,7 +340,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
           → Phase 15 (GAE only) → Phase 16 (train_step_lora + promote + sync) → Phase 17
         """
         self._ensure_initialized()
-        logger.info(f"Starting RlixMultiLoraPipeline run: {self._pipeline_id}")
+        logger.info(f"Starting RollMultiLoraPipeline run: {self._pipeline_id}")
 
         rollout_get_batch_timeout_s = parse_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
 

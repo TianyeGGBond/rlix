@@ -89,8 +89,8 @@ def _validate_cpu_only_reward(*, pipeline_config: Any) -> None:
         return
     if isinstance(device_mapping, str) and device_mapping.strip() in {"", "[]"}:
         return
-    # TODO(ENG-123): lift this restriction to support GPU reward clusters.
-    raise RuntimeError("ENG-123 Phase 3 only supports CPU-only reward (reward.device_mapping must be empty/None).")
+    # TODO: lift this restriction to support GPU reward clusters.
+    raise RuntimeError("reward cluster only supports CPU-only mode (reward.device_mapping must be empty/None).")
 
 
 def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
@@ -106,7 +106,7 @@ def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
     strategy_config = getattr(strategy_args, "strategy_config", None) or {}
     sleep_level = strategy_config.get("sleep_level", 1)
     if int(sleep_level) != 2:
-        raise RuntimeError("ENG-123 Phase 3 requires actor_infer vLLM sleep_level=2 (drop model weights on offload).")
+        raise RuntimeError("actor_infer vLLM sleep_level=2 required (drop model weights on offload).")
 
 
 def _validate_offload_nccl(*, pipeline_config: Any) -> None:
@@ -135,20 +135,20 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
             bad_clusters.append(name)
     if bad_clusters:
         raise RuntimeError(
-            f"ENG-123 sleep_level=2 requires offload_nccl=True on all clusters to reclaim NCCL "
+            f"sleep_level=2 requires offload_nccl=True on all clusters to reclaim NCCL "
             f"buffer VRAM between cycles. Missing on: {bad_clusters}. "
             f"Add 'offload_nccl: ${{offload_nccl}}' under each cluster in your pipeline YAML."
         )
 
 
-# Default Ray actor concurrency for RlixCoordinator. 4 slots let progress reports
+# Default Ray actor concurrency for PipelineCoordinator. 4 slots let progress reports
 # (fire-and-forget, fast) run concurrently with resize_infer RPCs without blocking each other.
 # _progress_lock guards the shared progress state under concurrent calls.
 COORDINATOR_MAX_CONCURRENCY: int = 4
 
 
-class RlixCoordinator(Coordinator):
-    """Per-pipeline coordinator actor (ENG-123 Phase 3).
+class PipelineCoordinator(Coordinator):
+    """Per-pipeline coordinator actor.
 
     Contract:
     - Aggregates per-scheduler progress reports from GroupQueueManager (train + val + all LoRAs)
@@ -205,7 +205,7 @@ class RlixCoordinator(Coordinator):
         # Resolve rlix scheduler handle for forwarding aggregated progress.
         self._rlix_scheduler = get_actor_or_raise(
             SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE,
-            error_context="RlixCoordinator requires the central scheduler actor to exist at startup.",
+            error_context="PipelineCoordinator requires the central scheduler actor to exist at startup.",
         )
 
         # Driver is responsible for:
@@ -221,11 +221,11 @@ class RlixCoordinator(Coordinator):
         adapters = getattr(getattr(pipeline_config, "actor_train", None), "model_args", None)
         adapters = getattr(adapters, "adapters", None) if adapters is not None else None
         if adapters:
-            from rlix.pipeline.multi_lora_pipeline import RlixMultiLoraPipeline
-            PipelineClass = RlixMultiLoraPipeline
+            from rlix.pipeline.multi_lora_pipeline import RollMultiLoraPipeline
+            PipelineClass = RollMultiLoraPipeline
         else:
-            from rlix.pipeline.full_finetune_pipeline import RlixFullFinetunePipeline
-            PipelineClass = RlixFullFinetunePipeline
+            from rlix.pipeline.full_finetune_pipeline import RollFullFinetunePipeline
+            PipelineClass = RollFullFinetunePipeline
 
         PipelineActor = ray.remote(PipelineClass)
         # Safety: always inject env vars before constructing the pipeline actor, so callers can't
@@ -375,7 +375,7 @@ class RlixCoordinator(Coordinator):
             ))
 
     def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> ActionResponse:
-        """Pipeline-scoped resize for actor_infer (ENG-123).
+        """Pipeline-scoped resize for actor_infer.
 
         Serialized with sync_lora_weights via _resize_sync_lock.
 

@@ -341,7 +341,7 @@ class Orchestrator:
             return
         self._shutdown_started = True
         if not force:
-            raise RuntimeError("shutdown(force=False) is not supported in ENG-123 Phase 1")
+            raise RuntimeError("shutdown(force=False) is not supported")
 
         # GPU Tracing: Explicit scheduler shutdown for trace finalization (with short timeout)
         # Use ray.wait() with timeout to avoid blocking indefinitely in fail-fast scenarios
