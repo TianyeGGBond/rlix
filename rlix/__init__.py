@@ -10,7 +10,7 @@ __all__ = [
     "RollMultiLoraPipeline",
 ]
 
-__version__ = "0.0.0"
+__version__ = "0.1.0"
 
 from rlix.init import init  # noqa: E402
 
