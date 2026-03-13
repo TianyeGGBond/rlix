@@ -38,30 +38,7 @@ venv.bak/
 *.swo
 .DS_Store
 
-# Factory
-.groupedtimelineinclude
-.lh/
-
-# Third-party submodules (ignore content but keep git tracking if they are submodules)
-# Note: submodules are tracked by git, but if they are just folders, ignore them.
-# Since they are submodules, we generally don't ignore them in the root .gitignore 
-# unless we want to hide untracked content inside them.
-# However, we can ignore common large artifact directories that might appear in root.
-
-# Data & Models
-data/
-models/
-checkpoints/
-logs/
-wandb/
-
-# Ignore non-submodule external directories
-external/linux_reference/
-
-# Code review output (worktrees + findings)
-code_review/output/
-
-hack/
+# AI tools
 .claude*/
 .gemini/
 .junie/
@@ -69,4 +46,32 @@ hack/
 .factory/
 .codex/
 .cursor/
-.*/
+.qoder/
+.qodo/
+.zencoder/
+.zenflow/
+.iflow/
+.continue/
+.ai/
+.groupedtimelineinclude
+.lh/
+
+# Data & Models
+data/
+models/
+checkpoints/
+logs/
+wandb/
+output/
+
+# External submodules
+external/
+
+## Internal / personal files (not for release)
+#CLAUDE.md
+#AGENTS.md
+scripts/
+ignored/
+thoughts/
+plans/
+design_doc/
