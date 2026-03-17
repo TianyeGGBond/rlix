@@ -44,7 +44,7 @@ from rlix.scheduler.types import (
     validate_cluster_id,
 )
 from rlix.scheduler.validation import ValidationInputs, validate_execution_plan
-from rlix.utils.ray_actors import get_actor_or_raise
+from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
 

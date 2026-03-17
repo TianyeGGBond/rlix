@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 
 from rlix.protocol.types import RESOURCE_MANAGER_ACTOR_NAME, RLIX_NAMESPACE
-from rlix.utils.ray_head import head_node_affinity_strategy
+from rlix.utils.ray import head_node_affinity_strategy
 import ray
 
 # Platform/resource assumption

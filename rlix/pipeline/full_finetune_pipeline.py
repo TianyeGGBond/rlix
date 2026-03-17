@@ -13,7 +13,7 @@ from codetiming import Timer
 from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, ActionResponse, get_pipeline_namespace, Priority, SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
 
 from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
-from rlix.utils.ray_actors import get_actor_or_raise
+from rlix.utils.ray import get_actor_or_raise
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import AgenticPipeline

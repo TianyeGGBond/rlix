@@ -7,7 +7,7 @@ from typing import Optional
 
 from rlix.orchestrator.orchestrator import AdmitResponse, Orchestrator
 from rlix.protocol.types import ORCHESTRATOR_ACTOR_NAME, RLIX_NAMESPACE
-from rlix.utils.ray_head import head_node_affinity_strategy
+from rlix.utils.ray import head_node_affinity_strategy
 import ray
 
 

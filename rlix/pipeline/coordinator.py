@@ -21,7 +21,7 @@ from rlix.protocol.types import (
     SCHEDULER_ACTOR_NAME,
     RLIX_NAMESPACE,
 )
-from rlix.utils.ray_actors import get_actor_or_raise
+from rlix.utils.ray import get_actor_or_raise
 
 # Max concurrent RPCs on the pipeline actor (resize + run can overlap).
 # Keep small: Ray uses a thread pool for sync actors; huge values hit thread limits.

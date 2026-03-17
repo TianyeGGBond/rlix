@@ -16,8 +16,8 @@ from rlix.protocol.types import ORCHESTRATOR_ACTOR_NAME, RLIX_NAMESPACE, SCHEDUL
 from rlix.protocol.validation import RegisterValidationInput, validate_register_pipeline
 from rlix.scheduler.resource_manager import get_or_create_resource_manager
 from rlix.scheduler.scheduler import scheduler_actor_class
-from rlix.utils.ray_head import get_head_node_id
-from rlix.utils.ray_head import head_node_affinity_strategy
+from rlix.utils.ray import get_head_node_id
+from rlix.utils.ray import head_node_affinity_strategy
 import ray
 
 # Timeouts for orchestrator operations (seconds).
