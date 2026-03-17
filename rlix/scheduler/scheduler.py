@@ -84,6 +84,10 @@ _MAX_GAP_ITERATIONS: int = 10_000
 _MAX_GAP_ACTIVATIONS: int = 1_000
 _TOPOLOGY_READY_TIMEOUT_S: float = float(os.environ.get("RLIX_TOPOLOGY_READY_TIMEOUT_S", "120"))
 
+# Progress reporting: sentinel stream key for full-finetune pipelines (no adapter_id).
+# LoRA pipelines use adapter_id as stream key; full-finetune uses this reserved sentinel.
+_FULL_FINETUNE_STREAM_KEY: str = "__full_finetune__"
+
 
 def _validate_and_canonicalize_device_mapping(
     *,
@@ -1258,7 +1262,7 @@ class SchedulerImpl:
             metrics = report.metrics if isinstance(report.metrics, dict) else {}
             mode = str(metrics.get("mode", "train"))
             lora_id = metrics.get("adapter_id")
-            stream_key_full_ft = "__full_finetune__"
+            stream_key_full_ft = _FULL_FINETUNE_STREAM_KEY
             pipeline_bucket = self._state.latest_progress_by_pipeline.setdefault(report.pipeline_id, {})
             has_full_ft = any(stream_key_full_ft in mode_bucket for mode_bucket in pipeline_bucket.values())
             has_lora = any(
