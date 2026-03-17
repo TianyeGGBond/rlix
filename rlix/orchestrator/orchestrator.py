@@ -12,7 +12,7 @@ from typing import Any, Dict, Literal, Optional
 PipelineType = Literal["ft", "lora"]
 
 from rlix.protocol.validation import validate_pipeline_id
-from rlix.protocol.types import ORCHESTRATOR_ACTOR_NAME, RLIX_NAMESPACE, SCHEDULER_ACTOR_NAME
+from rlix.protocol.types import RLIX_NAMESPACE, SCHEDULER_ACTOR_NAME
 from rlix.protocol.validation import RegisterValidationInput, validate_register_pipeline
 from rlix.scheduler.resource_manager import get_or_create_resource_manager
 from rlix.scheduler.scheduler import scheduler_actor_class
