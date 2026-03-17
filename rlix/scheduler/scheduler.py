@@ -2263,14 +2263,13 @@ class SchedulerImpl:
             """Max workers each pipeline can donate without dropping below its target allocation."""
             shrink_budget: Dict[str, int] = {}
             for state in pipeline_states:
-                if state.cluster_id in plan.clusters_to_remove:
-                    min_bundles = 0
-                elif _receiver_eligible(state):
-                    if state.target_gpu_count <= 0:
-                        min_bundles = 0
-                    else:
-                        min_bundles = max(1, state.target_gpu_count // state.tp_size)
+                # Only protect bundles for pipelines that are eligible receivers with non-zero demand.
+                # _receiver_eligible already excludes clusters_to_remove.
+                if _receiver_eligible(state) and state.target_gpu_count > 0:
+                    min_bundles = max(1, state.target_gpu_count // state.tp_size)
                 else:
+                    # Pipeline is being removed, has zero demand, or is not actively participating —
+                    # all its workers are available for donation.
                     min_bundles = 0
                 shrink_budget[state.pipeline_id] = max(0, len(state.active_dp_workers) - min_bundles)
             return shrink_budget
