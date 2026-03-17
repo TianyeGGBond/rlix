@@ -11,7 +11,6 @@ import atexit
 import logging
 import math
 import os
-import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -19,7 +18,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 
 import ray
 
-from rlix.protocol.validation import validate_pipeline_id
 from rlix.protocol.types import (
     COORDINATOR_ACTOR_NAME_PREFIX,
     GENERATION_CLUSTER_NAME,
@@ -30,6 +28,7 @@ from rlix.protocol.types import (
     ProgressReport,
     get_pipeline_namespace,
 )
+from rlix.protocol.validation import validate_pipeline_id
 from rlix.scheduler.state import SchedulerState
 from rlix.scheduler.types import (
     ClusterAllocation,
@@ -83,6 +82,7 @@ _QUEUE_TRACK_CAP: int = 1000
 _MAX_GAP_ITERATIONS: int = 10_000
 _MAX_GAP_ACTIVATIONS: int = 1_000
 _TOPOLOGY_READY_TIMEOUT_S: float = float(os.environ.get("RLIX_TOPOLOGY_READY_TIMEOUT_S", "120"))
+_FAIL_FAST_SHUTDOWN_TIMEOUT_S: float = float(os.environ.get("RLIX_FAIL_FAST_SHUTDOWN_TIMEOUT_S", "5"))
 
 # Progress reporting: sentinel stream key for full-finetune pipelines (no adapter_id).
 # LoRA pipelines use adapter_id as stream key; full-finetune uses this reserved sentinel.
@@ -2089,13 +2089,15 @@ class SchedulerImpl:
         try:
             orchestrator = ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=RLIX_NAMESPACE)
         except Exception as e:
-            sys.stderr.write(f"[rlix][ERROR] Failed to resolve orchestrator actor for shutdown: {type(e).__name__}: {e}\n")
+            logger.error("Failed to resolve orchestrator actor for shutdown: %s: %s", type(e).__name__, e)
             return
         try:
-            orchestrator.shutdown.remote(force=True, reason=reason, source="scheduler")
+            ref = orchestrator.shutdown.remote(force=True, reason=reason, source="scheduler")
+            await asyncio.wait_for(ref, timeout=_FAIL_FAST_SHUTDOWN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.error("orchestrator.shutdown timed out after %ss", _FAIL_FAST_SHUTDOWN_TIMEOUT_S)
         except Exception as e:
-            sys.stderr.write(f"[rlix][ERROR] Failed to call orchestrator.shutdown: {type(e).__name__}: {e}\n")
-            return
+            logger.error("Failed to call orchestrator.shutdown: %s: %s", type(e).__name__, e)
 
     def _snapshot_generation_dp_workers(
         self, *, plan: ExecutionPlan, idle_gpus: Set[int]
