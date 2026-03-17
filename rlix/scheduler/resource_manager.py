@@ -19,6 +19,18 @@ import ray
 
 @dataclass(slots=True)
 class ResourceManager:
+    """GPU topology and cluster resource state for the rlix control plane.
+
+    Tracks the per-node GPU count (frozen after init_topology) and provides
+    polling snapshots of live Ray cluster resources. Deployed as the singleton
+    Ray actor ``rlix:resource_manager`` via get_or_create_resource_manager.
+
+    Note: this is the *rlix-native* resource manager. ROLL pipelines use a
+    separate ``rlix:roll_resource_manager`` actor (RollResourceManagerProxy)
+    that manages per-pipeline placement groups. The two actors coexist in the
+    ``rlix`` namespace with distinct names.
+    """
+
     required_gpus_per_node: int | None = None
 
     def init_topology(self, *, required_gpus_per_node: int | None = None) -> int:
@@ -60,6 +72,7 @@ class ResourceManager:
         return int(required)
 
     def get_required_gpus_per_node(self) -> int:
+        """Return the frozen per-node GPU count. Raises if init_topology has not been called."""
         if self.required_gpus_per_node is None:
             raise RuntimeError("ResourceManager topology not initialized; call init_topology() first")
         return int(self.required_gpus_per_node)
@@ -76,6 +89,17 @@ class ResourceManager:
         poll_interval_s: float = 0.2,
         expected_num_gpus: int | None = None,
     ) -> dict:
+        """Poll Ray until GPU resources are available and return a cluster snapshot.
+
+        Args:
+            wait_timeout_s: Max seconds to poll before raising RuntimeError.
+            poll_interval_s: Sleep interval between polls.
+            expected_num_gpus: If set, wait until at least this many GPUs are visible.
+                If None, any positive GPU count satisfies the wait.
+
+        Returns:
+            Dict with keys ``num_gpus``, ``alive_nodes``, and ``cluster_resources``.
+        """
         if wait_timeout_s <= 0:
             raise ValueError(f"wait_timeout_s must be > 0, got {wait_timeout_s!r}")
         if poll_interval_s <= 0:
@@ -122,6 +146,7 @@ class ResourceManager:
 
 
 def get_or_create_resource_manager(*, name: str = RESOURCE_MANAGER_ACTOR_NAME, namespace: str = RLIX_NAMESPACE):
+    """Return the singleton ``rlix:resource_manager`` actor, creating it on the head node if needed."""
     strategy = head_node_affinity_strategy(soft=False)
 
     @ray.remote(num_cpus=0, max_restarts=0, max_task_retries=0)
