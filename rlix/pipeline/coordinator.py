@@ -32,7 +32,7 @@ _PIPELINE_ACTOR_MAX_CONCURRENCY: int = 32
 # Limits how long the scheduler is stalled when sync_lora_weights holds the lock
 # during an NCCL weight sync. Default 180s covers the ModelUpdateService default
 # timeout (150s) plus headroom; override via env var for tighter SLOs.
-_RESIZE_LOCK_TIMEOUT_S: float = parse_env_timeout_s("RLIX_RESIZE_LOCK_TIMEOUT_S", default_s=180.0)
+_RESIZE_LOCK_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_RESIZE_LOCK_TIMEOUT_S", default_s=180.0)
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
@@ -271,6 +271,15 @@ class PipelineCoordinator(Coordinator):
         rlix scheduler at 2% cadence of the aggregate.
         """
         metrics = report.metrics if isinstance(report.metrics, dict) else {}
+        if "collected" not in metrics:
+            raise ValueError(
+                f"ProgressReport from pipeline {report.pipeline_id!r} missing required 'collected' metric"
+            )
+        if "remaining" in metrics:
+            raise ValueError(
+                f"ProgressReport from pipeline {report.pipeline_id!r} contains wire-level 'remaining'; "
+                "send 'collected' instead (hard cutover)"
+            )
         mode = str(metrics.get("mode", "train"))
         adapter_id = metrics.get("adapter_id")
         scheduler_key = f"{mode}:{adapter_id if adapter_id is not None else '__fft__'}"
@@ -317,6 +326,10 @@ class PipelineCoordinator(Coordinator):
     def _aggregate_and_emit(self, *, force: bool) -> None:
         """Recompute aggregate progress from _scheduler_reports and emit to scheduler.
 
+        Sums clamped completion across all active streams. Each stream's completed
+        count is derived locally as min(collected, step_target). Retired streams are
+        removed by clear_progress_stream() so only live demand is counted.
+
         Must be called with _progress_lock held.
 
         Args:
@@ -325,39 +338,28 @@ class PipelineCoordinator(Coordinator):
         if not self._scheduler_reports:
             return
 
-        # Aggregate using the most-behind adapter stream per mode.
+        # Sum completion across all active streams, deriving clamped completed
+        # from raw collected per stream.
         #
-        # Multi-LoRA pipelines train adapters sequentially; completed adapters leave
-        # stale entries with remaining=0. Summing all streams inflates step_target
-        # (denominator) while remaining stays flat, making the pipeline look more
-        # "done" than it is. Instead, pick the stream with the highest percent_remaining
-        # per mode, so the active adapter drives the pipeline's demand signal.
+        # Multi-LoRA pipelines run multiple rollout schedulers concurrently;
+        # each active adapter contributes demand simultaneously. Retired adapters
+        # are removed by clear_progress_stream(), so only live streams are counted.
+        # Per-stream clamping: completed = min(collected, step_target).
         total_required = 0.0
-        total_remaining = 0.0
-        modes: dict[str, list[ProgressReport]] = {}
-        for key, rpt in self._scheduler_reports.items():
-            mode_part = key.split(":", 1)[0]
-            modes.setdefault(mode_part, []).append(rpt)
-        for mode_reports in modes.values():
-            best_remaining = 0.0
-            best_step_target = 0.0
-            best_percent = 0.0
-            for rpt in mode_reports:
-                rpt_metrics = rpt.metrics if isinstance(rpt.metrics, dict) else {}
-                remaining = max(0.0, float(rpt_metrics.get("remaining", 0)))
-                step_target = float(max(int(rpt.step_target_trajectories), 1))
-                percent = remaining / step_target if step_target > 0 else 0.0
-                if percent > best_percent:
-                    best_percent = percent
-                    best_remaining = remaining
-                    best_step_target = step_target
-            total_remaining += best_remaining
-            total_required += best_step_target
+        total_completed = 0.0
+        total_collected = 0.0
+        for rpt in self._scheduler_reports.values():
+            rpt_metrics = rpt.metrics if isinstance(rpt.metrics, dict) else {}
+            step_target = float(max(int(rpt.step_target_trajectories), 1))
+            collected_raw = max(0.0, float(rpt_metrics.get("collected", 0)))
+            completed_clamped = min(collected_raw, step_target)
+            total_required += step_target
+            total_completed += completed_clamped
+            total_collected += collected_raw
         if total_required <= 0:
             return
 
-        total_collected = max(total_required - total_remaining, 0.0)
-        percent_completed = total_collected / float(total_required)
+        percent_completed = min(total_completed / float(total_required), 1.0) if total_required > 0 else 0.0
         bucket = math.floor(percent_completed * 50)
 
         if not force and bucket == self._coord_progress_last_bucket:
@@ -370,7 +372,8 @@ class PipelineCoordinator(Coordinator):
             fifo_timestamp=time.time(),
             metrics={
                 "mode": "aggregated",
-                "remaining": int(total_remaining),
+                "collected": int(total_collected),
+                "completed": int(total_completed),
                 "bucket": int(bucket),
                 "new_batch": force,
             },

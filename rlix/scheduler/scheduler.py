@@ -1260,6 +1260,15 @@ class SchedulerImpl:
             # Keep latest nested by pipeline->mode->stream in one store.
             # stream_key is lora_id for LoRA streams, or reserved for full-finetune.
             metrics = report.metrics if isinstance(report.metrics, dict) else {}
+            if "completed" not in metrics:
+                raise ValueError(
+                    f"ProgressReport from pipeline {report.pipeline_id!r} missing required 'completed' metric"
+                )
+            if "remaining" in metrics:
+                raise ValueError(
+                    f"ProgressReport from pipeline {report.pipeline_id!r} contains wire-level 'remaining' "
+                    "at scheduler ingress; only 'completed' is accepted"
+                )
             mode = str(metrics.get("mode", "train"))
             lora_id = metrics.get("adapter_id")
             stream_key_full_ft = _FULL_FINETUNE_STREAM_KEY
@@ -1546,14 +1555,34 @@ class SchedulerImpl:
             reports.extend(mode_bucket.values())
         return reports
 
+    @staticmethod
+    def _derive_remaining_from_report(progress: ProgressReport) -> float:
+        """Derive remaining demand from a progress report's completed metric.
+
+        Returns max(step_target - completed_clamped, 0). Clamping ensures
+        overshoot never produces negative remaining.
+
+        Guarantees:
+            completed_clamped in [0, step_target]
+            remaining_derived in [0, step_target]
+            percent_remaining in [0, 1]
+        """
+        metrics = progress.metrics if isinstance(progress.metrics, dict) else {}
+        completed = max(0.0, float(metrics.get("completed", 0)))
+        step_target = float(max(int(progress.step_target_trajectories), 1))
+        completed_clamped = min(completed, step_target)
+        return max(step_target - completed_clamped, 0.0)
+
     def _pipeline_progress_totals_locked(self, *, pipeline_id: str) -> Tuple[float, float]:
-        """Compute (total_remaining, total_required) for ``pipeline_id`` in one pass."""
+        """Compute (total_remaining, total_required) for ``pipeline_id``.
+
+        Derives remaining from each report's completed metric rather than
+        reading wire-level remaining.
+        """
         total_required = 0.0
         total_remaining = 0.0
         for progress in self._iter_pipeline_reports_locked(pipeline_id=pipeline_id):
-            metrics = progress.metrics if isinstance(progress.metrics, dict) else {}
-            remaining = float(metrics.get("remaining", 0))
-            total_remaining += max(0.0, remaining)
+            total_remaining += self._derive_remaining_from_report(progress)
             total_required += float(max(int(progress.step_target_trajectories), 1))
         return max(0.0, total_remaining), total_required
 
@@ -2194,8 +2223,8 @@ class SchedulerImpl:
             if tp_size <= 0:
                 raise ValueError(f"pipeline_id={pipeline_id!r} has invalid actor_infer tp_size={tp_size}")
 
-            # Reuse the same per-stream clamping path as background rebalance to keep
-            # remaining-demand semantics consistent across planning paths.
+            # Derive remaining from completed metric; same derivation path as
+            # background rebalance to keep demand semantics consistent.
             remaining, step_target = self._pipeline_progress_totals_locked(pipeline_id=pipeline_id)
             if step_target <= 0.0:
                 continue
