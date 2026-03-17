@@ -1138,21 +1138,6 @@ class SchedulerImpl:
             if device_mapping:
                 used_gpus_by_cluster[cluster_name] = set(int(x) for x in device_mapping)
 
-        # Phase 3: fail-fast on overlapping GPU assignments across clusters within a pipeline.
-        # Policy: allow `actor_infer` to overlap with other clusters (optional colocation), but disallow overlaps
-        # among non-actor_infer clusters.
-        used_non_infer: Set[int] = set()
-        for cluster_name, used in sorted(used_gpus_by_cluster.items()):
-            if cluster_name == "actor_infer":
-                continue
-            overlap = used_non_infer & used
-            if overlap:
-                raise ValueError(
-                    f"device_mapping overlaps across non-actor_infer clusters within pipeline {pipeline_id!r}: "
-                    f"{cluster_name!r} overlaps GPUs {sorted(overlap)}"
-                )
-            used_non_infer |= used
-
         async with self._lock:
             self._state.pipeline_registry[pipeline_id] = {
                 "namespace": ray_namespace,
