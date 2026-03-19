@@ -148,8 +148,10 @@ def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
     if strategy_name != "vllm":
         return
     strategy_config = getattr(strategy_args, "strategy_config", None) or {}
-    sleep_level = strategy_config.get("sleep_level", 1)
-    if int(sleep_level) != 2:
+    sleep_level = strategy_config.get("sleep_level", None)
+    if sleep_level is None:
+        strategy_config["sleep_level"] = 2
+    elif int(sleep_level) != 2:
         raise RuntimeError("actor_infer vLLM sleep_level=2 required (drop model weights on offload).")
 
 
@@ -173,13 +175,15 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
         device_mapping = getattr(worker_config, "device_mapping", None)
         if not device_mapping:
             continue
-        if not getattr(worker_config, "offload_nccl", False):
+        offload_nccl = getattr(worker_config, "offload_nccl", None)
+        if offload_nccl is None:
+            worker_config.offload_nccl = True
+        elif not offload_nccl:
             bad_clusters.append(name)
     if bad_clusters:
         raise RuntimeError(
-            f"sleep_level=2 requires offload_nccl=True on all clusters to reclaim NCCL "
-            f"buffer VRAM between cycles. Missing on: {bad_clusters}. "
-            f"Add 'offload_nccl: ${{offload_nccl}}' under each cluster in your pipeline YAML."
+            f"offload_nccl=True is required on all GPU-active clusters to reclaim NCCL "
+            f"buffer VRAM between cycles. Explicitly set to False on: {bad_clusters}."
         )
 
 
