@@ -24,6 +24,10 @@ from rlix.protocol.types import (
 )
 from rlix.utils.ray import get_actor_or_raise
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Max concurrent RPCs on the pipeline actor (resize + run can overlap).
 # Keep small: Ray uses a thread pool for sync actors; huge values hit thread limits.
 _PIPELINE_ACTOR_MAX_CONCURRENCY: int = 32
@@ -36,6 +40,11 @@ _RESIZE_LOCK_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_RESIZE_LOCK_
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
+    """Build environment variables injected into every worker actor for a pipeline.
+
+    Sets HF/vLLM cache paths (shared root for weights, per-job scratch for collisions),
+    thread-count limits to stay under container pids.max, and pipeline identity vars.
+    """
     job_id = ray.get_runtime_context().get_job_id()
     scratch_root = f"/tmp/rlix/{pipeline_id}/{job_id}"
     shared_root = "/tmp/rlix/shared"
@@ -45,30 +54,48 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     # installed via pip are automatically available without PYTHONPATH.
 
     env_vars = {
+        # Pipeline identity — associates workers/actors with this pipeline.
         "PIPELINE_ID": pipeline_id,
+        # Ray namespace for this pipeline's actors; isolates named actors across concurrent pipelines.
         "ROLL_RAY_NAMESPACE": ray_namespace,
+        # Mode switch: tells ROLL to run under the RLix control plane instead of standalone.
         "RLIX_CONTROL_PLANE": "rlix",
-        # Shared weights/cache (big, reusable).
+        # --- Shared weights/cache (big, reusable across pipelines) ---
+        # Root for all Hugging Face local state (cache, tokens, configs).
         "HF_HOME": f"{shared_root}/hf",
+        # Preferred Hugging Face Hub cache path for downloaded repos/snapshots.
+        "HF_HUB_CACHE": f"{shared_root}/hf/hub",
+        # Legacy compatibility alias; prefer HF_HUB_CACHE in new code.
         "HUGGINGFACE_HUB_CACHE": f"{shared_root}/hf/hub",
+        # Legacy Transformers cache variable retained for compatibility.
+        # Modern Hugging Face cache configuration should prefer HF_HOME / HF_HUB_CACHE.
         "TRANSFORMERS_CACHE": f"{shared_root}/hf/transformers",
+        # Cache for the datasets library (downloaded + processed dataset artifacts).
         "HF_DATASETS_CACHE": f"{shared_root}/hf/datasets",
-        # Job/pipeline-scoped scratch (write-hot / collision-prone).
+        # --- Job/pipeline-scoped scratch (write-hot / collision-prone) ---
+        # Cache for auto-mapped remote-code modules (read by mcore_adapter).
+        # Per-pipeline to avoid write collisions when concurrent pipelines load different model code.
         "HUGGINGFACE_AUTOMAP_CACHE": f"{scratch_root}/hf/automap",
+        # Root directory for vLLM cache files.
+        # Isolated per pipeline to reduce contention between concurrent runs.
         "VLLM_CACHE_ROOT": f"{scratch_root}/vllm",
+        # FlashInfer runtime workspace directory. Isolated per pipeline for the same
+        # write-contention reasons as VLLM_CACHE_ROOT.
         "FLASHINFER_WORKSPACE_DIR": f"{scratch_root}/flashinfer",
-        # Limit thread counts to avoid hitting container pids.max.
-        # Read from env so shell export overrides; defaults are safe minimums.
+        # --- Thread limits (prevent hitting container pids.max) ---
+        # Read from env so shell export overrides; defaults are safe minimums for
+        # multi-pipeline deployments with many co-tenant worker processes per node.
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
         "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
         "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
-        "RAY_grpc_server_thread_pool_size": os.environ.get("RAY_grpc_server_thread_pool_size", "4"),
+        # Ray server-call thread setting (num_server_call_thread in Ray config).
+        # Lower values help bound per-process thread count in high-actor deployments.
+        "RAY_num_server_call_thread": os.environ.get("RAY_num_server_call_thread", "4"),
     }
-    import logging as _logging
-    _logging.getLogger(__name__).info(
-        "[_build_pipeline_env_vars] pid=%d pipeline_id=%s OMP_NUM_THREADS=%s RAY_grpc_server_thread_pool_size=%s",
+    logger.info(
+        "[_build_pipeline_env_vars] pid=%d pipeline_id=%s OMP_NUM_THREADS=%s RAY_num_server_call_thread=%s",
         os.getpid(), pipeline_id,
-        env_vars["OMP_NUM_THREADS"], env_vars["RAY_grpc_server_thread_pool_size"],
+        env_vars["OMP_NUM_THREADS"], env_vars["RAY_num_server_call_thread"],
     )
     return env_vars
 
@@ -86,6 +113,11 @@ def _validate_config_schema(*, pipeline_config: Any) -> None:
 
 
 def _validate_cpu_only_reward(*, pipeline_config: Any) -> None:
+    """Reject pipeline configs that assign GPUs to the reward cluster.
+
+    RLix currently supports CPU-only reward workers; GPU reward clusters
+    would require scheduler-managed allocation that is not yet implemented.
+    """
     reward_cfg = getattr(pipeline_config, "reward", None)
     if reward_cfg is None:
         return
@@ -101,6 +133,11 @@ def _validate_cpu_only_reward(*, pipeline_config: Any) -> None:
 
 
 def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
+    """Require vLLM sleep_level=2 for multi-pipeline GPU time-sharing.
+
+    sleep_level=2 drops model weights on offload, freeing VRAM for co-tenant
+    pipelines. Lower levels retain weights and prevent effective sharing.
+    """
     actor_infer = getattr(pipeline_config, "actor_infer", None)
     if actor_infer is None:
         return
@@ -117,24 +154,22 @@ def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
 
 
 def _validate_offload_nccl(*, pipeline_config: Any) -> None:
-    """Enforce offload_nccl=True on all clusters when sleep_level=2 is active.
+    """Enforce offload_nccl=True on all GPU-active clusters.
 
-    sleep_level=2 is the RLix multi-pipeline mode where GPU VRAM is shared across
-    co-tenant pipelines. NCCL communicator buffers (~400-500 MB per process) accumulate
-    on the GPU even when a cluster is sleeping. With 10+ co-tenant processes this can
-    consume 4-5 GB of baseline VRAM, preventing KV-cache wake-up.
+    NCCL communicator buffers accumulate on the GPU even when a cluster is sleeping.
+    With many co-tenant processes this can consume significant baseline VRAM,
+    preventing KV-cache wake-up.
 
     offload_nccl=True destroys process groups on offload and rebuilds them on load,
     which is the only way to reclaim that memory.
     """
-    # Clusters present in an agentic pipeline config.
     cluster_names = GPU_CLUSTER_NAMES
     bad_clusters = []
     for name in cluster_names:
         worker_config = getattr(pipeline_config, name, None)
         if worker_config is None:
             continue
-        # Skip clusters that are inactive (no GPUs assigned — e.g. default critic).
+        # Skip clusters that are inactive (no GPUs assigned — e.g. reward/env clusters).
         device_mapping = getattr(worker_config, "device_mapping", None)
         if not device_mapping:
             continue
@@ -169,6 +204,9 @@ class PipelineCoordinator(Coordinator):
         pipeline_id: str,
         pipeline_config: Any,
     ):
+        # Precondition: the driver must have already called
+        # orchestrator.allocate_pipeline_id(), register_pipeline(), and
+        # admit_pipeline() before creating this coordinator actor.
         validate_pipeline_id(pipeline_id)
         self._pipeline_id = pipeline_id
         self._ray_namespace = get_pipeline_namespace(pipeline_id)
@@ -182,16 +220,14 @@ class PipelineCoordinator(Coordinator):
         # Config flag for post-sync weight verification (disabled by default).
         self._verify_model_after_sync: bool = bool(pipeline_config.verify_model_after_sync)
 
-        # Create the cluster-wide singleton ResourceManager actor before any pipeline actor.
-        # The coordinator actor holds 0 GPU so the PG bundle ({GPU: N}) can always be satisfied.
-        # The actor is a namespace singleton (rlix:roll_resource_manager) shared across
-        # all concurrent pipeline actors.  We also capture node-0's placement group
-        # and base GPU rank here to pin pipeline actors to a GPU node for CUDA visibility.
+        # Singleton ResourceManager (rlix:roll_resource_manager) shared across all pipelines.
+        # Created before any pipeline actor so placement groups are ready.
         from roll.distributed.scheduler.resource_manager import RollResourceManagerProxy
-        self._rm_proxy = RollResourceManagerProxy(num_gpus_per_node=pipeline_config.num_gpus_per_node)
-        # Node 0's placement group is used to schedule the pipeline actor on a GPU node so
-        # that Ray sets CUDA_VISIBLE_DEVICES (needed for platform detection + RNG state).
-        self._rm_node0_pg = self._rm_proxy.node2pg.get(0)
+        self._resource_manager_proxy = RollResourceManagerProxy(num_gpus_per_node=pipeline_config.num_gpus_per_node)
+        # Pin pipeline actor to node-0's placement group so Ray sets
+        # CUDA_VISIBLE_DEVICES (needed for platform detection + checkpoint RNG state).
+        # The actor requests num_gpus=0.01 from the PG's bundle.
+        self._resource_manager_node0_pg = self._resource_manager_proxy.node2pg.get(0)
 
         self._pipeline_actor = None
         # Serializes resize_infer and sync_lora_weights: prevents a weight sync from
@@ -208,6 +244,8 @@ class PipelineCoordinator(Coordinator):
         # Key: "{mode}:{adapter_id or '__fft__'}". Invariant: mode+adapter_id is unique per GQM instance;
         # two GQMs sharing the same key is a misconfiguration (last-write-wins without error).
         self._scheduler_reports: Dict[str, ProgressReport] = {}
+        # Last progress bucket (0–50, 2% granularity) sent to the scheduler.
+        # Used to deduplicate: skip the RPC if the bucket hasn't changed.
         self._coord_progress_last_bucket: Optional[int] = None
         # Resolve rlix scheduler handle for forwarding aggregated progress.
         self._rlix_scheduler = get_actor_or_raise(
@@ -215,13 +253,14 @@ class PipelineCoordinator(Coordinator):
             error_context="PipelineCoordinator requires the central scheduler actor to exist at startup.",
         )
 
-        # Driver is responsible for:
-        # - orchestrator.allocate_pipeline_id()
-        # - orchestrator.register_pipeline(...)
-        # - orchestrator.admit_pipeline(...)
-        # before creating this coordinator actor.
 
     def create_pipeline_actor(self, *, pipeline_config: Any) -> Any:
+        """Create and return the per-pipeline Ray actor (full-finetune or multi-LoRA).
+
+        Selects the pipeline class based on whether adapters are configured,
+        injects env vars, and schedules the actor on node-0's placement group.
+        Returns the existing actor handle if already created (idempotent).
+        """
         if self._pipeline_actor is not None:
             return self._pipeline_actor
 
@@ -249,13 +288,13 @@ class PipelineCoordinator(Coordinator):
             max_task_retries=0,
             max_concurrency=_PIPELINE_ACTOR_MAX_CONCURRENCY,
             runtime_env={"env_vars": self._pipeline_env_vars},
-            # Schedule pipeline actor inside node-0's placement group bundle so that Ray
-            # sets CUDA_VISIBLE_DEVICES correctly (needed for checkpoint RNG state saving).
-            # num_gpus=0.01: drawn from the bundle's GPU pool (not the global pool), so
-            # the singleton RM can still hold all integer GPUs in its placement group.
+            # Schedule inside node-0's placement group so Ray sets CUDA_VISIBLE_DEVICES
+            # (needed for checkpoint RNG state saving). num_gpus=0.01 is drawn from the
+            # placement group's bundle, not the global pool — otherwise the ResourceManager
+            # couldn't reserve all integer GPU slots in its placement group.
             num_gpus=0.01,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=self._rm_node0_pg,
+                placement_group=self._resource_manager_node0_pg,
             ),
         ).remote(pipeline_id=self._pipeline_id, pipeline_config=pipeline_config)
         # Do not block pipeline actor creation on initialize_pipeline.
@@ -338,12 +377,7 @@ class PipelineCoordinator(Coordinator):
         if not self._scheduler_reports:
             return
 
-        # Sum completion across all active streams, deriving clamped completed
-        # from raw collected per stream.
-        #
-        # Multi-LoRA pipelines run multiple rollout schedulers concurrently;
-        # each active adapter contributes demand simultaneously. Retired adapters
-        # are removed by clear_progress_stream(), so only live streams are counted.
+        # Sum clamped completion across all active streams.
         # Per-stream clamping: completed = min(collected, step_target).
         total_required = 0.0
         total_completed = 0.0
