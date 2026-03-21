@@ -3,5 +3,5 @@
 # Requires ==0.0.6 for Group.create_group() support (used by queue sub-group tracing)
 tg4perfetto @ git+https://github.com/rlops/tg4perfetto.git
 
-# ROLL framework - core RL infrastructure dependency
-roll @ git+https://github.com/rlops/ROLL.git
+# ROLL framework - installed from external/ROLL submodule by setup_env.sh
+roll

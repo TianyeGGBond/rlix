@@ -29,7 +29,7 @@ classifiers = [
 dependencies = [
     "tg4perfetto>=0.0.6",
     "protobuf<3.21.0",
-    "roll @ git+https://github.com/rlops/ROLL.git",
+    "roll",
 ]
 
 [project.optional-dependencies]

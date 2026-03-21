@@ -64,8 +64,9 @@ logs/
 wandb/
 output/
 
-# External submodules
-external/
+# External dependencies (allow git submodules)
+external/*
+!external/ROLL
 
 ## Internal / personal files (not for release)
 #CLAUDE.md

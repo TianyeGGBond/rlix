@@ -1,15 +1,13 @@
 #!/bin/bash
 # Python dev environment setup for RLix (assumes CUDA drivers already installed).
 # Creates conda env "rlix" with Python 3.10 + CUDA toolkit 12.4,
-# clones ROLL from GitHub, then installs all Python dependencies.
+# initializes the ROLL submodule, then installs all Python dependencies.
 # Use -eo but not -u because conda's shell init references unset variables like PS1
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONDA_ENV_NAME="rlix"
 PYTHON_VERSION="3.10"
-ROLL_REPO="https://github.com/rlops/ROLL.git"
-ROLL_BRANCH="rlix"
 ROLL_DIR="${SCRIPT_DIR}/external/ROLL"
 CUDA_CHANNEL_LABEL="cuda-12.4.1"
 CUDA_NVCC_VERSION="12.4.131"
@@ -136,15 +134,9 @@ if ! command -v uv &> /dev/null; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# --- Clone ROLL if not already present ---
-if [[ -d "${ROLL_DIR}" ]]; then
-  echo "ROLL already cloned at ${ROLL_DIR}, pulling latest..."
-  git -C "${ROLL_DIR}" pull
-else
-  echo "Cloning ROLL (branch ${ROLL_BRANCH}) into ${ROLL_DIR}..."
-  mkdir -p "$(dirname "${ROLL_DIR}")"
-  git clone --branch "${ROLL_BRANCH}" "${ROLL_REPO}" "${ROLL_DIR}"
-fi
+# --- Init ROLL submodule ---
+echo "Initializing ROLL submodule..."
+git -C "${SCRIPT_DIR}" submodule update --init external/ROLL
 
 # --- Install Python dependencies ---
 cd "${ROLL_DIR}"

@@ -12,7 +12,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RLIX_ROOT = REPO_ROOT / "rlix"
-ROLL_ROOT = REPO_ROOT / "external" / "ROLL_rlix"
+ROLL_ROOT = REPO_ROOT / "external" / "ROLL"
 
 
 # ---------------------------------------------------------------------------

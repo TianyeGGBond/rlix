@@ -38,11 +38,12 @@ Example configurations are located in:
 
 ## Integration with ROLL
 
-These examples require the [ROLL fork](https://github.com/rlops/ROLL). Ensure it is installed before running:
+These examples require the [ROLL fork](https://github.com/rlops/ROLL), included as a git submodule:
 
 ```bash
-# Install ROLL fork (if needed)
-pip install "git+https://github.com/rlops/ROLL.git#subdirectory=mcore_adapter"
+# Initialize and install the ROLL submodule
+git submodule update --init external/ROLL
+pip install external/ROLL
 ```
 
 ## Troubleshooting
