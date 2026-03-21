@@ -1280,15 +1280,10 @@ class SchedulerImpl:
         """
         infos: List[GPUTraceInfo] = []
         for op in plan.sched_guided_allocation_ops:
-            if not op.gpus_to_allocate or not op.dp_ranks_to_add:
+            if not op.dp_rank_to_gpus_to_add:
                 continue
             pipeline_id, _ = parse_cluster_id(op.cluster_id)
-            tp_size = int(
-                self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"].get("tp_size", 1)
-            )
-            sorted_gpus = sorted(op.gpus_to_allocate)
-            for i, dp_rank in enumerate(sorted(op.dp_ranks_to_add)):
-                bundle = sorted_gpus[i * tp_size : (i + 1) * tp_size]
+            for dp_rank, bundle in op.dp_rank_to_gpus_to_add.items():
                 for gpu_id in bundle:
                     infos.append(
                         GPUTraceInfo(
@@ -1331,7 +1326,7 @@ class SchedulerImpl:
         for shrink_op in plan.sched_guided_shrink_ops:
             _add_remove(shrink_op.cluster_id, list(shrink_op.dp_ranks_to_remove))
         for alloc_op in plan.sched_guided_allocation_ops:
-            _add_add(alloc_op.cluster_id, list(alloc_op.dp_ranks_to_add))
+            _add_add(alloc_op.cluster_id, list(alloc_op.dp_rank_to_gpus_to_add.keys()))
 
         calls: List[Tuple[Any, List[int], List[int]]] = []
         for pipeline_id in sorted(set(pipeline_to_remove.keys()) | set(pipeline_to_add.keys())):
@@ -1569,9 +1564,11 @@ class SchedulerImpl:
         # multiple ops target the same cluster (merged by _try_activate_one but guarded here too).
         cluster_ids_to_signal: Set[str] = set()
         for alloc_op in plan.sched_guided_allocation_ops:
-            if not alloc_op.gpus_to_allocate:
+            if not alloc_op.dp_rank_to_gpus_to_add:
                 continue
-            gpu_set = set(alloc_op.gpus_to_allocate)
+            dp_rank_to_gpus_to_add = alloc_op.dp_rank_to_gpus_to_add
+            gpu_set = {gpu_id for gpus in dp_rank_to_gpus_to_add.values() for gpu_id in gpus}
+            sorted_needed = sorted(gpu_set)
             pipeline_id, _ = parse_cluster_id(alloc_op.cluster_id)
             # Stale-plan tolerance: if unregister_pipeline ran during the lock gap,
             # the pipeline is gone and GPUs were already returned to idle.
@@ -1583,12 +1580,6 @@ class SchedulerImpl:
                     alloc_op.cluster_id,
                 )
                 continue
-            tp_size = alloc_op.tp_size
-            sorted_needed = sorted(alloc_op.gpus_to_allocate)
-            dp_rank_to_gpus_to_add = {
-                dp_rank: sorted_needed[i * tp_size : (i + 1) * tp_size]
-                for i, dp_rank in enumerate(sorted(alloc_op.dp_ranks_to_add))
-            }
             alloc = self._state.active_allocations.get(alloc_op.cluster_id)
             if alloc is None:
                 updated_alloc = ClusterAllocation(
@@ -1618,8 +1609,8 @@ class SchedulerImpl:
             exec_expands.append(
                 {
                     "cluster_id": alloc_op.cluster_id,
-                    "gpus_allocated": sorted(alloc_op.gpus_to_allocate),
-                    "dp_ranks_added": sorted(alloc_op.dp_ranks_to_add),
+                    "gpus_allocated": sorted_needed,
+                    "dp_ranks_added": sorted(dp_rank_to_gpus_to_add.keys()),
                 }
             )
         for cluster_id in cluster_ids_to_signal:

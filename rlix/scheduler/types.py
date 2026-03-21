@@ -81,8 +81,7 @@ class SchedGuidedAllocationOp:
     """Instruction to expand a cluster by adding DP ranks onto specific GPUs."""
 
     cluster_id: str
-    dp_ranks_to_add: List[int]
-    gpus_to_allocate: List[int]
+    dp_rank_to_gpus_to_add: Dict[int, List[int]]
     has_pending_request: bool = False
     tp_size: int = 1  # Snapshotted at planning time; avoids registry lookup at commit
 
@@ -94,6 +93,7 @@ class ExecutionPlan:
     sched_guided_shrink_ops: List[SchedGuidedShrinkOp] = field(default_factory=list)
     signal_pending_allocation_ops: List[SignalPendingAllocationOp] = field(default_factory=list)
     sched_guided_allocation_ops: List[SchedGuidedAllocationOp] = field(default_factory=list)
+    # TODO: never populated; placeholder for orchestrator-driven cluster removal within a cycle.
     clusters_to_remove: Set[str] = field(default_factory=set)
 
 

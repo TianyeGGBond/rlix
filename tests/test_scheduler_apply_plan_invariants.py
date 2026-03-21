@@ -101,8 +101,7 @@ def test_generation_expand_skips_stale_op_after_unregister(monkeypatch: pytest.M
         sched_guided_allocation_ops=[
             scheduler_types.SchedGuidedAllocationOp(
                 cluster_id=cluster_id,
-                dp_ranks_to_add=[1],
-                gpus_to_allocate=[0, 1],
+                dp_rank_to_gpus_to_add={1: [0, 1]},
                 tp_size=2,
             )
         ]
@@ -201,8 +200,7 @@ def test_unregister_during_lock_gap_simulation(monkeypatch: pytest.MonkeyPatch) 
         sched_guided_allocation_ops=[
             scheduler_types.SchedGuidedAllocationOp(
                 cluster_id=cluster_id_infer,
-                dp_ranks_to_add=[0],
-                gpus_to_allocate=[2, 3],
+                dp_rank_to_gpus_to_add={0: [2, 3]},
                 tp_size=2,
             )
         ],

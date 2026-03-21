@@ -119,7 +119,7 @@ def test_single_pipeline_idle_gpus_activated(monkeypatch: pytest.MonkeyPatch) ->
     assert len(plan.sched_guided_allocation_ops) == 1
     op = plan.sched_guided_allocation_ops[0]
     assert op.cluster_id == cluster_id
-    assert set(op.gpus_to_allocate) == {2, 3}
+    assert {gpu_id for gpus in op.dp_rank_to_gpus_to_add.values() for gpu_id in gpus} == {2, 3}
     assert remaining_idle == set()
     # No shrink ops needed (GPUs were free, no donors)
     assert len(plan.sched_guided_shrink_ops) == 0
@@ -216,7 +216,8 @@ def test_two_pipelines_donor_shrink(monkeypatch: pytest.MonkeyPatch) -> None:
     b_gpus = set()
     for op in plan.sched_guided_allocation_ops:
         if op.cluster_id == cluster_b:
-            b_gpus.update(op.gpus_to_allocate)
+            for gpus in op.dp_rank_to_gpus_to_add.values():
+                b_gpus.update(gpus)
     assert len(b_gpus) >= 1
 
 

@@ -381,17 +381,29 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
     # Apply expansions (generation dp-rank add).
     for sim_alloc_op in plan.sched_guided_allocation_ops:
         tp_size = _cluster_tp_size(inputs, sim_alloc_op.cluster_id)
-        if len(sim_alloc_op.gpus_to_allocate) % tp_size != 0:
+        if any(len(gpus) != tp_size for gpus in sim_alloc_op.dp_rank_to_gpus_to_add.values()):
             raise ValidationError(
-                "expansion gpus_to_allocate not divisible by tp_size",
+                "expansion bundle size does not match tp_size",
                 condition=6,
                 context={
                     "cluster_id": sim_alloc_op.cluster_id,
                     "tp_size": tp_size,
-                    "len": len(sim_alloc_op.gpus_to_allocate),
                 },
             )
-        needed = set(sim_alloc_op.gpus_to_allocate)
+
+        # Intra-op duplicate-GPU check: no GPU may appear in two bundles within one op.
+        seen_in_op: Set[int] = set()
+        for dp_rank, gpu_bundle in sim_alloc_op.dp_rank_to_gpus_to_add.items():
+            overlap = seen_in_op & set(gpu_bundle)
+            if overlap:
+                raise ValidationError(
+                    "duplicate GPU within expansion op",
+                    condition=6,
+                    context={"cluster_id": sim_alloc_op.cluster_id, "dp_rank": dp_rank, "gpus": sorted(overlap)},
+                )
+            seen_in_op |= set(gpu_bundle)
+
+        needed = {gpu_id for gpus in sim_alloc_op.dp_rank_to_gpus_to_add.values() for gpu_id in gpus}
         if not needed.issubset(sim_idle):
             raise ValidationError(
                 "expansion consumes non-idle GPUs",
@@ -412,30 +424,31 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
             sim_allocations[sim_alloc_op.cluster_id] = sim_expand_alloc
 
         max_dp = _max_dp_workers(inputs, sim_alloc_op.cluster_id)
-        validate_dp_ranks_to_add(dp_ranks_to_add=sim_alloc_op.dp_ranks_to_add, max_dp_ranks=max_dp)
-        if len(set(sim_expand_alloc.active_dp_ranks) | set(sim_alloc_op.dp_ranks_to_add)) > max_dp:
+        dp_ranks_to_add = list(sim_alloc_op.dp_rank_to_gpus_to_add.keys())
+        validate_dp_ranks_to_add(dp_ranks_to_add=dp_ranks_to_add, max_dp_ranks=max_dp)
+        if len(set(sim_expand_alloc.active_dp_ranks) | sim_alloc_op.dp_rank_to_gpus_to_add.keys()) > max_dp:
             raise ValidationError(
                 "expansion exceeds max_dp_workers",
                 condition=7,
                 context={
                     "cluster_id": sim_alloc_op.cluster_id,
                     "max_dp_workers": max_dp,
-                    "add": sim_alloc_op.dp_ranks_to_add,
+                    "add": sorted(sim_alloc_op.dp_rank_to_gpus_to_add.keys()),
                 },
             )
-        if set(sim_alloc_op.dp_ranks_to_add) & set(sim_expand_alloc.active_dp_ranks):
+        if sim_alloc_op.dp_rank_to_gpus_to_add.keys() & sim_expand_alloc.active_dp_ranks:
             raise ValidationError(
                 "expansion adds already-active dp ranks",
                 condition=5,
                 context={
                     "cluster_id": sim_alloc_op.cluster_id,
                     "active": sorted(sim_expand_alloc.active_dp_ranks),
-                    "add": sim_alloc_op.dp_ranks_to_add,
+                    "add": sorted(sim_alloc_op.dp_rank_to_gpus_to_add.keys()),
                 },
             )
 
         # Condition 10: DP-rank overlap within a cluster.
-        for dp_rank in sim_alloc_op.dp_ranks_to_add:
+        for dp_rank in sim_alloc_op.dp_rank_to_gpus_to_add:
             if dp_rank in sim_expand_alloc.dp_rank_to_gpus:
                 raise ValidationError(
                     "dp_rank already exists in dp_rank_to_gpus",
@@ -443,19 +456,11 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
                     context={"cluster_id": sim_alloc_op.cluster_id, "dp_rank": dp_rank},
                 )
 
-        # Assign bundles by deterministic sort: dp_ranks_to_add order must match provided gpus_to_allocate bundles.
-        sorted_needed = sorted(needed)
-        if len(sorted_needed) != len(sim_alloc_op.dp_ranks_to_add) * tp_size:
-            raise ValidationError(
-                "expansion bundle size mismatch",
-                condition=6,
-                context={"cluster_id": sim_alloc_op.cluster_id},
-            )
-        for i, dp_rank in enumerate(sorted(sim_alloc_op.dp_ranks_to_add)):
-            gpu_slice = sorted_needed[i * tp_size : (i + 1) * tp_size]
-            sim_expand_alloc.dp_rank_to_gpus[dp_rank] = list(gpu_slice)
+        # Apply expansion: rank→GPU mapping is explicit in the op.
+        for dp_rank, gpu_bundle in sim_alloc_op.dp_rank_to_gpus_to_add.items():
+            sim_expand_alloc.dp_rank_to_gpus[dp_rank] = list(gpu_bundle)
             sim_expand_alloc.active_dp_ranks.add(dp_rank)
-            sim_expand_alloc.gpu_ids.extend(gpu_slice)
+            sim_expand_alloc.gpu_ids.extend(gpu_bundle)
         sim_expand_alloc.gpu_ids = sorted(set(sim_expand_alloc.gpu_ids))
 
     # Condition 8 (conservation): idle + allocated cover a consistent GPU universe.

@@ -388,15 +388,13 @@ def plan_generation_gap_ratio(
             None,
         )
         if existing_alloc_op is not None:
-            existing_alloc_op.dp_ranks_to_add.append(inactive.dp_rank)
-            existing_alloc_op.gpus_to_allocate.extend(sorted(needed_bundle))
+            existing_alloc_op.dp_rank_to_gpus_to_add[inactive.dp_rank] = sorted(needed_bundle)
             existing_alloc_op.has_pending_request = existing_alloc_op.has_pending_request or has_pending_request
         else:
             plan.sched_guided_allocation_ops.append(
                 SchedGuidedAllocationOp(
                     cluster_id=state.cluster_id,
-                    dp_ranks_to_add=[inactive.dp_rank],
-                    gpus_to_allocate=sorted(needed_bundle),
+                    dp_rank_to_gpus_to_add={inactive.dp_rank: sorted(needed_bundle)},
                     has_pending_request=has_pending_request,
                     tp_size=state.tp_size,
                 )

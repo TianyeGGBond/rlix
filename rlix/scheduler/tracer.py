@@ -542,11 +542,11 @@ class SchedulerTracer:
             "expands": [
                 {
                     "cluster_id": op.cluster_id,
-                    "gpus_allocated": sorted(op.gpus_to_allocate),
-                    "dp_ranks": sorted(op.dp_ranks_to_add),
+                    "gpus_allocated": sorted(gpu_id for gpus in op.dp_rank_to_gpus_to_add.values() for gpu_id in gpus),
+                    "dp_ranks": sorted(op.dp_rank_to_gpus_to_add.keys()),
                 }
                 for op in plan.sched_guided_allocation_ops
-                if op.gpus_to_allocate
+                if op.dp_rank_to_gpus_to_add
             ],
         }
 
