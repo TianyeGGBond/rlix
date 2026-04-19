@@ -159,6 +159,12 @@ class NemoRLFullFinetunePipeline:
         self._current_weight_version: int = -1  # incremented by _expand_workers
         self._cache_ready_step: int = -1  # updated in after_training (F4/F11 path)
 
+        # Introspectable state — read-only externally, written only by expand/shrink.
+        # active_dp_ranks mirrors VllmGeneration._active_dp_ranks (F2 owns ground truth).
+        # pre_activation_ranks tracks ranks between wake_up and activate (F6 atomic window).
+        self._active_dp_ranks: set = set()
+        self._pre_activation_ranks: set = set()  # woken but not yet in routing
+
         # NeMo RL runtime objects — created during initialize_pipeline().
         self._policy: Optional[Any] = None
         self._policy_generation: Optional[Any] = None
@@ -372,89 +378,113 @@ class NemoRLFullFinetunePipeline:
     def _expand_workers(self, *, dp_ranks_to_add: List[int]) -> None:
         """Atomic expand: wake → selective sync → version update → activate routing.
 
-        This sequence is the core correctness invariant of Feature 6:
+        F6 correctness invariant: activate_dp_ranks (step 5) is ONLY reached if
+        sync_selected_workers (step 3) AND set_weight_version (step 4) both succeed.
+        A failure in steps 3-5 leaves the ranks in a "woken-but-inactive" state —
+        they will not serve generation requests with stale weights.
 
-          1. Mark ranks inactive in routing (no new requests to these shards yet).
-          2. Wake up sleeping workers (training already offloaded, no OOM risk).
-          3. Selective weight sync from CPU bucket cache via NemoRLModelUpdateService.
-             Non-overlap shards continue generation without any pause.
-          4. Update trajectory collector weight_version BEFORE activating routing.
-             Ensures new shards are tagged with the correct version from the start.
-          5. Activate routing — new shards receive generation requests.
+        State transitions:
+          Before: ranks in sleeping set (not in _active_dp_ranks)
+          Step 1: marks ranks as pre-activation (mark_dp_ranks_inactive is a no-op
+                  here since they are already inactive, but makes intent explicit)
+          Step 2: ranks wake up (GPU VRAM restored); _pre_activation_ranks updated
+          Steps 3-4: weight sync + version update (atomic block, no routing yet)
+          Step 5: ranks move from _pre_activation_ranks → _active_dp_ranks
 
-        The entire sequence runs inside coordinator._resize_sync_lock (enforced by
-        the caller: coordinator.resize_infer → pipeline.resize_infer → here).
+        If any of steps 3-5 raise, _pre_activation_ranks retains the stale entries
+        so callers / tests can inspect the failed state.
+
+        Called inside coordinator._resize_sync_lock (coordinator.resize_infer holds
+        the lock for the full duration, preventing concurrent expand/shrink races).
         """
         if not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be non-empty")
 
-        logger.info(
-            "[%s] _expand_workers dp_ranks=%s", self._pipeline_id, dp_ranks_to_add
-        )
+        ranks = list(dp_ranks_to_add)
+        logger.info("[%s] _expand_workers start dp_ranks=%s", self._pipeline_id, ranks)
 
         if self._policy_generation is None:
-            logger.warning(
-                "[%s] _expand_workers: policy_generation not initialized; skipping",
-                self._pipeline_id,
+            raise RuntimeError(
+                f"[{self._pipeline_id}] _expand_workers: policy_generation is None; "
+                "cannot expand — call initialize_pipeline() first"
             )
-            return
+        if self._model_update_service is None:
+            raise RuntimeError(
+                f"[{self._pipeline_id}] _expand_workers: model_update_service is None; "
+                "cannot expand without weight sync (would activate stale weights)"
+            )
+        if self._trajectory_collector is None:
+            raise RuntimeError(
+                f"[{self._pipeline_id}] _expand_workers: trajectory_collector is None; "
+                "cannot expand without version update (register via on_trajectory_collector_created)"
+            )
 
-        # Step 1: Keep ranks out of active routing until sync is complete.
-        # Feature 2: VllmGeneration.mark_dp_ranks_inactive(dp_ranks)
-        self._policy_generation.mark_dp_ranks_inactive(dp_ranks_to_add)
+        # Step 1: Explicitly keep ranks out of routing before wake-up.
+        # F2: VllmGeneration.mark_dp_ranks_inactive — idempotent for sleeping ranks,
+        # but documents intent and sets _preempted_shards to block new dispatches.
+        self._policy_generation.mark_dp_ranks_inactive(ranks)
 
-        # Step 2: Wake sleeping workers.
-        # Training has already offloaded (offload_training_gpu in after_training hook),
-        # so overlap GPU VRAM is free — no OOM risk.
-        # Feature 2: VllmGeneration.wake_up_partial(dp_ranks)
-        self._policy_generation.wake_up_partial(dp_ranks_to_add)
+        # Step 2: Wake sleeping workers (training already offloaded — no OOM risk).
+        # F2: VllmGeneration.wake_up_partial(dp_ranks)
+        self._policy_generation.wake_up_partial(ranks)
+        self._pre_activation_ranks.update(ranks)
 
-        # Step 3: Selective weight sync from CPU bucket cache (Feature 4).
-        # Only woken shards receive weights; non-overlap shards are unaffected.
-        if self._model_update_service is not None:
+        # Steps 3-5: atomic block.
+        # Any exception here means activate_dp_ranks is NOT called.
+        # Ranks remain in _pre_activation_ranks (woken but not in routing).
+        try:
+            # Step 3: Selective weight sync — only woken shards, no global pause.
+            # F4: NemoRLModelUpdateService.sync_selected_workers (CPU bucket → GPU)
             ray.get(
                 self._model_update_service.sync_selected_workers.remote(
-                    tgt_dp_ranks=list(dp_ranks_to_add),
+                    tgt_dp_ranks=ranks,
                 )
             )
-        else:
-            logger.warning(
-                "[%s] _expand_workers: model_update_service not available; "
-                "weights NOT synced (inference workers will use stale weights)",
-                self._pipeline_id,
+            logger.info(
+                "[%s] _expand_workers: sync_selected_workers done", self._pipeline_id
             )
 
-        # Step 4: Update collector weight_version — must complete BEFORE routing
-        # activation. If the order were reversed, a new shard could receive requests
-        # and generate trajectories tagged with the old version, causing incorrect
-        # off-policy filtering in the replay buffer.
-        if self._trajectory_collector is not None:
+            # Step 4: Update collector weight_version BEFORE routing activation.
+            # Invariant: new shard enters routing only after collector already knows
+            # the new version, preventing stale-version tagging of fresh trajectories.
             new_version = self._current_weight_version + 1
             ray.get(
                 self._trajectory_collector.set_weight_version.remote(new_version)
             )
+            # Only increment local counter after remote call succeeds.
             self._current_weight_version = new_version
             logger.info(
                 "[%s] _expand_workers: weight_version → %d",
                 self._pipeline_id,
                 new_version,
             )
-        else:
-            logger.warning(
-                "[%s] _expand_workers: trajectory_collector not registered yet; "
-                "skipping version update",
+
+            # Step 5: Activate routing — reached only if steps 3+4 succeeded.
+            # F3: VllmGeneration.activate_dp_ranks adds ranks to _active_dp_ranks.
+            self._policy_generation.activate_dp_ranks(ranks)
+            self._active_dp_ranks.update(ranks)
+            self._pre_activation_ranks.difference_update(ranks)
+
+            logger.info(
+                "[%s] _expand_workers complete — dp_ranks=%s now active, "
+                "weight_version=%d",
                 self._pipeline_id,
+                ranks,
+                self._current_weight_version,
             )
 
-        # Step 5: Activate routing — new shards now receive generation requests.
-        # Feature 3: VllmGeneration.activate_dp_ranks(dp_ranks)
-        self._policy_generation.activate_dp_ranks(dp_ranks_to_add)
-
-        logger.info(
-            "[%s] _expand_workers complete — dp_ranks=%s now active",
-            self._pipeline_id,
-            dp_ranks_to_add,
-        )
+        except Exception:
+            # Ranks are awake but NOT in routing. Weights may be stale.
+            # _pre_activation_ranks still contains these ranks for diagnostic inspection.
+            logger.error(
+                "[%s] _expand_workers FAILED during sync/version/activate. "
+                "Ranks %s are woken but inactive (not in routing). "
+                "Inspect _pre_activation_ranks. weight_version unchanged at %d.",
+                self._pipeline_id,
+                ranks,
+                self._current_weight_version,
+            )
+            raise
 
     # ------------------------------------------------------------------
     # resize_infer — coordinator entry point (Feature 5)
