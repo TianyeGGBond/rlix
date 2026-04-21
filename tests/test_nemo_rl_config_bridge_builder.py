@@ -29,6 +29,7 @@ def _install_import_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     package_roots = {
         "rlix": RLIX_ROOT,
         "rlix.pipeline": RLIX_ROOT / "pipeline",
+        "rlix.protocol": RLIX_ROOT / "protocol",
     }
     for module_name, module_path in package_roots.items():
         package_module = types.ModuleType(module_name)

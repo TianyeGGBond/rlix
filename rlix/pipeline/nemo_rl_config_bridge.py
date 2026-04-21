@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
+
+import ray
+
+from rlix.protocol.types import get_pipeline_namespace
 
 
 def validate_partial_overlap_topology(
@@ -156,3 +161,85 @@ def detect_pipeline_type(*, nemo_config: Any) -> str:
     peft = getattr(megatron_cfg, "peft", None)
     enabled = getattr(peft, "enabled", False)
     return "lora" if bool(enabled) else "ft"
+
+
+@dataclass(frozen=True)
+class NemoRlRegistrationResult:
+    """Result of :func:`register_nemo_rl_pipeline`'s 3-step orchestrator dance.
+
+    ``scheduler`` is the Ray actor handle returned by the orchestrator's
+    ``AdmitResponse``, required by NeMo RL child actors (e.g.
+    ``AsyncTrajectoryCollector``, ``ReplayBuffer``, ``ModelUpdateService``)
+    to issue GPU allocation requests.
+    """
+
+    pipeline_id: str
+    ray_namespace: str
+    scheduler: Any
+
+
+def register_nemo_rl_pipeline(
+    *,
+    orchestrator: Any,
+    nemo_config: Any,
+    train_device_mapping: List[int],
+    infer_device_mapping: List[int],
+) -> NemoRlRegistrationResult:
+    """Run the RLix 3-step pipeline registration dance for a NeMo RL pipeline.
+
+    Flow:
+      1. Detect pipeline type (``"ft"``/``"lora"``) via
+         :func:`detect_pipeline_type`.
+      2. ``orchestrator.allocate_pipeline_id.remote(pipeline_type)`` → id.
+      3. Build ``cluster_tp_configs`` / ``cluster_device_mappings`` via
+         :func:`build_cluster_registry_inputs`.
+      4. ``orchestrator.register_pipeline.remote(...)``.
+      5. ``orchestrator.admit_pipeline.remote(pipeline_id=...)`` →
+         ``AdmitResponse`` whose ``scheduler`` handle is propagated to the
+         caller.
+
+    Errors from any of the three orchestrator calls propagate unchanged —
+    matches ROLL's ``examples/start_multi_pipeline_test.py`` fail-fast
+    pattern and leaves any partial orchestrator state for post-mortem.
+
+    Raises RuntimeError when ``admit_pipeline`` returns ``scheduler=None``:
+    that only happens when the pipeline is not registered on the
+    orchestrator side, which should be impossible immediately after a
+    successful ``register_pipeline`` — indicates orchestrator-state
+    corruption worth surfacing loudly.
+    """
+    pipeline_type = detect_pipeline_type(nemo_config=nemo_config)
+    pipeline_id: str = ray.get(
+        orchestrator.allocate_pipeline_id.remote(pipeline_type)
+    )
+
+    ray_namespace = get_pipeline_namespace(pipeline_id)
+    cluster_tp_configs, cluster_device_mappings = build_cluster_registry_inputs(
+        nemo_config=nemo_config,
+        train_device_mapping=train_device_mapping,
+        infer_device_mapping=infer_device_mapping,
+    )
+    ray.get(
+        orchestrator.register_pipeline.remote(
+            pipeline_id=pipeline_id,
+            ray_namespace=ray_namespace,
+            cluster_tp_configs=cluster_tp_configs,
+            cluster_device_mappings=cluster_device_mappings,
+        )
+    )
+    admit_response = ray.get(
+        orchestrator.admit_pipeline.remote(pipeline_id=pipeline_id)
+    )
+    if admit_response.scheduler is None:
+        raise RuntimeError(
+            f"NeMo RL pipeline registration: orchestrator.admit_pipeline "
+            f"returned scheduler=None for pipeline_id={pipeline_id!r}; "
+            f"indicates the pipeline is not registered on the orchestrator "
+            f"side despite a successful register_pipeline call (possible "
+            f"orchestrator-state corruption)."
+        )
+    return NemoRlRegistrationResult(
+        pipeline_id=pipeline_id,
+        ray_namespace=ray_namespace,
+        scheduler=admit_response.scheduler,
+    )
