@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import Any, Dict, List, Tuple
 
 
 def validate_partial_overlap_topology(
@@ -39,3 +39,120 @@ def validate_partial_overlap_topology(
     assert len(infer_set - train_set) >= vllm_tp_size, (
         "at least 1 full inference DP rank must stay active after shrink"
     )
+
+
+def _require_nemo_field(nemo_config: Any, dotted_path: str) -> Any:
+    """Walk a dotted attribute path on *nemo_config*; raise ValueError if missing.
+
+    Kept local to this module — unlike ``getattr(..., default)``, missing
+    fields are a hard error because topology validation cannot proceed with
+    silently-defaulted parallelism sizes.
+    """
+    current: Any = nemo_config
+    for part in dotted_path.split("."):
+        if not hasattr(current, part):
+            raise ValueError(
+                f"nemo_config missing required field: {dotted_path}"
+            )
+        current = getattr(current, part)
+    return current
+
+
+def extract_topology_validation_inputs(*, nemo_config: Any) -> Dict[str, Any]:
+    """Extract the 6 non-device inputs for :func:`validate_partial_overlap_topology`.
+
+    Returned dict is meant to be ``**``-unpacked alongside ``train_devices``
+    and ``infer_devices`` at the call site. Values are passed through as-is
+    from the NeMo RL config — no type coercion, because the downstream
+    validator's arithmetic will surface type errors naturally.
+
+    Raises ValueError when any required field is absent from *nemo_config*,
+    with the dotted path echoed in the message so stack-trace readers can
+    locate the misconfigured key.
+    """
+    return {
+        "vllm_tp_size": _require_nemo_field(
+            nemo_config, "policy.generation.vllm_cfg.tensor_parallel_size"
+        ),
+        "megatron_tp": _require_nemo_field(
+            nemo_config, "policy.megatron_cfg.tensor_model_parallel_size"
+        ),
+        "megatron_pp": _require_nemo_field(
+            nemo_config, "policy.megatron_cfg.pipeline_model_parallel_size"
+        ),
+        "megatron_cp": _require_nemo_field(
+            nemo_config, "policy.megatron_cfg.context_parallel_size"
+        ),
+        "megatron_ep": _require_nemo_field(
+            nemo_config, "policy.megatron_cfg.expert_model_parallel_size"
+        ),
+        "async_grpo_enabled": _require_nemo_field(
+            nemo_config, "grpo.async_grpo.enabled"
+        ),
+    }
+
+
+def build_cluster_registry_inputs(
+    *,
+    nemo_config: Any,
+    train_device_mapping: List[int],
+    infer_device_mapping: List[int],
+) -> Tuple[Dict[str, int], Dict[str, List[int]]]:
+    """Build ``(cluster_tp_configs, cluster_device_mappings)`` for RLix pipeline registration.
+
+    ``actor_train`` tp is canonicalized to 1 because Megatron workers each
+    occupy a single GPU — intra-train parallelism is expressed via NCCL
+    groups, not via RLix's tp field.
+
+    Device mappings are received as kwargs rather than extracted from
+    *nemo_config* because NeMo RL's YAML does not natively carry
+    train/infer device lists; the pipeline driver is the source of truth.
+
+    Raises ValueError on empty device mappings, non-positive vllm tp, or
+    an infer-count not divisible by vllm tp.
+    """
+    vllm_tp = _require_nemo_field(
+        nemo_config, "policy.generation.vllm_cfg.tensor_parallel_size"
+    )
+    if not train_device_mapping:
+        raise ValueError("nemo_config train_device_mapping must be non-empty")
+    if not infer_device_mapping:
+        raise ValueError("nemo_config infer_device_mapping must be non-empty")
+    if vllm_tp <= 0:
+        raise ValueError(
+            f"NeMo RL vllm tensor_parallel_size must be positive, got: {vllm_tp}"
+        )
+    if len(infer_device_mapping) % vllm_tp != 0:
+        raise ValueError(
+            f"NeMo RL infer_device_mapping length must divide evenly by vllm "
+            f"tensor_parallel_size, got: len(infer)={len(infer_device_mapping)} "
+            f"vllm_tp={vllm_tp}"
+        )
+    cluster_tp_configs: Dict[str, int] = {
+        "actor_train": 1,
+        "actor_infer": vllm_tp,
+    }
+    cluster_device_mappings: Dict[str, List[int]] = {
+        "actor_train": list(train_device_mapping),
+        "actor_infer": list(infer_device_mapping),
+    }
+    return cluster_tp_configs, cluster_device_mappings
+
+
+def detect_pipeline_type(*, nemo_config: Any) -> str:
+    """Return ``"lora"`` when NeMo RL PEFT is enabled, else ``"ft"``.
+
+    Uses chained :func:`getattr` with ``None`` defaults so absent
+    ``policy`` / ``megatron_cfg`` / ``peft`` nodes fall through to the
+    full-finetune branch without raising — matches ROLL-side behavior in
+    :mod:`examples.start_multi_pipeline_test`.
+
+    Truthy-coerces ``peft.enabled`` rather than identity-checking against
+    ``True``, so YAML-derived non-bool truthy values still map to
+    ``"lora"``.
+    """
+    policy = getattr(nemo_config, "policy", None)
+    megatron_cfg = getattr(policy, "megatron_cfg", None)
+    peft = getattr(megatron_cfg, "peft", None)
+    enabled = getattr(peft, "enabled", False)
+    return "lora" if bool(enabled) else "ft"
