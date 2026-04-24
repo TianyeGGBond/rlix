@@ -59,6 +59,8 @@ def _make_nemo_config(
     drop_policy: bool = False,
     drop_grpo: bool = False,
     drop_async_grpo: bool = False,
+    rlix_train_device_mapping: object = _SENTINEL,
+    rlix_infer_device_mapping: object = _SENTINEL,
 ) -> SimpleNamespace:
     """Construct a minimal nested SimpleNamespace mimicking a NeMo RL config.
 
@@ -90,6 +92,13 @@ def _make_nemo_config(
             cfg.grpo = SimpleNamespace(
                 async_grpo=SimpleNamespace(enabled=async_grpo)
             )
+    rlix_fields: dict = {}
+    if rlix_train_device_mapping is not _SENTINEL:
+        rlix_fields["train_device_mapping"] = rlix_train_device_mapping
+    if rlix_infer_device_mapping is not _SENTINEL:
+        rlix_fields["infer_device_mapping"] = rlix_infer_device_mapping
+    if rlix_fields:
+        cfg.rlix = SimpleNamespace(**rlix_fields)
     return cfg
 
 
@@ -194,6 +203,81 @@ class TestBuildClusterRegistryInputs:
                 train_device_mapping=[0],
                 infer_device_mapping=[0, 1, 2],
             )
+
+    def test_fallback_to_config_when_kwargs_not_provided(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _load_bridge(monkeypatch)
+        cfg = _make_nemo_config(
+            vllm_tp=2,
+            rlix_train_device_mapping=[0, 1],
+            rlix_infer_device_mapping=[0, 1, 2, 3],
+        )
+        tp, devs = bridge.build_cluster_registry_inputs(nemo_config=cfg)
+        assert tp == {"actor_train": 1, "actor_infer": 2}
+        assert devs == {"actor_train": [0, 1], "actor_infer": [0, 1, 2, 3]}
+
+    def test_kwargs_precedence_over_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _load_bridge(monkeypatch)
+        cfg = _make_nemo_config(
+            vllm_tp=2,
+            rlix_train_device_mapping=[99, 99],
+            rlix_infer_device_mapping=[99, 99, 99, 99],
+        )
+        _, devs = bridge.build_cluster_registry_inputs(
+            nemo_config=cfg,
+            train_device_mapping=[0, 1],
+            infer_device_mapping=[0, 1, 2, 3],
+        )
+        assert devs == {"actor_train": [0, 1], "actor_infer": [0, 1, 2, 3]}
+
+    def test_both_missing_raises_for_train(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _load_bridge(monkeypatch)
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"train_device_mapping must be provided via kwarg or "
+                r"nemo_config\.rlix\.train_device_mapping"
+            ),
+        ):
+            bridge.build_cluster_registry_inputs(
+                nemo_config=_make_nemo_config(vllm_tp=2),
+                infer_device_mapping=[0, 1, 2, 3],
+            )
+
+    def test_both_missing_raises_for_infer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _load_bridge(monkeypatch)
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"infer_device_mapping must be provided via kwarg or "
+                r"nemo_config\.rlix\.infer_device_mapping"
+            ),
+        ):
+            bridge.build_cluster_registry_inputs(
+                nemo_config=_make_nemo_config(vllm_tp=2),
+                train_device_mapping=[0, 1],
+            )
+
+    def test_config_fallback_with_partial_kwargs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _load_bridge(monkeypatch)
+        cfg = _make_nemo_config(
+            vllm_tp=2,
+            rlix_infer_device_mapping=[0, 1, 2, 3],
+        )
+        _, devs = bridge.build_cluster_registry_inputs(
+            nemo_config=cfg,
+            train_device_mapping=[0, 1],
+        )
+        assert devs == {"actor_train": [0, 1], "actor_infer": [0, 1, 2, 3]}
 
 
 class TestDetectPipelineType:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ray
 
@@ -100,8 +100,8 @@ def extract_topology_validation_inputs(*, nemo_config: Any) -> Dict[str, Any]:
 def build_cluster_registry_inputs(
     *,
     nemo_config: Any,
-    train_device_mapping: List[int],
-    infer_device_mapping: List[int],
+    train_device_mapping: Optional[List[int]] = None,
+    infer_device_mapping: Optional[List[int]] = None,
 ) -> Tuple[Dict[str, int], Dict[str, List[int]]]:
     """Build ``(cluster_tp_configs, cluster_device_mappings)`` for RLix pipeline registration.
 
@@ -109,16 +109,47 @@ def build_cluster_registry_inputs(
     occupy a single GPU — intra-train parallelism is expressed via NCCL
     groups, not via RLix's tp field.
 
-    Device mappings are received as kwargs rather than extracted from
-    *nemo_config* because NeMo RL's YAML does not natively carry
-    train/infer device lists; the pipeline driver is the source of truth.
+    Device mappings can be supplied two ways:
 
-    Raises ValueError on empty device mappings, non-positive vllm tp, or
-    an infer-count not divisible by vllm tp.
+    1. As explicit ``train_device_mapping`` / ``infer_device_mapping``
+       kwargs — this is the preferred path when the pipeline driver is
+       the source of truth.
+    2. As ``nemo_config.rlix.train_device_mapping`` /
+       ``nemo_config.rlix.infer_device_mapping`` — a fallback for configs
+       that carry the device lists directly.
+
+    kwargs take precedence: if a kwarg is not ``None``, it is used
+    verbatim and the config subtree is ignored. A kwarg of ``None``
+    triggers the config fallback; an absent or ``None`` config value
+    then raises. An explicitly empty list (``[]``) on either source is
+    rejected by the non-empty check below — use ``None`` to mean "not
+    provided, try the other source".
+
+    Raises ValueError on empty device mappings, non-positive vllm tp,
+    an infer-count not divisible by vllm tp, or when both the kwarg and
+    the config fallback are absent for either device mapping.
     """
     vllm_tp = _require_nemo_field(
         nemo_config, "policy.generation.vllm_cfg.tensor_parallel_size"
     )
+    if train_device_mapping is None:
+        train_device_mapping = getattr(
+            getattr(nemo_config, "rlix", None), "train_device_mapping", None
+        )
+        if train_device_mapping is None:
+            raise ValueError(
+                "train_device_mapping must be provided via kwarg or "
+                "nemo_config.rlix.train_device_mapping"
+            )
+    if infer_device_mapping is None:
+        infer_device_mapping = getattr(
+            getattr(nemo_config, "rlix", None), "infer_device_mapping", None
+        )
+        if infer_device_mapping is None:
+            raise ValueError(
+                "infer_device_mapping must be provided via kwarg or "
+                "nemo_config.rlix.infer_device_mapping"
+            )
     if not train_device_mapping:
         raise ValueError("nemo_config train_device_mapping must be non-empty")
     if not infer_device_mapping:
@@ -182,10 +213,15 @@ def register_nemo_rl_pipeline(
     *,
     orchestrator: Any,
     nemo_config: Any,
-    train_device_mapping: List[int],
-    infer_device_mapping: List[int],
+    train_device_mapping: Optional[List[int]] = None,
+    infer_device_mapping: Optional[List[int]] = None,
 ) -> NemoRlRegistrationResult:
     """Run the RLix 3-step pipeline registration dance for a NeMo RL pipeline.
+
+    ``train_device_mapping`` and ``infer_device_mapping`` are optional;
+    when ``None`` they fall back to ``nemo_config.rlix.train_device_mapping``
+    / ``nemo_config.rlix.infer_device_mapping`` — see
+    :func:`build_cluster_registry_inputs` for the full precedence rules.
 
     Flow:
       1. Detect pipeline type (``"ft"``/``"lora"``) via

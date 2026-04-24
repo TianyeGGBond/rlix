@@ -60,6 +60,8 @@ def _make_nemo_config(
     meg_ep: object = 1,
     async_grpo: object = True,
     peft_enabled: object = _SENTINEL,
+    rlix_train_device_mapping: object = _SENTINEL,
+    rlix_infer_device_mapping: object = _SENTINEL,
 ) -> SimpleNamespace:
     megatron_cfg = SimpleNamespace(
         tensor_model_parallel_size=meg_tp,
@@ -73,7 +75,15 @@ def _make_nemo_config(
     generation = SimpleNamespace(vllm_cfg=vllm_cfg)
     policy = SimpleNamespace(generation=generation, megatron_cfg=megatron_cfg)
     grpo = SimpleNamespace(async_grpo=SimpleNamespace(enabled=async_grpo))
-    return SimpleNamespace(policy=policy, grpo=grpo)
+    cfg = SimpleNamespace(policy=policy, grpo=grpo)
+    rlix_fields: dict = {}
+    if rlix_train_device_mapping is not _SENTINEL:
+        rlix_fields["train_device_mapping"] = rlix_train_device_mapping
+    if rlix_infer_device_mapping is not _SENTINEL:
+        rlix_fields["infer_device_mapping"] = rlix_infer_device_mapping
+    if rlix_fields:
+        cfg.rlix = SimpleNamespace(**rlix_fields)
+    return cfg
 
 
 # --------------------------------------------------------------------------
@@ -318,3 +328,43 @@ class TestRegisterNemoRlPipeline:
                 train_device_mapping=[0, 1],
                 infer_device_mapping=[0, 1, 2, 3],
             )
+
+    def test_register_with_kwargs_direct_passes_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _load_bridge(monkeypatch)
+        orch = FakeOrchestrator(pipeline_id="ft_kwargs000000")
+        bridge.register_nemo_rl_pipeline(
+            orchestrator=orch,
+            nemo_config=_make_nemo_config(
+                vllm_tp=2,
+                rlix_train_device_mapping=[99, 99],
+                rlix_infer_device_mapping=[99, 99, 99, 99],
+            ),
+            train_device_mapping=[0, 1],
+            infer_device_mapping=[0, 1, 2, 3],
+        )
+        _, register_kwargs = orch.calls[1]
+        assert register_kwargs["cluster_device_mappings"] == {
+            "actor_train": [0, 1],
+            "actor_infer": [0, 1, 2, 3],
+        }
+
+    def test_register_with_config_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _load_bridge(monkeypatch)
+        orch = FakeOrchestrator(pipeline_id="ft_fallback00000")
+        bridge.register_nemo_rl_pipeline(
+            orchestrator=orch,
+            nemo_config=_make_nemo_config(
+                vllm_tp=2,
+                rlix_train_device_mapping=[0, 1],
+                rlix_infer_device_mapping=[0, 1, 2, 3],
+            ),
+        )
+        _, register_kwargs = orch.calls[1]
+        assert register_kwargs["cluster_device_mappings"] == {
+            "actor_train": [0, 1],
+            "actor_infer": [0, 1, 2, 3],
+        }
