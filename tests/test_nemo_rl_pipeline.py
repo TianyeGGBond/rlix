@@ -218,6 +218,10 @@ class MockVLLMGeneration:
         self.inactive_ranks.difference_update(dp_ranks)
         self._log(f"activate_dp_ranks({sorted(dp_ranks)})")
 
+    def finalize_weight_update(self, dp_ranks: List[int]) -> List[Any]:
+        self._log(f"finalize_weight_update({sorted(dp_ranks)})")
+        return []
+
 
 # ---------------------------------------------------------------------------
 # Mock: ModelUpdateService (F4 stub)
@@ -381,7 +385,7 @@ def _make_test_pipeline(
     p._current_weight_version = initial_version
     p._pre_activation_ranks = set()
     p._active_dp_ranks = set()
-    p._cache_ready_step = -1
+    p._cache_ready_step = initial_version
     p._policy = None
     p._coordinator_handle = None
 
@@ -578,7 +582,7 @@ class TestExpandWorkersAtomic:
             pipeline._expand_workers(dp_ranks_to_add=dp_ranks)
 
     def test_expand_workers_is_atomic_on_success(self):
-        """F6 ordering invariant: mark→wake→sync→set_version→activate."""
+        """F6 ordering invariant: mark→wake→sync→finalize→set_version→activate."""
         shared: List[str] = []  # single list records global call order across all mocks
         vllm = MockVLLMGeneration(dp_size=4, shared_events=shared)
         vllm.active_dp_ranks = {0}
@@ -595,7 +599,8 @@ class TestExpandWorkersAtomic:
             "mark_inactive([1, 2])",
             "wake_up_partial([1, 2])",
             "sync_selected_workers([1, 2])",
-            "set_weight_version(4)",
+            "finalize_weight_update([1, 2])",
+            "set_weight_version(3)",
             "activate_dp_ranks([1, 2])",
         ]:
             assert key in idx, f"Expected event {key!r} not found in: {shared}"
@@ -603,17 +608,18 @@ class TestExpandWorkersAtomic:
         # Ordering: each step before the next
         assert idx["mark_inactive([1, 2])"] < idx["wake_up_partial([1, 2])"]
         assert idx["wake_up_partial([1, 2])"] < idx["sync_selected_workers([1, 2])"]
-        assert idx["sync_selected_workers([1, 2])"] < idx["set_weight_version(4)"]
+        assert idx["sync_selected_workers([1, 2])"] < idx["finalize_weight_update([1, 2])"]
+        assert idx["finalize_weight_update([1, 2])"] < idx["set_weight_version(3)"]
         # Critical: version must be set BEFORE routing is activated
-        assert idx["set_weight_version(4)"] < idx["activate_dp_ranks([1, 2])"]
+        assert idx["set_weight_version(3)"] < idx["activate_dp_ranks([1, 2])"]
 
-    def test_expand_workers_increments_weight_version(self):
-        """_current_weight_version must increase by 1 on success."""
+    def test_expand_workers_publishes_cache_version(self):
+        """_current_weight_version must equal the cache-producing step."""
         pipeline = _make_test_pipeline(initial_version=9)
 
         self._run_expand(pipeline, dp_ranks=[1])
 
-        assert pipeline._current_weight_version == 10
+        assert pipeline._current_weight_version == 9
 
     def test_expand_workers_updates_collector_version(self):
         """Collector.weight_version must equal pipeline._current_weight_version after expand."""
@@ -622,7 +628,7 @@ class TestExpandWorkersAtomic:
 
         self._run_expand(pipeline, dp_ranks=[0])
 
-        assert collector.weight_version == 1
+        assert collector.weight_version == 0
         assert pipeline._current_weight_version == collector.weight_version
 
     def test_expand_workers_clears_pre_activation_ranks(self):

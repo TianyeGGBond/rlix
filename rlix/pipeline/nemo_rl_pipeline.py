@@ -9,8 +9,8 @@ Key design choices vs RollFullFinetunePipeline:
   - Training loop is NeMo RL's async_grpo_train() (not ROLL AgenticPipeline).
   - Weight sync is selective (NemoRLModelUpdateService), not full NCCL broadcast.
   - Inference routing state is owned by VllmGeneration._active_dp_ranks (F2).
-  - Weight version is owned by this actor; grpo.py tracks a shadow copy for
-    replay buffer sampling but does NOT call set_weight_version directly (F6).
+  - Weight version is the training step that produced the CPU cache. Active
+    refresh and later expand of the same cache publish the same version (F6).
 
 Feature dependencies in this file:
   F5  — scheduler-driven shrink/expand, hooks, bootstrap lifecycle
@@ -27,7 +27,7 @@ import asyncio
 import logging
 import os
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import ray
 
@@ -43,10 +43,11 @@ from rlix.protocol.types import (
     Priority,
     get_pipeline_namespace,
 )
-from rlix.utils.env import parse_env_timeout_s
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
+
+_BOOTSTRAP_CACHE_VERSION = -1
 
 
 # ---------------------------------------------------------------------------
@@ -83,22 +84,23 @@ class NemoRLRLixHooks:
             "[NemoRLRLixHooks] before_training step=%d — actor_train GPUs granted", step
         )
 
-    def after_training(self, step: int) -> None:
-        """Release the training GPU; scheduler triggers expand + selective sync.
+    def after_training(self, step: int) -> int:
+        """Refresh active inference ranks, then release the training GPU.
 
-        The scheduler asynchronously calls coordinator.resize_infer(add=overlap_ranks)
-        after this notification, which routes to _expand_workers(). Expand completion
-        (including collector version update) is guaranteed before the next
-        before_training() call returns.
+        Non-overlap inference ranks may keep serving throughout training and
+        therefore will not pass through expand. They must receive the latest
+        base weights before the scheduler is told actor_train GPUs are free.
         """
         logger.info(
-            "[NemoRLRLixHooks] after_training step=%d — notifying scheduler to release actor_train",
+            "[NemoRLRLixHooks] after_training step=%d — syncing active base weights",
             step,
         )
+        version = self._pipeline._after_training(step=step)
         self._pipeline._notify_release_cluster_gpus(
             cluster_id=self._pipeline._actor_train_cluster_id,
             global_step=step,
         )
+        return version
 
     def on_trajectory_collector_created(self, collector: Any) -> None:
         """Register the trajectory collector handle with the pipeline actor.
@@ -156,7 +158,7 @@ class NemoRLFullFinetunePipeline:
 
         # State owned exclusively by this actor (single writer).
         self._trajectory_collector: Optional[Any] = None  # set by on_trajectory_collector_created
-        self._current_weight_version: int = -1  # incremented by _expand_workers
+        self._current_weight_version: int = -1  # equals _cache_ready_step after publish
         self._cache_ready_step: int = -1  # updated in after_training (F4/F11 path)
 
         # Introspectable state — read-only externally, written only by expand/shrink.
@@ -265,7 +267,7 @@ class NemoRLFullFinetunePipeline:
             # ----------------------------------------------------------------
             # Phase 1: Training init
             # ----------------------------------------------------------------
-            init_step = -1
+            init_step = _BOOTSTRAP_CACHE_VERSION
             self._request_cluster_gpus(
                 cluster_id=self._actor_train_cluster_id,
                 priority=Priority.INITIALIZATION,
@@ -278,13 +280,13 @@ class NemoRLFullFinetunePipeline:
 
                 # F4 stub: build CPU bucket cache for base model weights.
                 # Full implementation in Feature 4 (megatron_policy_worker.py).
-                self._build_cpu_bucket_cache_stub(step=init_step)
+                self._build_cpu_bucket_cache(step=init_step, is_bootstrap=True)
                 self._cache_ready_step = init_step
 
                 # F11 stubs: offload training GPU VRAM + destroy NCCL groups.
                 # Needed so inference workers can wake_up on overlap GPUs without OOM.
-                self._offload_training_gpu_stub()
-                self._destroy_nccl_groups_stub()
+                self._offload_training_gpu()
+                self._destroy_nccl_groups()
 
             finally:
                 self._notify_release_cluster_gpus(
@@ -444,15 +446,12 @@ class NemoRLFullFinetunePipeline:
                 "[%s] _expand_workers: sync_selected_workers done", self._pipeline_id
             )
 
-            # Step 4: Update collector weight_version BEFORE routing activation.
-            # Invariant: new shard enters routing only after collector already knows
-            # the new version, preventing stale-version tagging of fresh trajectories.
-            new_version = self._current_weight_version + 1
-            ray.get(
-                self._trajectory_collector.set_weight_version.remote(new_version)
-            )
-            # Only increment local counter after remote call succeeds.
-            self._current_weight_version = new_version
+            self._finalize_weight_update(ranks)
+
+            # Step 4: publish the cache version BEFORE routing activation.
+            # Expand reuses the same CPU cache as active refresh, so it must not
+            # bump the version for the same weights.
+            new_version = self._publish_weight_version()
             logger.info(
                 "[%s] _expand_workers: weight_version → %d",
                 self._pipeline_id,
@@ -516,6 +515,22 @@ class NemoRLFullFinetunePipeline:
     # ------------------------------------------------------------------
     # Training loop — Feature 5
     # ------------------------------------------------------------------
+
+    def _after_training(self, *, step: int) -> int:
+        """Post-train critical path: cache, offload, active sync, version publish."""
+        self._build_cpu_bucket_cache(step=step)
+        self._cache_ready_step = int(step)
+
+        self._offload_training_gpu()
+        self._destroy_nccl_groups()
+
+        coordinator = self._get_coordinator_handle()
+        active_ranks = ray.get(coordinator.sync_base_weights_to_active.remote())
+        active_ranks = [int(rank) for rank in (active_ranks or [])]
+        if active_ranks:
+            self._finalize_weight_update(active_ranks)
+
+        return self._publish_weight_version()
 
     def run(self) -> None:
         """Start async GRPO training with RLix hooks injected.
@@ -655,39 +670,69 @@ class NemoRLFullFinetunePipeline:
             "[%s] All inference workers sleeping (level=2)", self._pipeline_id
         )
 
-    def _build_cpu_bucket_cache_stub(self, step: int) -> None:
+    def _build_cpu_bucket_cache(self, step: int, *, is_bootstrap: bool = False) -> None:
         """Build CPU bucket cache snapshot of current training weights.
 
         Feature 4 dependency: implemented in megatron_policy_worker.py.
-        Until F4 lands, this is a no-op. The consequence is that the first
-        selective sync will have no cache to read from and will log a warning.
+        If the policy has no cache builder yet, fail fast rather than letting
+        inference serve stale weights under a new version.
         """
-        logger.info(
-            "[%s] _build_cpu_bucket_cache step=%d [F4 stub — no-op]",
-            self._pipeline_id,
-            step,
-        )
+        if self._policy is None or not hasattr(self._policy, "build_cpu_bucket_cache"):
+            if is_bootstrap:
+                logger.info(
+                    "[%s] _build_cpu_bucket_cache bootstrap version=%d skipped; policy cache builder unavailable",
+                    self._pipeline_id,
+                    step,
+                )
+                return
+            raise NotImplementedError(
+                "NeMo RL policy must implement build_cpu_bucket_cache(step) before "
+                "Feature 5+6 weight refresh can run safely."
+            )
+        ray.get(self._policy.build_cpu_bucket_cache.remote(step))
 
-    def _offload_training_gpu_stub(self) -> None:
+    def _offload_training_gpu(self) -> None:
         """Release training GPU VRAM so inference can wake_up on overlap GPUs.
 
         Feature 11 dependency: implemented as policy.offload_training_gpu().
-        Until F11 lands, VRAM is not freed and wake_up on overlap GPUs may OOM.
         """
-        logger.info(
-            "[%s] _offload_training_gpu [F11 stub — no-op]", self._pipeline_id
-        )
+        if self._policy is not None and hasattr(self._policy, "offload_training_gpu"):
+            ray.get(self._policy.offload_training_gpu.remote())
+            return
+        logger.warning("[%s] policy.offload_training_gpu unavailable", self._pipeline_id)
 
-    def _destroy_nccl_groups_stub(self) -> None:
+    def _destroy_nccl_groups(self) -> None:
         """Destroy Megatron NCCL communicator groups to release their VRAM.
 
         Feature 11 dependency: implemented in nccl_offload.py (NeMo RL repo).
         NCCL communicator buffers can use hundreds of MB on the GPU even when
         training is idle. Without this, inference wake_up on overlap GPUs may OOM.
         """
-        logger.info(
-            "[%s] _destroy_nccl_groups [F11 stub — no-op]", self._pipeline_id
-        )
+        if self._policy is not None and hasattr(self._policy, "destroy_nccl_groups"):
+            ray.get(self._policy.destroy_nccl_groups.remote())
+            return
+        logger.warning("[%s] policy.destroy_nccl_groups unavailable", self._pipeline_id)
+
+    def _finalize_weight_update(self, dp_ranks: List[int]) -> None:
+        """Run one post-load finalization on each target vLLM worker."""
+        ranks = sorted(set(int(rank) for rank in dp_ranks))
+        if not ranks:
+            return
+        if self._policy_generation is None:
+            raise RuntimeError("policy_generation is required for finalize_weight_update")
+
+        if not hasattr(self._policy_generation, "finalize_weight_update"):
+            raise RuntimeError("policy_generation must expose finalize_weight_update(dp_ranks)")
+        ray.get(self._policy_generation.finalize_weight_update(ranks))
+
+    def _publish_weight_version(self) -> int:
+        """Publish the cache-producing step as the current collector version."""
+        if self._trajectory_collector is None:
+            raise RuntimeError("trajectory_collector is required before publishing weight version")
+        version = int(self._cache_ready_step)
+        ray.get(self._trajectory_collector.set_weight_version.remote(version))
+        self._current_weight_version = version
+        return version
 
     def _create_model_update_service(self) -> None:
         """Create NemoRLModelUpdateService Ray actor in the pipeline namespace."""

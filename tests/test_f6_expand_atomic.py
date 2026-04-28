@@ -153,6 +153,10 @@ class MockVLLMGeneration:
         self.inactive_ranks.difference_update(dp_ranks)
         self._log(f"activate_dp_ranks({sorted(dp_ranks)})")
 
+    def finalize_weight_update(self, dp_ranks: List[int]) -> List[Any]:
+        self._log(f"finalize_weight_update({sorted(dp_ranks)})")
+        return []
+
 
 class MockModelUpdateService:
     """Mock for NemoRLModelUpdateService (F4 stub).
@@ -243,7 +247,7 @@ def _make_pipeline(
     pipeline._current_weight_version = initial_version
     pipeline._pre_activation_ranks = set()
     pipeline._active_dp_ranks = set()
-    pipeline._cache_ready_step = -1
+    pipeline._cache_ready_step = initial_version
     pipeline._initialized = True
 
     pipeline._policy_generation = vllm or MockVLLMGeneration(dp_size=dp_size)
@@ -274,7 +278,7 @@ def _make_pipeline_with_refs(
     pipeline._current_weight_version = initial_version
     pipeline._pre_activation_ranks = set()
     pipeline._active_dp_ranks = set()
-    pipeline._cache_ready_step = -1
+    pipeline._cache_ready_step = initial_version
     pipeline._initialized = True
 
     pipeline._policy_generation = vllm

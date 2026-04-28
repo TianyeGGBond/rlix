@@ -103,21 +103,10 @@ class NemoRLModelUpdateService:
             tgt_dp_ranks,
         )
 
-        # --- Feature 4 placeholder ---
-        # Full implementation requires:
-        #   policy.build_cpu_bucket_cache(step) — called in after_training hook
-        #   policy.cache_owner_rank             — pp0/dp0/tp0/cp0 rank index
-        #   _build_comm_plan_for_sender()       — IPC vs NCCL routing per device
-        #   _stage_bucket_cpu_to_gpu()          — controlled staging buffer loop
-        #   policy_generation.update_weights_via_ipc_zmq()     — IPC send path
-        #   policy_generation.update_weights_from_collective()  — NCCL send path
-        #
-        # Until then, log a warning and return so the rest of F5/F6 wiring can be
-        # exercised end-to-end in integration tests with mock weights.
-        logger.warning(
-            "[NemoRLModelUpdateService] sync_selected_workers is a stub — "
-            "Feature 4 (CPU bucket cache) not yet implemented. "
-            "Inference workers will run with stale weights until F4 lands."
+        raise NotImplementedError(
+            "NeMo RL selective base-weight sync requires the Feature 4 sender "
+            "implementation (CPU bucket cache transport). Refusing to mark stale "
+            "inference workers as synced."
         )
 
     def __repr__(self) -> str:
