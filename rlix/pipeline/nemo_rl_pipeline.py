@@ -325,8 +325,8 @@ class NemoRLFullFinetunePipeline:
             self._create_model_update_service()
 
             # All DP ranks sleeping; routing disabled until scheduler expand.
-            # F2: VllmGeneration._active_dp_ranks starts as empty set when
-            # sleep_partial is called on all ranks during _init_inference_workers().
+            # F2: VllmGeneration._active_dp_ranks starts as empty set after
+            # _sleep_all_inference_workers() calls finish_generation() on all ranks.
             logger.info(
                 "[%s] initialize_pipeline complete — waiting for scheduler grant",
                 self._pipeline_id,

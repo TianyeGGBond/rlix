@@ -34,9 +34,11 @@ class NemoRLModelUpdateService:
     """Per-pipeline selective weight sync service for NeMo RL.
 
     Holds references to the Megatron training policy and the vLLM generation
-    interface. On each expand triggered by the scheduler, sync_selected_workers
-    is called with the DP ranks that just woke up; it pushes the CPU-cached
-    weights to those shards only (non-overlap shards continue generation).
+    interface. sync_selected_workers is called in two scenarios:
+      - expand path: DP ranks that just woke up (scheduler-driven expand).
+      - active refresh path: DP ranks currently serving requests (partial-overlap
+        ranks that did not shrink during training and will not pass through expand).
+    In both cases, untargeted shards are not contacted and continue generation.
 
     Args:
         pipeline_id:       Unique identifier for this pipeline.
@@ -86,8 +88,11 @@ class NemoRLModelUpdateService:
         generation without pause.
 
         Args:
-            tgt_dp_ranks: DP ranks in the inference cluster to push weights to.
-                          Must be a subset of ranks that just woke up.
+            tgt_dp_ranks: DP ranks to push weights to. Two callers:
+                          - expand path: ranks that just woke up, not yet routing.
+                          - active refresh path: ranks currently serving requests;
+                            implementation must synchronize CUDA streams after
+                            load_weights() to avoid mid-inference weight switching.
             verify:       When True, run post-sync weight verification checksums.
 
         Raises:
