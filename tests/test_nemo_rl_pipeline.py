@@ -127,6 +127,33 @@ def patch_ray_get() -> Generator:
 
 
 # ---------------------------------------------------------------------------
+# Mock: Policy (replaces real NeMo RL Megatron policy for F4 calls)
+# ---------------------------------------------------------------------------
+
+
+class MockPolicy:
+    """Minimal policy stub satisfying _build_cpu_bucket_cache checks."""
+
+    def build_cpu_bucket_cache(self, step: int) -> None:
+        pass
+
+    def promote_active_checkpoint(self, version: int) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Mock: Coordinator (replaces real RLix coordinator for sync_base_weights calls)
+# ---------------------------------------------------------------------------
+
+
+class MockCoordinator:
+    """Returns empty active_ranks so _after_training completes without side-effects."""
+
+    def sync_base_weights_to_active(self) -> list:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Mock: Scheduler (replaces real RLix scheduler Ray actor)
 # ---------------------------------------------------------------------------
 
@@ -386,8 +413,8 @@ def _make_test_pipeline(
     p._pre_activation_ranks = set()
     p._active_dp_ranks = set()
     p._cache_ready_step = initial_version
-    p._policy = None
-    p._coordinator_handle = None
+    p._policy = _MockRemoteProxy(MockPolicy())
+    p._coordinator_handle = _MockRemoteProxy(MockCoordinator())
 
     # RLix scheduler (used by NemoRLRLixHooks via _request_cluster_gpus)
     p._rlix_scheduler = _scheduler
@@ -877,11 +904,11 @@ class TestMinimalIntegrationFlow:
             # rank 1 must be active again
             assert 1 in vllm.active_dp_ranks, \
                 "rank 1 must be active after expand"
-            # weight version must have incremented exactly once
-            assert pipeline._current_weight_version == 1, \
-                "weight_version must be 1 after one expand cycle"
-            # collector must know the new version BEFORE routing was activated
-            assert collector.weight_version == 1, \
+            # weight version = _cache_ready_step = step (no bump on expand, same cache)
+            assert pipeline._current_weight_version == 0, \
+                "weight_version must be 0 after step=0 (version = cache-producing step)"
+            # collector must know the version BEFORE routing was activated
+            assert collector.weight_version == 0, \
                 "collector version must match pipeline version after expand"
             # no stale ranks left in pre-activation limbo
             assert pipeline._pre_activation_ranks == set(), \
@@ -911,9 +938,9 @@ class TestMinimalIntegrationFlow:
                 # Scheduler expands
                 pipeline.resize_infer(dp_ranks_to_remove=[], dp_ranks_to_add=[1])
 
-        # Two expand cycles → version = 2
-        assert pipeline._current_weight_version == 2
-        assert collector.weight_version == 2
+        # Two expand cycles: step=0 → version=0, step=1 → version=1 (no bump on expand)
+        assert pipeline._current_weight_version == 1
+        assert collector.weight_version == 1
         # Scheduler was called twice for each side
         assert len(sched.request_calls) == 2
         assert len(sched.release_calls) == 2
@@ -947,7 +974,7 @@ class TestMinimalIntegrationFlow:
         with patch_ray_get():
             pipeline._expand_workers(dp_ranks_to_add=[1])
 
-        # Now rank 1 is active and version is 1
-        assert pipeline._current_weight_version == 1
+        # Now rank 1 is active; version = _cache_ready_step = 0 (no bump on expand)
+        assert pipeline._current_weight_version == 0
         assert 1 in vllm.active_dp_ranks
         assert pipeline._pre_activation_ranks == set()

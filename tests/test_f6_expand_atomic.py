@@ -331,16 +331,16 @@ class TestF6ExpandAtomicHappyPath:
         assert "mark_inactive([1, 2])" in idx
         assert "wake_up_partial([1, 2])" in idx
         assert "sync_selected_workers([1, 2])" in idx
-        assert "set_weight_version(1)" in idx
+        assert "set_weight_version(0)" in idx  # no bump: expand reuses same cache as active refresh
         assert "activate_dp_ranks([1, 2])" in idx
 
         assert idx["mark_inactive([1, 2])"] < idx["wake_up_partial([1, 2])"]
         assert idx["wake_up_partial([1, 2])"] < idx["sync_selected_workers([1, 2])"]
-        assert idx["sync_selected_workers([1, 2])"] < idx["set_weight_version(1)"]
-        assert idx["set_weight_version(1)"] < idx["activate_dp_ranks([1, 2])"]
+        assert idx["sync_selected_workers([1, 2])"] < idx["set_weight_version(0)"]
+        assert idx["set_weight_version(0)"] < idx["activate_dp_ranks([1, 2])"]
 
     def test_weight_version_incremented(self):
-        """_current_weight_version must increase by exactly 1."""
+        """_current_weight_version stays at _cache_ready_step — expand does not bump (spec F6 no-bump)."""
         vllm = MockVLLMGeneration(dp_size=4)
         svc = MockModelUpdateService()
         collector = MockTrajectoryCollector(fail_on_set_version=False)
@@ -348,8 +348,8 @@ class TestF6ExpandAtomicHappyPath:
 
         patched_expand(pipeline, dp_ranks=[0])
 
-        assert pipeline._current_weight_version == 6
-        assert collector.weight_version == 6
+        assert pipeline._current_weight_version == 5  # same cache → same version
+        assert collector.weight_version == 5
 
     def test_active_dp_ranks_updated(self):
         """_active_dp_ranks must contain the expanded ranks after success."""
@@ -535,21 +535,26 @@ class TestF6ExpandMultipleSteps:
     """Verify version increments correctly across multiple expand cycles."""
 
     def test_version_increments_each_step(self):
+        """Two expands from the same cache publish the same version (spec F6 no-bump).
+        Version only advances when a new training step completes and _cache_ready_step advances."""
         vllm = MockVLLMGeneration(dp_size=4)
         vllm.active_dp_ranks = set()
         svc = MockModelUpdateService()
         collector = MockTrajectoryCollector()
         pipeline = _make_pipeline_with_refs(vllm=vllm, svc=svc, collector=collector, initial_version=0)
 
-        # First expand: ranks [0, 1]
+        # First expand: ranks [0, 1] — publishes _cache_ready_step = 0
         patched_expand(pipeline, dp_ranks=[0, 1])
+        assert pipeline._current_weight_version == 0  # no bump: same cache
+        assert collector.weight_version == 0
+
+        # Simulate next training step advancing cache_ready_step
+        pipeline._cache_ready_step = 1
+
+        # Second expand: ranks [2, 3] — now publishes _cache_ready_step = 1
+        patched_expand(pipeline, dp_ranks=[2, 3])
         assert pipeline._current_weight_version == 1
         assert collector.weight_version == 1
-
-        # Second expand: ranks [2, 3]
-        patched_expand(pipeline, dp_ranks=[2, 3])
-        assert pipeline._current_weight_version == 2
-        assert collector.weight_version == 2
 
         assert pipeline._active_dp_ranks == {0, 1, 2, 3}
 
