@@ -30,6 +30,13 @@ class ClusterAllocation:
     dp_rank_to_gpus: Dict[int, List[int]] = field(default_factory=dict)
     global_step: Optional[int] = None
     timestamp: Optional[float] = None
+    # Most recent ``step_target_estimate`` supplied with a request that
+    # produced or refreshed this allocation. Persists across cycles so the
+    # gap-ratio planner can size a GENERATION cluster whose engines were
+    # transiently shrunk to ``active_dp_ranks=set()`` (e.g. by a peer's
+    # INITIALIZATION preempt or by ACTOR_TRAINING) and now hold neither
+    # a pending request nor any progress reports.
+    step_target_estimate: Optional[float] = None
 
 
 class ValidationError(RuntimeError):

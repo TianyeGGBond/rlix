@@ -408,6 +408,25 @@ class SchedulerImpl:
         """Return True if the bucket for ``priority`` contains a pending request for ``cluster_id``."""
         return any(pending.request.cluster_id == cluster_id for pending in self._state.pending_bucket(priority))
 
+    def _lookup_pending_step_target_estimate_locked(
+        self, *, cluster_id: str, priority: Priority
+    ) -> Optional[float]:
+        """Return the pending request's ``step_target_estimate`` if any.
+
+        Used at allocation commit time to snapshot the estimate onto the
+        new/refreshed ``ClusterAllocation``; lets the gap-ratio planner
+        re-grant a GENERATION cluster across cycles after the pending
+        request has been consumed by ``_signal_pending_request``.
+        """
+        for pending in self._state.pending_bucket(priority):
+            if pending.request.cluster_id != cluster_id:
+                continue
+            estimate = pending.step_target_estimate
+            if estimate is None:
+                return None
+            return float(int(estimate))
+        return None
+
     async def register_pipeline_topology(
         self,
         *,
@@ -1516,12 +1535,22 @@ class SchedulerImpl:
             sorted_gpus = sorted(signal_op.gpus_to_allocate)
             dp_rank_to_gpus = build_dp_rank_mapping(sorted_gpus, tp_size)
             active_dp_ranks = set(dp_rank_to_gpus.keys()) if is_generation_cluster(signal_op.cluster_id) else set()
+            # For GENERATION clusters, snapshot the pending request's
+            # step_target_estimate onto the allocation so the gap-ratio
+            # planner can size the cluster on subsequent cycles even
+            # after the pending request has been popped from the bucket.
+            step_target_estimate: Optional[float] = None
+            if priority == Priority.GENERATION:
+                step_target_estimate = self._lookup_pending_step_target_estimate_locked(
+                    cluster_id=signal_op.cluster_id, priority=priority
+                )
             allocation = ClusterAllocation(
                 cluster_id=signal_op.cluster_id,
                 gpu_ids=sorted_gpus,
                 priority=priority,
                 active_dp_ranks=active_dp_ranks,
                 dp_rank_to_gpus=dp_rank_to_gpus,
+                step_target_estimate=step_target_estimate,
             )
             self._state.idle_gpus -= gpu_set
             self._state.active_allocations[signal_op.cluster_id] = allocation
@@ -1585,6 +1614,14 @@ class SchedulerImpl:
                 )
                 continue
             alloc = self._state.active_allocations.get(alloc_op.cluster_id)
+            # If a pending GENERATION request fed this expand, snapshot its
+            # step_target_estimate onto the allocation. Persisting it lets
+            # the gap-ratio planner re-grant after a transient shrink to
+            # active_dp_ranks=set() even when no new pending exists and no
+            # progress reports have been submitted yet.
+            pending_step_target_estimate = self._lookup_pending_step_target_estimate_locked(
+                cluster_id=alloc_op.cluster_id, priority=Priority.GENERATION
+            )
             if alloc is None:
                 updated_alloc = ClusterAllocation(
                     cluster_id=alloc_op.cluster_id,
@@ -1592,6 +1629,7 @@ class SchedulerImpl:
                     priority=Priority.GENERATION,
                     active_dp_ranks=set(dp_rank_to_gpus_to_add.keys()),
                     dp_rank_to_gpus=dict(dp_rank_to_gpus_to_add),
+                    step_target_estimate=pending_step_target_estimate,
                 )
                 self._state.idle_gpus -= gpu_set
                 self._state.active_allocations[alloc_op.cluster_id] = updated_alloc
@@ -1604,6 +1642,11 @@ class SchedulerImpl:
                 alloc.dp_rank_to_gpus = updated_dp_rank_to_gpus
                 alloc.active_dp_ranks = updated_active_dp_ranks
                 alloc.gpu_ids = updated_gpu_ids
+                # Refresh only when the current cycle carried a new pending
+                # request — never overwrite a previously-recorded estimate
+                # with None during a passive expand (e.g. gap-ratio re-grant).
+                if pending_step_target_estimate is not None:
+                    alloc.step_target_estimate = pending_step_target_estimate
             self._tracer.trace_active_gpus_update(num_gpus=self._num_gpus, idle_gpu_count=len(self._state.idle_gpus))
             # GPU Tracing: proactive expand trace opens already happened in _execute_resize_calls
             # (right after expand RPCs completed, before this state commit).
