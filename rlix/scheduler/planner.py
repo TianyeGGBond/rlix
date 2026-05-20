@@ -16,7 +16,6 @@ from rlix.protocol.types import GENERATION_CLUSTER_NAME, Priority
 from rlix.scheduler.types import (
     ClusterAllocation,
     ExecutionPlan,
-    PendingRequest,
     SchedGuidedAllocationOp,
     SchedGuidedShrinkOp,
     is_generation_cluster,
@@ -61,32 +60,6 @@ class _GapRatioPipelineState:
     existing_ratio: float = 0.0
     gap: float = 0.0
     target_gpu_count: int = 0
-
-
-def has_pending_generation_request(
-    pending_bucket_gen: List[PendingRequest],
-    cluster_id: str,
-) -> bool:
-    """Return True if the GENERATION priority bucket has a pending request for ``cluster_id``."""
-    return any(p.request.cluster_id == cluster_id for p in pending_bucket_gen)
-
-
-def get_pending_generation_step_target_estimate(
-    pending_bucket_gen: List[PendingRequest],
-    cluster_id: str,
-) -> Optional[float]:
-    """Return the pending GENERATION request's estimated step target, if any."""
-    for pending in pending_bucket_gen:
-        if pending.request.cluster_id != cluster_id:
-            continue
-        estimate = pending.step_target_estimate
-        if estimate is None:
-            return None
-        estimate_int = int(estimate)
-        if estimate_int <= 0:
-            return None
-        return float(estimate_int)
-    return None
 
 
 def snapshot_generation_dp_workers(
@@ -170,7 +143,7 @@ def plan_generation_gap_ratio(
     idle_gpus: Set[int],
     pipeline_registry: Dict[str, Dict[str, Any]],
     active_allocations: Dict[str, ClusterAllocation],
-    pending_bucket_gen: List[PendingRequest],
+    rollout_open_pipelines: Dict[str, Optional[int]],
     progress_totals_fn: Callable[..., Tuple[float, float]],
     epsilon: float = 0.0,
 ) -> Set[int]:
@@ -205,7 +178,7 @@ def plan_generation_gap_ratio(
     def _receiver_eligible(state: _GapRatioPipelineState) -> bool:
         if state.cluster_id in plan.clusters_to_remove:
             return False
-        if has_pending_generation_request(pending_bucket_gen, state.cluster_id):
+        if state.pipeline_id in rollout_open_pipelines:
             return True
         return bool(state.active_dp_workers) or state.cluster_id in active_allocations
 
@@ -219,23 +192,27 @@ def plan_generation_gap_ratio(
         if tp_size <= 0:
             raise ValueError(f"pipeline_id={pipeline_id!r} has invalid actor_infer tp_size={tp_size}")
 
-        has_pending = has_pending_generation_request(pending_bucket_gen, cluster_id)
+        has_pending = pipeline_id in rollout_open_pipelines
         # Derive remaining from completed metric; same derivation path as
         # background rebalance to keep demand semantics consistent.
         remaining, step_target = progress_totals_fn(pipeline_id=pipeline_id)
         if step_target <= 0.0:
-            step_target_estimate = get_pending_generation_step_target_estimate(pending_bucket_gen, cluster_id)
-            if step_target_estimate is None:
+            if has_pending:
+                raw_estimate = rollout_open_pipelines.get(pipeline_id)
+                step_target_estimate = float(raw_estimate) if raw_estimate is not None and int(raw_estimate) > 0 else None
+                if step_target_estimate is None:
+                    continue
+                remaining = float(step_target_estimate)
+                step_target = float(step_target_estimate)
+                percent_remaining = 1.0
+            else:
                 continue
-            remaining = float(step_target_estimate)
-            step_target = float(step_target_estimate)
-            percent_remaining = 1.0
         else:
             percent_remaining = remaining / step_target if step_target > 0 else 0.0
 
         if has_pending:
-            # Inflate demand so a pipeline that hasn't started generating yet (remaining == 0)
-            # still receives a non-zero weight and gets allocated at least one DP worker.
+            # Inflate demand in the bootstrap window (request sent, no progress yet)
+            # so the pipeline gets at least one DP worker allocated before generation starts.
             remaining += step_target
             percent_remaining = remaining / step_target if step_target > 0 else 0.0
 
@@ -395,7 +372,7 @@ def plan_generation_gap_ratio(
 
         # Validate receiver eligibility BEFORE committing donor mutations.
         # Previous ordering applied donor shrinks first, leaving them unrolled if this guard fired.
-        has_pending_request = has_pending_generation_request(pending_bucket_gen, state.cluster_id)
+        has_pending_request = state.pipeline_id in rollout_open_pipelines
         if state.cluster_id in plan.clusters_to_remove:
             return False
         if not has_pending_request and state.cluster_id not in active_allocations:

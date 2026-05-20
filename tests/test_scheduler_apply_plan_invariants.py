@@ -117,6 +117,27 @@ def test_generation_expand_skips_stale_op_after_unregister(monkeypatch: pytest.M
     assert allocation.dp_rank_to_gpus == {0: [4, 5]}
 
 
+def test_planned_generation_release_preserves_rollout_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    scheduler_module, protocol_types, scheduler_types = _load_scheduler_modules(monkeypatch)
+
+    scheduler = scheduler_module.SchedulerImpl()
+    pipeline_id = "ft_abc123def456"
+    cluster_id = f"{pipeline_id}_actor_infer"
+    scheduler._state.rollout_open_pipelines[pipeline_id] = 8
+    req = scheduler_types.PendingPlannedReleaseRequest(
+        cluster_id=cluster_id,
+        dp_ranks_to_remove=[0],
+        event=asyncio.Event(),
+    )
+    scheduler._state.pending_planned_release_requests[cluster_id] = req
+
+    scheduler._apply_plan_and_signal(scheduler_types.ExecutionPlan())
+
+    assert scheduler._state.rollout_open_pipelines[pipeline_id] == 8
+    assert cluster_id not in scheduler._state.pending_planned_release_requests
+    assert req.event.is_set()
+
+
 def test_commit_skips_stale_signal_op_after_unregister(monkeypatch: pytest.MonkeyPatch) -> None:
     """True unregister race: pipeline gone, waiter already removed → skip with warning."""
     scheduler_module, protocol_types, scheduler_types = _load_scheduler_modules(monkeypatch)
