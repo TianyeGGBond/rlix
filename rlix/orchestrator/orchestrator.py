@@ -129,6 +129,19 @@ def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None) -> An
         name=SCHEDULER_ACTOR_NAME,
         namespace=RLIX_NAMESPACE,
         scheduling_strategy=strategy,
+        # Stays at max_restarts=0 by design: the scheduler owns in-memory
+        # state (active_allocations, pipeline_registry, _topology_ready,
+        # the _central_scheduling_loop asyncio task) seeded only by
+        # ``SchedulerImpl.initialize``. A Ray-driven actor restart would
+        # create a fresh process with _topology_ready never set and
+        # active_allocations empty — subsequent request_gpus would block
+        # on _wait_topology_ready until timeout, OR a future code path
+        # that bypassed the gate could double-allocate GPUs the scheduler
+        # has forgotten. The Ray ``'Worker' has no attribute core_worker``
+        # race observed at worker.py:1039 IS real on this hardware/Ray
+        # 2.55.1, but masking it with restarts is worse than the original
+        # hang. See ``rlix-miles-4ppl-full-overlap-run/debug-implementation-log.md``
+        # Layer 8 for the trace.
         max_restarts=0,
         max_task_retries=0,
         runtime_env=scheduler_runtime_env,
