@@ -144,15 +144,9 @@ def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None) -> An
         # Layer 8 for the trace.
         max_restarts=0,
         max_task_retries=0,
-        # max_concurrency=4 mitigates the same Ray-2.55.1 worker.py:1039
-        # ``'Worker' object has no attribute 'core_worker'`` race observed on
-        # the Orchestrator and MilesCoordinator (see client.py:88 and
-        # miles_coordinator.py:602). The scheduler is hit by 2 pipelines ×
-        # (request_gpus / notify_release_gpus / report_progress /
-        # clear_progress) plus the central scheduling loop's planner ticks;
-        # the default single-threaded actor loop serializes these and races
-        # the Ray task dispatcher's internal core_worker lifecycle. 4 matches
-        # the per-pipeline fan-out under the 4-GPU 2-pipeline topology.
+        # Mitigates (does not eliminate) the Ray-2.55.1 worker.py:1039
+        # core_worker race; see
+        # docs/internal/4gpu-2ppl-rollout2-hang-fix.md.
         max_concurrency=4,
         runtime_env=scheduler_runtime_env,
         get_if_exists=True,

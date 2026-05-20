@@ -834,29 +834,14 @@ class MilesPipeline:
         return self._release_train_only(step)
 
     def signal_rollout_demand(self, rollout_id: int, step_target: int) -> None:
-        """Pre-signal scheduler that this pipeline has fresh demand for the
-        upcoming rollout, so the gap-ratio planner can wake actor_infer
-        engines BEFORE the rollout function's ``begin_progress_batch`` fires.
+        """Pre-stamp scheduler with fresh GENERATION demand for the upcoming
+        rollout so gap-ratio wakes actor_infer engines BEFORE the rollout
+        function's ``begin_progress_batch`` fires.
 
-        Mirrors rlix.pipeline.full_finetune_pipeline Phase 4.5
-        (``notify_release_then_request_gpus`` at
-        ``full_finetune_pipeline.py:696``), which re-requests ``actor_infer``
-        at GENERATION priority with a fresh ``step_target_estimate`` per
-        rollout. miles cannot tear down + re-request ``actor_infer`` between
-        rollouts (would shut SGLang engines mid-loop), so instead we publish
-        a synthetic ``new_batch=True`` progress report — same "fresh demand"
-        signal to gap-ratio planning, without the engine teardown.
-
-        Without this, when both pipelines fully release between rollouts
-        (``alloc.active_dp_ranks == set()`` — happens after every
-        ``_after_training`` because ``actor_train`` preempts the shared
-        infer GPUs), the first pipeline whose rollout function starts wins
-        the GENERATION budget. The second pipeline's engines only get
-        scheduled when its own ``begin_progress_batch`` fires — by which
-        time the first pipeline already holds all DP workers and the
-        gap-ratio donor-shrink races cause the second pipeline's engine
-        wake to miss the rollout function's first sample dispatch, hanging
-        on ``Warning: No progress for 30.0s. Queue size: 0, Collected: 0/N``.
+        See ``docs/internal/4gpu-2ppl-rollout2-hang-fix.md`` for the
+        rollout-boundary chicken-and-egg this resolves and why a synthetic
+        ``new_batch=True`` ProgressReport (vs rlix's release-then-request
+        pattern) is used.
         """
         if not self._initialized:
             return
