@@ -47,7 +47,6 @@ from rlix.protocol.types import (
     ACTOR_TRAIN_CLUSTER_NAME,
     GENERATION_CLUSTER_NAME,
     Priority,
-    ProgressReport,
     RLIX_NAMESPACE,
     SCHEDULER_ACTOR_NAME,
     get_pipeline_namespace,
@@ -838,25 +837,16 @@ class MilesPipeline:
         upcoming rollout, so the gap-ratio planner can wake actor_infer
         engines BEFORE the rollout function's ``begin_progress_batch`` fires.
 
-        Mirrors rlix.pipeline.full_finetune_pipeline Phase 4.5
-        (``notify_release_then_request_gpus`` at
-        ``full_finetune_pipeline.py:696``), which re-requests ``actor_infer``
-        at GENERATION priority with a fresh ``step_target_estimate`` per
-        rollout. miles cannot tear down + re-request ``actor_infer`` between
-        rollouts (would shut SGLang engines mid-loop), so instead we publish
-        a synthetic ``new_batch=True`` progress report — same "fresh demand"
-        signal to gap-ratio planning, without the engine teardown.
-
-        Without this, when both pipelines fully release between rollouts
-        (``alloc.active_dp_ranks == set()`` — happens after every
-        ``_after_training`` because ``actor_train`` preempts the shared
-        infer GPUs), the first pipeline whose rollout function starts wins
-        the GENERATION budget. The second pipeline's engines only get
-        scheduled when its own ``begin_progress_batch`` fires — by which
-        time the first pipeline already holds all DP workers and the
-        gap-ratio donor-shrink races cause the second pipeline's engine
-        wake to miss the rollout function's first sample dispatch, hanging
-        on ``Warning: No progress for 30.0s. Queue size: 0, Collected: 0/N``.
+        Calls ``scheduler.request_gpus(actor_infer, GENERATION,
+        step_target_estimate=N)`` — writes
+        ``rollout_open_pipelines[pipeline_id] = N`` on the durable
+        registry (dfd53f3). When the existing GENERATION allocation
+        still has ``active_dp_ranks``, the RPC short-circuits and
+        returns the existing GPU list. When ``active_dp_ranks == set()``
+        (post-``_after_training`` rollout boundary), it enqueues a
+        pending request and blocks until gap-ratio activates at least
+        one DP worker — giving the rollout function a guaranteed-awake
+        engine for its first sample dispatch.
         """
         if not self._initialized:
             return
@@ -867,21 +857,13 @@ class MilesPipeline:
             return
         try:
             ray.get(
-                scheduler.report_progress.remote(
-                    ProgressReport(
-                        pipeline_id=self._pipeline_id,
-                        step_target_trajectories=int(step_target),
-                        fifo_timestamp=time.time(),
-                        metrics={
-                            "mode": "aggregated",
-                            "collected": 0,
-                            "completed": 0,
-                            "bucket": 0,
-                            "new_batch": True,
-                        },
-                    )
+                scheduler.request_gpus.remote(
+                    cluster_id=self._actor_infer_cluster_id,
+                    priority=Priority.GENERATION,
+                    global_step=int(rollout_id),
+                    step_target_estimate=int(step_target),
                 ),
-                timeout=10.0,
+                timeout=60.0,
             )
             logger.info(
                 "[MilesPipeline] signal_rollout_demand rollout_id=%d step_target=%d pipeline_id=%s",
