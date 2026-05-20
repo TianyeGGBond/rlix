@@ -47,6 +47,7 @@ from rlix.protocol.types import (
     ACTOR_TRAIN_CLUSTER_NAME,
     GENERATION_CLUSTER_NAME,
     Priority,
+    ProgressReport,
     RLIX_NAMESPACE,
     SCHEDULER_ACTOR_NAME,
     get_pipeline_namespace,
@@ -831,6 +832,66 @@ class MilesPipeline:
 
     def release_train_only(self, step: int) -> None:
         return self._release_train_only(step)
+
+    def signal_rollout_demand(self, rollout_id: int, step_target: int) -> None:
+        """Pre-signal scheduler that this pipeline has fresh demand for the
+        upcoming rollout, so the gap-ratio planner can wake actor_infer
+        engines BEFORE the rollout function's ``begin_progress_batch`` fires.
+
+        Mirrors rlix.pipeline.full_finetune_pipeline Phase 4.5
+        (``notify_release_then_request_gpus`` at
+        ``full_finetune_pipeline.py:696``), which re-requests ``actor_infer``
+        at GENERATION priority with a fresh ``step_target_estimate`` per
+        rollout. miles cannot tear down + re-request ``actor_infer`` between
+        rollouts (would shut SGLang engines mid-loop), so instead we publish
+        a synthetic ``new_batch=True`` progress report — same "fresh demand"
+        signal to gap-ratio planning, without the engine teardown.
+
+        Without this, when both pipelines fully release between rollouts
+        (``alloc.active_dp_ranks == set()`` — happens after every
+        ``_after_training`` because ``actor_train`` preempts the shared
+        infer GPUs), the first pipeline whose rollout function starts wins
+        the GENERATION budget. The second pipeline's engines only get
+        scheduled when its own ``begin_progress_batch`` fires — by which
+        time the first pipeline already holds all DP workers and the
+        gap-ratio donor-shrink races cause the second pipeline's engine
+        wake to miss the rollout function's first sample dispatch, hanging
+        on ``Warning: No progress for 30.0s. Queue size: 0, Collected: 0/N``.
+        """
+        if not self._initialized:
+            return
+        if step_target <= 0:
+            return
+        scheduler = self._get_scheduler_handle(silent_on_missing=True)
+        if scheduler is None:
+            return
+        try:
+            ray.get(
+                scheduler.report_progress.remote(
+                    ProgressReport(
+                        pipeline_id=self._pipeline_id,
+                        step_target_trajectories=int(step_target),
+                        fifo_timestamp=time.time(),
+                        metrics={
+                            "mode": "aggregated",
+                            "collected": 0,
+                            "completed": 0,
+                            "bucket": 0,
+                            "new_batch": True,
+                        },
+                    )
+                ),
+                timeout=10.0,
+            )
+            logger.info(
+                "[MilesPipeline] signal_rollout_demand rollout_id=%d step_target=%d pipeline_id=%s",
+                int(rollout_id), int(step_target), self._pipeline_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "signal_rollout_demand(rollout_id=%d) failed: %r",
+                int(rollout_id), exc,
+            )
 
     # ------------------------------------------------------------------
     # Helpers

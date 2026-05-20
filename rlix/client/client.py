@@ -84,6 +84,17 @@ def _get_or_create_orchestrator(opts: ConnectOptions) -> Any:
                     # mask it with a half-recovered state.
                     max_restarts=0,
                     max_task_retries=0,
+                    # max_concurrency=4 mitigates the Ray-2.55.1 worker.py:1039
+                    # ``'Worker' object has no attribute 'core_worker'`` race
+                    # that fires when concurrent inbound RPCs (register_pipeline
+                    # / admit_pipeline / unregister + the per-rollout
+                    # signal_rollout_demand → scheduler.report_progress chain)
+                    # contend on the default single-threaded actor task loop.
+                    # The same fix is applied to MilesCoordinator
+                    # (rlix/pipeline/miles_coordinator.py:602). 4 matches the
+                    # number of cross-actor surfaces that can fire in parallel
+                    # under the 2-pipeline 4-GPU topology.
+                    max_concurrency=4,
                     runtime_env=runtime_env,
                 )
                 .remote(env_vars=opts.env_vars)
