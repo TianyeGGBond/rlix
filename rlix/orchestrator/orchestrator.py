@@ -129,8 +129,17 @@ def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None) -> An
         name=SCHEDULER_ACTOR_NAME,
         namespace=RLIX_NAMESPACE,
         scheduling_strategy=strategy,
-        max_restarts=0,
-        max_task_retries=0,
+        # Auto-restart on Ray's internal worker race
+        # ("'Worker' object has no attribute 'core_worker'", a Ray library
+        # bug at ray._private.worker.main_loop line 1039). Without restart,
+        # one transient Ray RPC-handler glitch between rollouts cascades:
+        # the scheduler worker process dies, the in-flight ``request_gpus``
+        # raises ActorDiedError, and the whole training loop halts.
+        # max_restarts=2 gives a small budget — enough to survive the
+        # ~per-rollout probability of the race, not enough to mask a real
+        # logic bug that would crash the scheduler repeatedly.
+        max_restarts=2,
+        max_task_retries=2,
         runtime_env=scheduler_runtime_env,
         get_if_exists=True,
     ).remote()

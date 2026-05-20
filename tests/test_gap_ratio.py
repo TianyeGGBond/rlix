@@ -694,3 +694,120 @@ def test_alloc_step_target_estimate_fallback_ignored_when_pending_or_progress_pr
     # Pipeline still gets the worker; we only care that no exception was raised
     # and the planner accepted the pending estimate over the stale alloc value.
     assert len(plan.sched_guided_allocation_ops) == 1
+
+
+def test_fallback_no_expand_when_no_peer_has_fresh_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a fallback'd GENERATION cluster must NOT expand into idle GPUs
+    when no peer pipeline has a fresh signal (pending request or progress).
+
+    The post-``_after_training`` scheduling cycle releases ACTOR_TRAINING and
+    immediately re-enters the planner. Under miles' ``MILES_SKIP_TMS_PAUSE=1``
+    workaround on blackwell/cu12.9, the just-released GPUs still hold ~5–10 GB
+    of train residual that SGLang's ``resume_memory_occupation`` would collide
+    with. Both pipelines being fallback-only (no pending, no progress) is the
+    signal that no peer needs the budget — there is nobody to compete with, so
+    the fallback's "prevent peer-starvation" job doesn't apply and it should
+    stay at zero active workers.
+    """
+    gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
+
+    ExecutionPlan = scheduler_types.ExecutionPlan
+    ClusterAllocation = scheduler_types.ClusterAllocation
+    Priority = protocol_types.Priority
+
+    plan = ExecutionPlan()
+
+    p1_id = "ft_dddddddddddd"
+    p1_cluster = f"{p1_id}_actor_infer"
+    p2_id = "ft_eeeeeeeeeeee"
+    p2_cluster = f"{p2_id}_actor_infer"
+
+    _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
+    active_dp_workers = {p1_id: [], p2_id: []}
+    inactive_dp_workers = {
+        p1_id: [
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=1, gpu_ids=[1]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=2, gpu_ids=[2]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=3, gpu_ids=[3]),
+        ],
+        p2_id: [
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=1, gpu_ids=[1]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=2, gpu_ids=[2]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=3, gpu_ids=[3]),
+        ],
+    }
+    pipeline_registry = {
+        p1_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1, 2, 3],
+                    "max_dp_workers": 4,
+                },
+            },
+            "admitted": True,
+        },
+        p2_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1, 2, 3],
+                    "max_dp_workers": 4,
+                },
+            },
+            "admitted": True,
+        },
+    }
+
+    # Both pipelines: alloc at GENERATION, active=set() (train just preempted
+    # them), step_target_estimate snapshotted earlier. No pending requests.
+    active_allocations = {
+        p1_cluster: ClusterAllocation(
+            cluster_id=p1_cluster,
+            gpu_ids=[],
+            priority=Priority.GENERATION,
+            active_dp_ranks=set(),
+            dp_rank_to_gpus={},
+            step_target_estimate=8.0,
+        ),
+        p2_cluster: ClusterAllocation(
+            cluster_id=p2_cluster,
+            gpu_ids=[],
+            priority=Priority.GENERATION,
+            active_dp_ranks=set(),
+            dp_rank_to_gpus={},
+            step_target_estimate=8.0,
+        ),
+    }
+
+    # No pending GEN requests anywhere — both pipelines are fallback-only.
+    pending_bucket_gen: list = []
+
+    def progress_totals_fn(*, pipeline_id):
+        return (0.0, 0.0)
+
+    gap_ratio_mod.plan_generation_gap_ratio(
+        plan,
+        active_dp_workers=active_dp_workers,
+        inactive_dp_workers=inactive_dp_workers,
+        non_gen_reserved_gpus=set(),
+        idle_gpus={0, 1, 2, 3},
+        pipeline_registry=pipeline_registry,
+        active_allocations=active_allocations,
+        pending_bucket_gen=pending_bucket_gen,
+        progress_totals_fn=progress_totals_fn,
+    )
+
+    # No activation: both pipelines are fallback, no peer has fresh signal,
+    # so no engine wake is issued — the trailing OOM on blackwell/cu12.9 is
+    # avoided.
+    assert plan.sched_guided_allocation_ops == [], (
+        "Fallback pipelines must not expand when no peer has a fresh signal: "
+        f"got {plan.sched_guided_allocation_ops!r}"
+    )

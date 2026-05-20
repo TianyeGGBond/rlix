@@ -482,12 +482,25 @@ def plan_generation_gap_ratio(
                 return None
             return state.gap / state.target_ratio
 
+        # A fallback pipeline (no fresh GENERATION pending, no progress reports)
+        # only needs to be activated when a peer with a fresh signal is competing
+        # for the same budget — that is the deadlock case the fallback was
+        # introduced to break. When no peer has fresh demand, the fallback should
+        # NOT expand, because the just-released GPUs may still hold residual VRAM
+        # from a prior non-GEN allocation that has not physically freed (e.g. a
+        # miles train actor under MILES_SKIP_TMS_PAUSE=1 on blackwell/cu12.9
+        # whose ``offload()`` is a no-op). Eager fallback expansion in that
+        # window OOMs SGLang's ``resume_memory_occupation`` call.
+        has_fresh_signal = any(
+            (not p.is_fallback) for p in pipeline_states if _receiver_eligible(p)
+        )
         acceptors: List[_GapRatioPipelineState] = [
             p
             for p in pipeline_states
             if p.gap > epsilon
             and _receiver_eligible(p)
             and (len(p.active_dp_workers) * p.tp_size) < p.target_gpu_count
+            and (not p.is_fallback or has_fresh_signal)
         ]
         acceptors_with_norm_gap = [(_normalized_gap(p), p) for p in acceptors]
         acceptors_with_norm_gap = [(ng, p) for ng, p in acceptors_with_norm_gap if ng is not None]

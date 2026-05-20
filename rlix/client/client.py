@@ -73,8 +73,13 @@ def _get_or_create_orchestrator(opts: ConnectOptions) -> Any:
                     name=ORCHESTRATOR_ACTOR_NAME,
                     namespace=RLIX_NAMESPACE,
                     scheduling_strategy=strategy,
-                    max_restarts=0,
-                    max_task_retries=0,
+                    # Mirror the scheduler's restart budget. Ray's internal
+                    # worker race ("'Worker' has no attribute 'core_worker'"
+                    # at main_loop line 1039) reliably kills the orchestrator
+                    # worker once per training loop on this hardware; without
+                    # restart, it cascade-kills the scheduler too.
+                    max_restarts=2,
+                    max_task_retries=2,
                     runtime_env=runtime_env,
                 )
                 .remote(env_vars=opts.env_vars)

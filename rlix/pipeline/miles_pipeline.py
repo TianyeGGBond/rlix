@@ -369,6 +369,23 @@ class MilesPipeline:
         self._run_async(self._train_group.set_rollout_manager(self._rollout_manager))
         logger.info("[MilesPipeline] phaseB step4b: set_rollout_manager done")
 
+        # Inject the RLix progress hook into the rollout manager. Without
+        # this, every ``begin_progress_batch`` / ``bump_completed`` from the
+        # rollout function lands on a :class:`NoOpRLixHooks` and the central
+        # scheduler never sees rollout demand — gap-ratio then has no signal
+        # to wake engines for rollout N+1 after the prior ``_after_training``
+        # released ``actor_train``, and the loop hangs on
+        # ``await rollout_data`` indefinitely.
+        from rlix.pipeline.miles_hooks import MilesRLixHooks
+
+        rlix_hooks = MilesRLixHooks(
+            coordinator_handle=self._coordinator_handle,
+            pipeline_id=self._pipeline_id,
+        )
+        logger.info("[MilesPipeline] phaseB step4c: set_rlix_hooks start")
+        ray.get(self._rollout_manager.set_rlix_hooks.remote(rlix_hooks))
+        logger.info("[MilesPipeline] phaseB step4c: set_rlix_hooks done")
+
         # F107 / X2: register handles. F22 (relaxed): in M11.1 single-pipeline
         # this happens after the manager exists; the dual-pipeline-shell-init
         # F22 ordering is deferred.
