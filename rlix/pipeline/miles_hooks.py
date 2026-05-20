@@ -70,6 +70,12 @@ class MilesRLixHooks:
         self._open_target_weight_version = int(target_weight_version)
         self._step_target_groups = int(step_target_groups)
         self._collected = int(initial_completed)
+        logger.info(
+            "[MilesRLixHooks] begin_progress_batch pipeline_id=%s mode=%s "
+            "target_version=%d step_target_groups=%d initial_completed=%d",
+            self._pipeline_id, self._open_mode,
+            int(target_weight_version), int(step_target_groups), int(initial_completed),
+        )
         self._publish_report(new_batch=True)
 
     def bump_completed(self, *, target_weight_version: int) -> None:
@@ -148,19 +154,29 @@ class MilesRLixHooks:
         try:
             handle = getattr(self._coordinator, "report_progress_from_scheduler", None)
             if handle is None:
-                logger.debug(
-                    "MilesRLixHooks: coordinator has no "
-                    "report_progress_from_scheduler; skipping"
+                logger.warning(
+                    "[MilesRLixHooks] _fire_report: coordinator has no "
+                    "report_progress_from_scheduler; SKIPPING — progress signal lost"
                 )
                 return
             remote = getattr(handle, "remote", None)
+            metrics = report.metrics if isinstance(report.metrics, dict) else {}
+            logger.debug(
+                "[MilesRLixHooks] _fire_report pipeline_id=%s kind=%s "
+                "collected=%s step_target=%d new_batch=%s",
+                self._pipeline_id,
+                metrics.get("kind"),
+                metrics.get("collected"),
+                int(report.step_target_trajectories),
+                bool(metrics.get("new_batch", False)),
+            )
             if remote is not None:
                 remote(report)
             else:
                 handle(report)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "MilesRLixHooks: report_progress_from_scheduler failed: %r", exc
+                "[MilesRLixHooks] _fire_report: report_progress_from_scheduler failed: %r", exc
             )
 
     def _fire_clear(self, *, mode: str, adapter_id: str | None) -> None:

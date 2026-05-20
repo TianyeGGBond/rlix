@@ -503,3 +503,357 @@ def test_snapshot_fails_fast_when_actor_infer_missing(monkeypatch: pytest.Monkey
             pipeline_registry=pipeline_registry,
             active_allocations={},
         )
+
+
+def test_alloc_step_target_estimate_fallback_revives_starved_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a GENERATION cluster with active_dp_ranks=set(), no pending request,
+    and no progress reports must still be picked up by gap-ratio if its allocation
+    carries a ``step_target_estimate`` snapshotted at grant time.
+
+    This is the cross-pipeline full-overlap deadlock: P1 was granted GEN, then
+    transiently shrunk to zero by P2's INITIALIZATION preempt; P2's wakeup
+    re-enters gap-ratio, P1 must still get a share of the budget back.
+    """
+    gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
+
+    ExecutionPlan = scheduler_types.ExecutionPlan
+    ClusterAllocation = scheduler_types.ClusterAllocation
+    Priority = protocol_types.Priority
+    Request = scheduler_types.Request
+    PendingRequest = scheduler_types.PendingRequest
+
+    plan = ExecutionPlan()
+
+    # P1 — starved: GEN alloc exists but has been shrunk to zero, no pending, no progress.
+    p1_id = "ft_aaaaaaaaaaaa"
+    p1_cluster = f"{p1_id}_actor_infer"
+
+    # P2 — fresh pending GEN request (just finished its INIT).
+    p2_id = "ft_bbbbbbbbbbbb"
+    p2_cluster = f"{p2_id}_actor_infer"
+
+    _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
+    active_dp_workers = {p1_id: [], p2_id: []}
+    inactive_dp_workers = {
+        p1_id: [
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=1, gpu_ids=[1]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=2, gpu_ids=[2]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=3, gpu_ids=[3]),
+        ],
+        p2_id: [
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=1, gpu_ids=[1]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=2, gpu_ids=[2]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=3, gpu_ids=[3]),
+        ],
+    }
+
+    pipeline_registry = {
+        p1_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1, 2, 3],
+                    "max_dp_workers": 4,
+                },
+            },
+            "admitted": True,
+        },
+        p2_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1, 2, 3],
+                    "max_dp_workers": 4,
+                },
+            },
+            "admitted": True,
+        },
+    }
+
+    # P1 allocation persists at GENERATION priority but with no active dp_ranks
+    # (peer's INITIALIZATION preempt shrunk all four). The step_target_estimate
+    # was snapshotted at original grant time.
+    active_allocations = {
+        p1_cluster: ClusterAllocation(
+            cluster_id=p1_cluster,
+            gpu_ids=[],
+            priority=Priority.GENERATION,
+            active_dp_ranks=set(),
+            dp_rank_to_gpus={},
+            step_target_estimate=8.0,
+        ),
+    }
+
+    # Only P2 has a pending request.
+    pending_bucket_gen = [
+        PendingRequest(
+            request=Request(cluster_id=p2_cluster, priority=Priority.GENERATION, timestamp=0.0),
+            event=asyncio.Event(),
+            step_target_estimate=8,
+        )
+    ]
+
+    def progress_totals_fn(*, pipeline_id):
+        return (0.0, 0.0)
+
+    remaining_idle = gap_ratio_mod.plan_generation_gap_ratio(
+        plan,
+        active_dp_workers=active_dp_workers,
+        inactive_dp_workers=inactive_dp_workers,
+        non_gen_reserved_gpus=set(),
+        idle_gpus={0, 1, 2, 3},
+        pipeline_registry=pipeline_registry,
+        active_allocations=active_allocations,
+        pending_bucket_gen=pending_bucket_gen,
+        progress_totals_fn=progress_totals_fn,
+    )
+
+    # Must have produced an allocation op for BOTH pipelines. The starved P1
+    # must get at least one DP worker; that is the fix for the full-overlap
+    # deadlock (see runs/run3.log in rlix-miles-4ppl-partial-overlap-run/).
+    cluster_ids = {op.cluster_id for op in plan.sched_guided_allocation_ops}
+    assert p1_cluster in cluster_ids, (
+        "P1 must get a GEN worker back via the alloc.step_target_estimate "
+        "fallback even though it has no pending request and no progress reports"
+    )
+    assert p2_cluster in cluster_ids
+
+    # H3 (review fix): pin the fallback_cap invariant. A regressed cap that
+    # let P1 grab 2+ bundles instead of 1 would silently re-introduce the
+    # Layer-2 OOM (post-train re-expand collides with non-GEN residual).
+    # max(active=0, 1) * tp_size=1 = 1 bundle = exactly one dp_rank for P1.
+    p1_ops = [op for op in plan.sched_guided_allocation_ops if op.cluster_id == p1_cluster]
+    assert len(p1_ops) == 1, f"P1 must produce exactly one allocation op, got {len(p1_ops)}"
+    p1_dp_ranks_added = sum(len(op.dp_rank_to_gpus_to_add) for op in p1_ops)
+    assert p1_dp_ranks_added == 1, (
+        f"P1 fallback must respect cap=max(active=0,1)*tp_size=1; "
+        f"got {p1_dp_ranks_added} dp_ranks added — fallback_cap regressed"
+    )
+
+
+def test_alloc_step_target_estimate_fallback_ignored_when_pending_or_progress_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pending request must take precedence over the alloc snapshot, AND
+    the pipeline must NOT be marked is_fallback in that case.
+
+    H3 review fix: distinguishing pending-vs-alloc-snapshot at the assertion
+    level requires a setup where the two branches produce different planner
+    decisions. With ``is_fallback=False`` (pending path) there is no
+    ``fallback_cap``; with ``is_fallback=True`` (alloc-snapshot path) the cap
+    clamps the target to ``max(active, 1) * tp_size = 1``.
+
+    Setup: 4 inactive workers + 4 idle GPUs + single pipeline.
+    - pending=1 path: target = floor(1.0 * 4 / 1) = 4. Without cap, the
+      planner activates all 4.
+    - alloc-snapshot=999 fallback path: ``fallback_cap = 1``. The planner
+      activates only 1.
+    Asserting the planner activated 4 workers (one op per activation under
+    the iterative loop) pins that the pending estimate won and the fallback
+    flag stayed False.
+    """
+    gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
+
+    ExecutionPlan = scheduler_types.ExecutionPlan
+    ClusterAllocation = scheduler_types.ClusterAllocation
+    Priority = protocol_types.Priority
+    Request = scheduler_types.Request
+    PendingRequest = scheduler_types.PendingRequest
+
+    plan = ExecutionPlan()
+    pid = "ft_cccccccccccc"
+    cluster = f"{pid}_actor_infer"
+
+    _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
+    active_dp_workers = {pid: []}
+    inactive_dp_workers = {
+        pid: [
+            _GapRatioDPWorker(pipeline_id=pid, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=pid, dp_rank=1, gpu_ids=[1]),
+            _GapRatioDPWorker(pipeline_id=pid, dp_rank=2, gpu_ids=[2]),
+            _GapRatioDPWorker(pipeline_id=pid, dp_rank=3, gpu_ids=[3]),
+        ]
+    }
+    pipeline_registry = {
+        pid: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1, 2, 3],
+                    "max_dp_workers": 4,
+                },
+            },
+            "admitted": True,
+        }
+    }
+    # Existing alloc carries a STALE estimate (999) that, if read via the
+    # fallback path, would be capped to 1 bundle. The pending carries a
+    # smaller value (1) but is the source-of-truth signal; under the pending
+    # path the planner activates all 4 workers because the target_ratio is
+    # 1.0 and total_gen_budget_gpus = 4.
+    active_allocations = {
+        cluster: ClusterAllocation(
+            cluster_id=cluster,
+            gpu_ids=[],
+            priority=Priority.GENERATION,
+            step_target_estimate=999.0,
+        ),
+    }
+    pending_bucket_gen = [
+        PendingRequest(
+            request=Request(cluster_id=cluster, priority=Priority.GENERATION, timestamp=0.0),
+            event=asyncio.Event(),
+            step_target_estimate=1,
+        )
+    ]
+
+    def progress_totals_fn(*, pipeline_id):
+        return (0.0, 0.0)
+
+    gap_ratio_mod.plan_generation_gap_ratio(
+        plan,
+        active_dp_workers=active_dp_workers,
+        inactive_dp_workers=inactive_dp_workers,
+        non_gen_reserved_gpus=set(),
+        idle_gpus={0, 1, 2, 3},
+        pipeline_registry=pipeline_registry,
+        active_allocations=active_allocations,
+        pending_bucket_gen=pending_bucket_gen,
+        progress_totals_fn=progress_totals_fn,
+    )
+
+    # Pin the precedence: pending path produces 4 activations; fallback path
+    # (capped at 1) would produce only 1. Anything other than 4 means the
+    # pending estimate did NOT win.
+    total_dp_ranks_added = sum(
+        len(op.dp_rank_to_gpus_to_add) for op in plan.sched_guided_allocation_ops
+    )
+    assert total_dp_ranks_added == 4, (
+        f"Pending estimate must override stale alloc snapshot; expected 4 dp_ranks "
+        f"activated (uncapped pending path), got {total_dp_ranks_added}. If this is "
+        f"1, the planner regressed to the fallback path while a pending was present."
+    )
+
+
+def test_fallback_no_expand_when_no_peer_has_fresh_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a fallback'd GENERATION cluster must NOT expand into idle GPUs
+    when no peer pipeline has a fresh signal (pending request or progress).
+
+    The post-``_after_training`` scheduling cycle releases ACTOR_TRAINING and
+    immediately re-enters the planner. Under miles' ``MILES_SKIP_TMS_PAUSE=1``
+    workaround on blackwell/cu12.9, the just-released GPUs still hold ~5–10 GB
+    of train residual that SGLang's ``resume_memory_occupation`` would collide
+    with. Both pipelines being fallback-only (no pending, no progress) is the
+    signal that no peer needs the budget — there is nobody to compete with, so
+    the fallback's "prevent peer-starvation" job doesn't apply and it should
+    stay at zero active workers.
+    """
+    gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
+
+    ExecutionPlan = scheduler_types.ExecutionPlan
+    ClusterAllocation = scheduler_types.ClusterAllocation
+    Priority = protocol_types.Priority
+
+    plan = ExecutionPlan()
+
+    p1_id = "ft_dddddddddddd"
+    p1_cluster = f"{p1_id}_actor_infer"
+    p2_id = "ft_eeeeeeeeeeee"
+    p2_cluster = f"{p2_id}_actor_infer"
+
+    _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
+    active_dp_workers = {p1_id: [], p2_id: []}
+    inactive_dp_workers = {
+        p1_id: [
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=1, gpu_ids=[1]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=2, gpu_ids=[2]),
+            _GapRatioDPWorker(pipeline_id=p1_id, dp_rank=3, gpu_ids=[3]),
+        ],
+        p2_id: [
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=0, gpu_ids=[0]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=1, gpu_ids=[1]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=2, gpu_ids=[2]),
+            _GapRatioDPWorker(pipeline_id=p2_id, dp_rank=3, gpu_ids=[3]),
+        ],
+    }
+    pipeline_registry = {
+        p1_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1, 2, 3],
+                    "max_dp_workers": 4,
+                },
+            },
+            "admitted": True,
+        },
+        p2_id: {
+            "cluster_configs": {
+                "actor_infer": {
+                    "tp_size": 1,
+                    "is_generation": True,
+                    "device_mapping": [0, 1, 2, 3],
+                    "max_dp_workers": 4,
+                },
+            },
+            "admitted": True,
+        },
+    }
+
+    # Both pipelines: alloc at GENERATION, active=set() (train just preempted
+    # them), step_target_estimate snapshotted earlier. No pending requests.
+    active_allocations = {
+        p1_cluster: ClusterAllocation(
+            cluster_id=p1_cluster,
+            gpu_ids=[],
+            priority=Priority.GENERATION,
+            active_dp_ranks=set(),
+            dp_rank_to_gpus={},
+            step_target_estimate=8.0,
+        ),
+        p2_cluster: ClusterAllocation(
+            cluster_id=p2_cluster,
+            gpu_ids=[],
+            priority=Priority.GENERATION,
+            active_dp_ranks=set(),
+            dp_rank_to_gpus={},
+            step_target_estimate=8.0,
+        ),
+    }
+
+    # No pending GEN requests anywhere — both pipelines are fallback-only.
+    pending_bucket_gen: list = []
+
+    def progress_totals_fn(*, pipeline_id):
+        return (0.0, 0.0)
+
+    gap_ratio_mod.plan_generation_gap_ratio(
+        plan,
+        active_dp_workers=active_dp_workers,
+        inactive_dp_workers=inactive_dp_workers,
+        non_gen_reserved_gpus=set(),
+        idle_gpus={0, 1, 2, 3},
+        pipeline_registry=pipeline_registry,
+        active_allocations=active_allocations,
+        pending_bucket_gen=pending_bucket_gen,
+        progress_totals_fn=progress_totals_fn,
+    )
+
+    # No activation: both pipelines are fallback, no peer has fresh signal,
+    # so no engine wake is issued — the trailing OOM on blackwell/cu12.9 is
+    # avoided.
+    assert plan.sched_guided_allocation_ops == [], (
+        "Fallback pipelines must not expand when no peer has a fresh signal: "
+        f"got {plan.sched_guided_allocation_ops!r}"
+    )

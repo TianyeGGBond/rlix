@@ -61,6 +61,14 @@ class _GapRatioPipelineState:
     existing_ratio: float = 0.0
     gap: float = 0.0
     target_gpu_count: int = 0
+    # ``True`` when this pipeline was admitted to the iteration via the
+    # ``alloc.step_target_estimate`` fallback (no pending GENERATION request,
+    # no progress reports yet, but an active GENERATION allocation exists).
+    # Fallback pipelines are kept alive (so a peer's allocation never
+    # starves them) but must NOT eagerly fill idle GPUs — those may be
+    # about to be claimed by another pipeline still preparing its request
+    # (e.g. a pipeline in INITIALIZATION between Phase A and Phase B step1).
+    is_fallback: bool = False
 
 
 def has_pending_generation_request(
@@ -223,8 +231,25 @@ def plan_generation_gap_ratio(
         # Derive remaining from completed metric; same derivation path as
         # background rebalance to keep demand semantics consistent.
         remaining, step_target = progress_totals_fn(pipeline_id=pipeline_id)
+        is_fallback = False
         if step_target <= 0.0:
             step_target_estimate = get_pending_generation_step_target_estimate(pending_bucket_gen, cluster_id)
+            if step_target_estimate is None:
+                # Fall back to the estimate snapshotted onto the active
+                # allocation at grant time. Without this, a GENERATION
+                # cluster that was transiently shrunk to ``active_dp_ranks
+                # =set()`` (peer's INITIALIZATION preempt, or a local
+                # ACTOR_TRAINING) and has not yet submitted progress is
+                # invisible to gap-ratio and starves forever.
+                existing_alloc = active_allocations.get(cluster_id)
+                if (
+                    existing_alloc is not None
+                    and existing_alloc.priority == Priority.GENERATION
+                    and existing_alloc.step_target_estimate is not None
+                    and existing_alloc.step_target_estimate > 0
+                ):
+                    step_target_estimate = existing_alloc.step_target_estimate
+                    is_fallback = True
             if step_target_estimate is None:
                 continue
             remaining = float(step_target_estimate)
@@ -250,6 +275,7 @@ def plan_generation_gap_ratio(
                 tp_size=tp_size,
                 active_dp_workers=active_list,
                 inactive_dp_workers=inactive_list,
+                is_fallback=is_fallback,
             )
         )
 
@@ -283,6 +309,15 @@ def plan_generation_gap_ratio(
             # Floor: every pipeline with non-zero demand gets at least one TP bundle,
             # otherwise the gap never closes and the pipeline stays starved.
             p.target_gpu_count = max(rounded_bundles * p.tp_size, p.tp_size)
+            if p.is_fallback:
+                # Fallback pipelines have no fresh signal — protect what they
+                # already hold (and ≥1 bundle so the engines stay reachable),
+                # but never grow them at the expense of GPUs another pipeline
+                # is about to claim. Once a real GENERATION request or a real
+                # progress report lands, the fallback flag drops and normal
+                # gap-ratio sizing resumes.
+                fallback_cap = max(len(p.active_dp_workers), 1) * p.tp_size
+                p.target_gpu_count = min(p.target_gpu_count, fallback_cap)
 
     def _update_gaps() -> None:
         for state in pipeline_states:
@@ -447,12 +482,25 @@ def plan_generation_gap_ratio(
                 return None
             return state.gap / state.target_ratio
 
+        # A fallback pipeline (no fresh GENERATION pending, no progress reports)
+        # only needs to be activated when a peer with a fresh signal is competing
+        # for the same budget — that is the deadlock case the fallback was
+        # introduced to break. When no peer has fresh demand, the fallback should
+        # NOT expand, because the just-released GPUs may still hold residual VRAM
+        # from a prior non-GEN allocation that has not physically freed (e.g. a
+        # miles train actor under MILES_SKIP_TMS_PAUSE=1 on blackwell/cu12.9
+        # whose ``offload()`` is a no-op). Eager fallback expansion in that
+        # window OOMs SGLang's ``resume_memory_occupation`` call.
+        has_fresh_signal = any(
+            (not p.is_fallback) for p in pipeline_states if _receiver_eligible(p)
+        )
         acceptors: List[_GapRatioPipelineState] = [
             p
             for p in pipeline_states
             if p.gap > epsilon
             and _receiver_eligible(p)
             and (len(p.active_dp_workers) * p.tp_size) < p.target_gpu_count
+            and (not p.is_fallback or has_fresh_signal)
         ]
         acceptors_with_norm_gap = [(_normalized_gap(p), p) for p in acceptors]
         acceptors_with_norm_gap = [(ng, p) for ng, p in acceptors_with_norm_gap if ng is not None]

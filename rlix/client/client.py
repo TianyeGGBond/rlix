@@ -73,6 +73,15 @@ def _get_or_create_orchestrator(opts: ConnectOptions) -> Any:
                     name=ORCHESTRATOR_ACTOR_NAME,
                     namespace=RLIX_NAMESPACE,
                     scheduling_strategy=strategy,
+                    # Stays at max_restarts=0 by design. Orchestrator.__init__
+                    # would re-bootstrap the scheduler topology on restart
+                    # (re-running _ensure_scheduler_singleton.initialize), but
+                    # the ``self._pipelines`` registry of admitted pipelines is
+                    # in-memory and would be wiped — every active pipeline
+                    # would become unreachable for admit / unregister. Cheaper
+                    # to surface the underlying Ray race (worker.py:1039
+                    # 'core_worker' AttributeError) as a hard failure than to
+                    # mask it with a half-recovered state.
                     max_restarts=0,
                     max_task_retries=0,
                     runtime_env=runtime_env,
