@@ -615,6 +615,58 @@ Per user follow-up ("if you need vast, then start it"), restarted vast `37573107
 
 Vast stopped after validation.
 
+### Smoke v10 — GPU utilization trace (2026-05-24 12:38→12:53)
+
+Per user follow-up ("ideal is always 100% util to maximize gpu"), restarted vast, ran smoke under `nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used --format=csv -l 2` background polling. 456 samples per GPU across 15:11 wall time.
+
+**Per-GPU utilization (4× RTX 4060 Ti 16 GB)**:
+
+| GPU | avg | p50 | p90 | p95 | p99 | max | %≥10% | %≥50% | %≥90% |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | **1.6%** | 0 | 0 | 0 | 88 | 100 | 3.1 | 1.1 | 0.9 |
+| 1 | **0.4%** | 0 | 0 | 0 | 10 | 46 | 1.1 | 0.0 | 0.0 |
+| 2 | **8.4%** | 0 | 10 | 100 | 100 | 100 | 10.1 | 8.1 | 7.7 |
+| 3 | **0.7%** | 0 | 0 | 0 | 35 | 99 | 1.3 | 0.4 | 0.2 |
+
+**13 idle gaps ≥5s** (all 4 GPUs <10% util simultaneously):
+- 12:38:26 → 12:40:41 (134s) — Phase A init both pipelines
+- 12:40:53 → 12:44:13 (200s) — Phase B (SGLang) loading + finish_init_offload
+- 12:44:19 → 12:46:21 (122s) — post-init handle pull + first dispatch
+- 12:46:23 → 12:49:25 (182s) — sync_base_weights_to_active(-1) + first rollout dispatch
+- 12:49:27 → 12:49:43 (16s), 12:49:49 → 12:50:11 (22s), 12:50:15 → 12:50:45 (30s) — donor-shrink/release/expand transitions between rollout 0 train and rollout 1 dispatch
+- 12:51:09 → 12:53:31 (5 × 10-16s) — final rollout + shutdown_hard
+
+**Total compute time ≈ 60-90s** out of 911s wall — **~7-10% effective duty cycle**.
+
+### Why this is low (and what "100%" actually means here)
+
+1. **Minimal-batch config**: `rollout-batch 1 / n-samples 1 / max-tokens 512 / response 256` was chosen to fit 16 GB GPUs. Each rollout's actual GPU work is 1-3 seconds.
+2. **Init dominates**: 9+ min of the 15-min run is Phase A train init + Phase B SGLang engine loading + first-time sync. This is one-shot per smoke.
+3. **Donor-shrink overhead**: each rollout boundary triggers shrink → release → expand → sync_selected_workers → activate_routing cycle. Per the rlix donor-shrink design, this is INHERENT to overlap topology — engines on shared GPUs serialize between train and infer phases.
+
+### How to get to high utilization
+
+| Lever | Effect | Requires |
+|---|---|---|
+| Larger batch (`rollout-batch 32 / n-samples 8 / response 2048`) | 10-50× more compute per rollout → sustained util | ≥48 GB GPU per shared GPU |
+| Larger model (Qwen2.5-7B) | More FLOPs per token → high util naturally | ≥80 GB GPU |
+| `--num-rollout 20+` | Amortize init across many cycles | Longer wall clock |
+| 3+ pipelines (M11.3) | More pipelines competing for fewer transitions | M11.3 scope |
+| Eliminate donor-shrink for steady-state (M11.5) | If both pipelines can stay active on shared GPUs (e.g. via TP=2 split) | M11.5 — requires F22 strict shell-init |
+
+### Finding (not a bug — workload constraint)
+
+The current 16 GB hardware **cannot** demonstrate high throughput for M11.2 overlap with Qwen2.5-0.5B. Control plane verification is complete; **throughput benchmarking is a separate workstream requiring larger GPUs and larger workloads**.
+
+Reproducing the throughput benchmark on appropriate hardware:
+- 4× A40 (48 GB) or 4× A100 (40 GB)
+- Qwen2.5-7B
+- `--rollout-batch-size 32 --n-samples-per-prompt 8 --rollout-max-response-len 2048`
+- `--num-rollout 20`
+- expected util: ≥70% avg per GPU during steady-state rollout/train cycles
+
+Vast `37573107` stopped after v10.
+
 ### Open follow-ups
 
 | Severity | ID | Title | Status |
