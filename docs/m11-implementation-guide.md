@@ -536,6 +536,23 @@ Four small fixes from the M11 review report.
 | NOTE | F8 / F10 | `orchestrator.cleanup_stale_pipelines()` RPC | M11.3 production hardening |
 | LOW | LOW1 | verify `generate_rollout_fully_async` accepts `rlix_hooks` kw | ~30 min check |
 
+## §3.6 Tianye's PR #14 — finalize-always-continue + release-on-sync-failure ✅ MERGED 2026-05-18 _(added 2026-05-24)_
+
+Chronologically merged BEFORE PR #16 (B-13 fix) but discovered late during this doc audit — both fixes are RESOLVED and live on `zhenyu/miles-mvp-e2e` post `47bf02b`.
+
+**`rlops/rlix#14` — `tianye/m11-finalize-always-continue` (merged 2026-05-18 as `8727394`).** Author: TianyeGGBond. Two commits:
+
+| Commit | File | Bug | Fix |
+|---|---|---|---|
+| `0302437 fix(rlix): always resume generation after finalize` | `rlix/pipeline/miles_model_update_service.py:307-323` | `finalize_weight_update` raise leaves engines in `pause_generation(mode='retract')` indefinitely — subsequent `generate` calls 503; mirrors the sticky-pause class of bugs that motivated `pause_generation`'s `try/except` discipline. | Wrap `_ray_get(finalize_refs)` in `try/finally`; `continue_generation` fan-out moves into the `finally` branch so it always fires. New test `tests/test_miles_model_update_service_cleanup.py:1-51` (51 LoC). |
+| `a8460a9 fix(rlix): release train GPUs after sync failure` | `rlix/pipeline/miles_pipeline.py:674-697` | `sync_base_weights_to_active` raise after the train actor has offloaded its weights skips the `_notify_release_cluster_gpus` call → rlix scheduler ledger leaks the actor_train allocation; peer pipelines starve (related family to F1/F3, but service-side rather than driver-side). | Wrap `ray.get(sync_base_weights_to_active.remote(step))` in `try/finally`; the `_notify_release_cluster_gpus` + `_actor_train_allocated = False` flag flip move into the `finally` branch. R11-F1 invariant preserved: flag flips only on SUCCESSFUL release. New test `tests/test_miles_pipeline_after_training_cleanup.py:1-39` (39 LoC). |
+
+**Verification.** Both commits ship with pytest coverage (90 LoC of new tests covering the cleanup path). No vast smoke needed — these are pure cleanup-path fixes whose failure modes are unit-testable in isolation.
+
+**Why missed earlier:** PR #14 merged 2026-05-18, two weeks before the doc-audit pass. The body of §3.5 documents Phase 1/3/7 + Tianye PR #16 (B-13) but not PR #14. This appended sub-section closes the gap.
+
+**Codex.** Both fixes follow the same `try/finally` cleanup pattern Codex APPROVED for Phase 1 (R04-F1) and Phase 7 (F3+F4). Pattern consistency is the audit trail.
+
 ---
 
 ## §4 M11.1 + M11.2 fix index (back-pointer to F1–F12)
