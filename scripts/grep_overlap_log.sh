@@ -117,6 +117,25 @@ echo "--- C20 0-active suspend / wake (informational) ---"
 c20_suspend=$(grep -cE "_workers_changed|workers_changed_notify|empty candidate_set" "$LOG" || true)
 note "C20 suspend/wake log lines: $c20_suspend"
 
+# ---------------- Condition 0: training loops actually completed (B-15) ---
+# Phase 7's F3 try/finally fires shutdown_hard on ANY exit path — including
+# training crashes. C2 alone (shutdown_hard complete) therefore reports PASS
+# when training failed. Add an explicit "training loop complete" + "no
+# train_group.train raised" check to catch silent regressions.
+echo "--- Condition 0 (B-15): both training loops actually completed ---"
+training_complete=$(grep -cE "training loop complete pipeline_id=" "$LOG" || true)
+train_raised=$(grep -cE "train_group\.train raised" "$LOG" || true)
+note "training loop complete log lines: $training_complete (expect ≥2 — one per pipeline; or ≥1 for single-pipeline smoke)"
+note "train_group.train raised log lines: $train_raised (expect 0)"
+# Allow either 1 (single-pipeline run_miles_rlix) or 2 (dual run_miles_dual).
+if [ "$training_complete" -lt 1 ]; then
+    fail_cond "C0 — training loops never completed (zero 'training loop complete' lines)"
+elif [ "$train_raised" -gt 0 ]; then
+    fail_cond "C0 — $train_raised 'train_group.train raised' lines indicate training crashed"
+else
+    pass_cond "C0 — training completed cleanly"
+fi
+
 echo "=========================================="
 if [ "$fail" -gt 0 ]; then
     echo "RESULT: FAIL ($fail conditions failed)"

@@ -580,14 +580,21 @@ class MilesPipeline:
         target_free_gb = 20.0
         deadline2 = time.time() + float(timeout_s)
         last_min_free_gb: Optional[float] = None
+        nvidia_smi_unavail_count = 0
         while time.time() < deadline2:
             min_free_gb = self._probe_min_free_gpu_mem_gb(target_gpu_ids)
             if min_free_gb is None:
-                # nvidia-smi unavailable or unparseable — fall back to a
-                # short grace sleep so we don't spin forever.
-                logger.warning(
-                    "_wait_for_overlap_engines_offloaded: nvidia-smi probe unavailable; "
-                    "falling back to 3s grace sleep"
+                # F5 (m11-review.review-report.md §2): nvidia-smi unavailable
+                # or unparseable. Was logged at DEBUG only — promoted to INFO
+                # so operators see the fallback without flipping log levels.
+                # If this fires repeatedly across sessions, it's a hardware
+                # / image regression worth investigating (driver missing,
+                # nvidia-smi path changed, etc.).
+                nvidia_smi_unavail_count += 1
+                logger.info(
+                    "_wait_for_overlap_engines_offloaded: nvidia-smi probe "
+                    "unavailable (count=%d); falling back to 3s grace sleep",
+                    nvidia_smi_unavail_count,
                 )
                 time.sleep(3.0)
                 return
