@@ -48,12 +48,15 @@ M11 is the milestone for **first end-to-end working rlix-mode**.
 | ID | Scope | Status |
 |---|---|---|
 | **M11.1** | Single MilesPipeline, partial-overlap topology (`actor_train ⊂ actor_infer`), full Qwen2.5-0.5B GRPO loop with `--num-rollout 2` | ✅ GREEN |
-| **M11.2** | Two concurrent MilesPipelines on disjoint pools (P1=[0,1], P2=[2,3]), each running its own GRPO loop | ✅ GREEN |
-| **M11.3+** | 3+ pipelines, runtime preempt under contention, production hardening | Deferred |
+| **M11.2 Option A** | Two concurrent MilesPipelines on **disjoint** pools (P1=[0,1], P2=[2,3]), each running its own GRPO loop | ✅ GREEN |
+| **M11.2 real (overlap)** | Two MilesPipelines on **shared** infer pool (P1=[0,1,2], P2=[1,2,3], shared [1,2]); scheduler arbitrates via donor-shrink-before-receiver-expand | ✅ GREEN — **verified 2026-05-24 on vast 4× RTX 4060 Ti 16 GB across smoke v8/v9/v10** |
+| **M11.3+** | 3+ pipelines, runtime preempt under contention, production hardening | Deferred (concurrent-resize stress test, orchestrator cleanup RPC, fairness stress) |
 
-Verification rig: vast.ai 4xGPU instances (RTX5090 for M11.1; A40 for M11.2), Qwen2.5-0.5B GRPO with 2 rollouts. EXIT_CODE=0 + clean shutdown is the pass bar. Iteration logs:
+Verification rig: vast.ai 4xGPU instances (RTX5090 for M11.1; A40 for M11.2 Option A; RTX 4060 Ti for M11.2 overlap), Qwen2.5-0.5B GRPO with 2 rollouts. EXIT_CODE=0 + clean shutdown is the pass bar. Iteration logs:
 - `plans/m11-e2e-test-log.md` — M11.1 attempts 0–10
-- `plans/m11-2-dual-pipeline-log.md` — M11.2 attempts 0–4
+- `plans/m11-2-dual-pipeline-log.md` — M11.2 **Option A** attempts 0–4
+- `plans/m11-2-overlap-log.md` — M11.2 **real overlap** attempts 0–10 (incl. Phase 1/3/7 implementation + Tianye PR integration + B-13 fix + batch follow-ups)
+- `docs/m11-tianye-prs-review.md` — dedicated writeup on Tianye's paired PRs (`rlops/rlix#16` + `rlops/miles#4`) that fixed B-13
 
 ### 1.5 5-minute reading order
 
@@ -400,9 +403,142 @@ Version is published exactly once per sync (`manager.set_weight_version`), NOT p
 
 ---
 
+## §3.5 Post-Option-A milestones (M11.2 real overlap)
+
+After M11.2 Option A (disjoint pools) shipped, the team progressed to **real M11.2 overlap** (two pipelines sharing physical infer GPUs). This required new state-machine work, driver hardening, and a paired set of upstream PRs from `@TianyeGGBond`. Status of each new line of work below.
+
+### Phase 1 — R04-F1 try/finally + `release_train_only` shim ✅ DONE
+
+**Goal.** Address the single HIGH finding from the M11 review (`m11-review.review-report.md` F1): if `train()` raises mid-iteration, the rlix scheduler ledger leaks the actor_train GPU allocation indefinitely.
+
+**Where it lives now.**
+- `miles/miles/utils/rlix_train_loop.py:117-193` — `before_step + train_group.train` wrapped in `try/except/finally`; cleanup branch calls optional `release_only` step hook.
+- `rlix/pipeline/miles_pipeline.py:812-833` — `_release_train_only(step)` private + `release_train_only(step)` public Ray hook; cleanup-only path that calls `_notify_release_cluster_gpus` WITHOUT `_publish_sync_resources` / `sync_base_weights_to_active` (would crash on un-onloaded weights or double-publish).
+- `miles/examples/rlix/run_miles_{rlix,dual}.py` — drivers wire `release_only=_release_only` callable to `pipeline.release_train_only.remote`.
+
+**Verification.** vast Attempt 0 with `MILES_INJECT_TRAIN_FAULT=1` — driver exits non-zero; `release_only done` logged; `nvidia-smi memory.used` ≤200 MiB per GPU.
+
+**Commits.** rlix `47bf02b feat(rlix): M11.2 real-overlap`, miles `6513b25 feat(miles): M11.2 real-overlap`.
+
+**Codex.** APPROVE_WITH_NOTES, 0 BLOCKERS (round 2).
+
+---
+
+### Phase 3 — Option β state machine (engines park in `offloaded` post-INIT) ✅ DONE
+
+**Goal.** Enable real-overlap topology without the full F22 architectural rebuild (deferred). When `MILES_INIT_DEFER_ADD_WORKER=1`:
+- SGLang engines skip `/add_worker` POST during init (`miles/backends/sglang_utils/sglang_engine.py:339-358`).
+- `RolloutManager._init_engine_info_table` lands engines in `state="loading"` not `"active"` (`miles/ray/rollout.py:585-625`).
+- `MilesPipeline._init_phase_b_infer` drives `finish_init_offload(all)` after `start_rollout_servers` → engines transition `loading → offloaded`, VRAM released (`rlix/pipeline/miles_pipeline.py:316-490`).
+- `bootstrap_active_engines(frozenset())` — post-INIT active set is EMPTY.
+- Phase B step 7 `sync_base_weights_to_active(-1)` is SKIPPED under Option β — first runtime `_expand_workers` does the base v=−1 sync via the F40 Runtime branch.
+- New `RolloutManager.get_router_enabled_workers()` accessor (Codex Q5-a invariant); post-INIT assertion that router admission is empty.
+- `shrink_engines` calls `unregister_from_router` BEFORE `release_memory_occupation` (Codex Q5-b invariant).
+- `activate_routing` calls `register_with_router` BEFORE `state="active"` (Codex Q5-b symmetric invariant).
+- F10 hatch (`_expand_workers` no-op for already-active engines) raises RuntimeError under Option β to catch regressions.
+
+**Verification.** vast smoke v1 with `MILES_DUAL_P1_TRAIN=0 MILES_DUAL_P1_INFER=0,1,2 MILES_DUAL_P2_TRAIN=3 MILES_DUAL_P2_INFER=1,2,3 MILES_INIT_DEFER_ADD_WORKER=1` — engines come up offloaded, donor-shrink-before-receiver-expand fires correctly, but B-13 wedge surfaced (mp2 finished early, mp1 hung). Required Tianye's PRs to close.
+
+**Commits.** rlix `47bf02b`, miles `6513b25` (same commit as Phase 1).
+
+---
+
+### Phase 7 — F3 + F4 driver-side cleanup ✅ DONE
+
+**Goal.** Address two MEDIUM findings from the M11 review:
+- **F3 (R04-F2):** Driver crash before `shutdown_hard` skips scheduler release.
+- **F4 (R04-F3):** Dual driver `asyncio.gather` doesn't cancel peer coroutine on failure → orphan actors.
+
+**Where it lives now.**
+- `miles/examples/rlix/run_miles_dual.py:483-548` — `_async_main` rewritten:
+  - `asyncio.gather(...)` → `asyncio.create_task(...)` + `asyncio.wait(return_when=asyncio.FIRST_EXCEPTION)`.
+  - On first exception: cancel pending tasks, await CancelledError settle, re-raise.
+  - `try/finally` INSIDE `_async_main`: fires `shutdown_hard.remote()` for ALL pipelines with 60s timeout, wrapped in `try/except Exception` so shutdown_hard failure doesn't suppress original train exception.
+- `miles/examples/rlix/run_miles_rlix.py:235-281` — mirror pattern for single-pipeline driver.
+
+**F13 compliance.** F13 says "no top-level try/except, no `ray.shutdown()`, let exceptions propagate naturally". My `try/finally` lives INSIDE `_async_main` (not at module top); exceptions still propagate through `asyncio.run`. Codex confirmed F13 preserved.
+
+**Verification.** Phase 7 cleanup fires on every smoke crash (v1-v7); both `shutdown_hard complete pipeline_id=…` log lines appear regardless of train success/failure. v8+ adds clean training-completion as the additional success signal.
+
+**Commits.** miles `79f2874 fix(miles): F3 + F4 driver-side cleanup`.
+
+**Codex.** APPROVE, 0 BLOCKERS (round 2). Round 1 flagged a MEDIUM (`.remote()` construction outside inner try) — fixed in round 2.
+
+---
+
+### Tianye's paired PRs — B-13 fix (`rlops/rlix#16` + `rlops/miles#4`) ✅ MERGED 2026-05-24
+
+**Bug they fix (B-13).** Under M11.2 overlap, between rollouts both pipelines' `actor_infer` DP workers shrink to ∅. The scheduler's gap-ratio planner needs a fresh demand signal to re-wake engines, but the only signal arrived from `begin_progress_batch` INSIDE the rollout function — too late. Whoever fires first wins all DP workers; peer hangs at `Warning: No progress for 30.0s. Collected 0/N`. Two compounding sub-bugs: `pending_bucket_gen` was per-cycle (vanished once consumed) and `MilesRLixHooks` was never wired at init (`begin_progress_batch` hit no-op).
+
+**Fix shape.** Pre-signal scheduler demand BEFORE rollout dispatch via durable `rollout_open_pipelines` registry.
+
+**Where it lives now.**
+- `rlix/scheduler/state.py` — new `rollout_open_pipelines: Dict[str, int]` durable across planning cycles.
+- `rlix/scheduler/scheduler.py` — `request_gpus(GENERATION, step_target_estimate=N)` writes to registry; wakes scheduling loop.
+- `rlix/scheduler/planner.py` — gap-ratio planner consumes durable registry (replaces transient `pending_bucket_gen`).
+- `rlix/pipeline/miles_pipeline.py:835-874` — new `MilesPipeline.signal_rollout_demand(rollout_id, step_target)` Ray hook.
+- `rlix/pipeline/miles_pipeline.py:379-387` — `set_rlix_hooks.remote(MilesRLixHooks(...))` wired in Phase B init (was no-op).
+- `rlix/pipeline/miles_hooks.py` — `MilesRLixHooks.begin_progress_batch` now actually forwards to scheduler.
+- `miles/examples/rlix/run_miles_dual.py:467-481` — new `_signal_demand` step hook calls `pipe.signal_rollout_demand.remote(...)` before each rollout dispatch.
+- `miles/utils/rlix_train_loop.py:105-111, 233-239` — optional `signal_demand: StepHook` kw; fires before pre-loop + each next-rollout dispatch.
+- `miles/ray/rollout.py` — `set_rlix_hooks(hooks)` setter; thread `rlix_hooks` into `call_rollout_fn`.
+- `miles/rollout/base_types.py` — `call_rollout_fn` forwards `rlix_hooks` via `inspect.signature` check.
+- `miles/router/router.py` — `ClientDisconnect` → 499 + counter-balance fix in try/finally (independent improvement).
+- `examples/rlix/run_miles_dual.py:305` — `max_concurrency=4` on MilesCoordinator (allow concurrent RPCs).
+
+**Verification.** vast smoke v8 — mp1 + mp2 both complete 2 rollouts each (~14:27 wall clock); no `Warning: No progress for 30.0s` anywhere; all 7 PASS-bar conditions met.
+
+**Codex.** 5 review rounds across PR lifecycle; final APPROVE_WITH_NOTES, 0 BLOCKERS. Detailed in `docs/m11-tianye-prs-review.md`.
+
+**Carryforward MEDIUM** (not a blocker): `max_concurrency=4` exposes coordinator resize methods to concurrent execution; `_resize_sync_lock` released across Ray RPCs is not race-proof. Needs M11.3 concurrent-resize stress test.
+
+---
+
+### B-14 / vast hardware compatibility — `MILES_SKIP_TMS_PAUSE=1` is conditional ✅ FIXED via env-flag toggle
+
+**Bug (B-14).** On 16 GB GPUs, multi-rollout endurance OOMed at rollout 1 boundary. Initially looked like SGLang `torch_memory_saver` not releasing VRAM to driver. Initially attempted (wrong path) to live-patch SGLang server-side `release_memory_occupation` with `gc.collect() + torch.cuda.empty_cache()`. User pushed back — modifying upstream library is policy violation.
+
+**Actual root cause.** `MILES_SKIP_TMS_PAUSE=1` (originally a Blackwell + CUDA 12.9 + tms 0.0.9 segfault workaround documented in `docs/tms-fixes.md`) was unconditionally set in `scripts/run_smoke_dual.sh`, bypassing Megatron's `torch_memory_saver.pause()` on hardware where it works fine. Without `pause()`, Megatron weights stay resident on GPU between rollouts.
+
+**Fix.** Remove `MILES_SKIP_TMS_PAUSE=1` from the smoke script when running on tms-stable hardware. Comment in `scripts/run_smoke_dual.sh` explains the conditional. **No library source patching.**
+
+**Verification.** vast smoke v8 with `MILES_SKIP_TMS_PAUSE` UNSET — `torch_memory_saver.pause()` fires correctly; Megatron memory drops from 12.77 GB to 10.01 GB on offload (2.76 GB freed, vs 808 MB by empty_cache alone). Both rollouts complete end-to-end.
+
+**Commits.** rlix `a011bbf docs(m11): v8 PASS — drop MILES_SKIP_TMS_PAUSE=1`.
+
+---
+
+### Batch follow-ups — B-15 + F5 + F9 + F7 ✅ DONE
+
+Four small fixes from the M11 review report.
+
+| ID | Sev | Title | Where | Commit |
+|---|---|---|---|---|
+| **B-15** | harness | `grep_overlap_log.sh` reported PASS even when training crashed (Phase 7 always fires shutdown_hard) — added C0 condition requiring ≥1 `training loop complete pipeline_id=` + 0 `train_group.train raised` | `scripts/grep_overlap_log.sh:118-138` | rlix `a4c6369` |
+| **F5** | LOW | `nvidia-smi probe unavailable` logged at DEBUG only — promoted to INFO + counter | `rlix/pipeline/miles_pipeline.py:583-602` | rlix `a4c6369` |
+| **F9** | NOTE | `_split_pools_for_dual` silently ignored extra GPUs (5/6/7-GPU machines) — added explicit ValueError; error message points at MILES_DUAL_P* env workaround | `miles/examples/rlix/run_miles_dual.py:76-91` | miles `1487c3f` |
+| **F7** | NOTE | `shrink_engines` pause_generation contract undocumented — added docstring covering mode='retract' semantics, idempotency, 4xx vs 5xx; log message now includes engine_indices | `miles/ray/rollout.py:1003-1030` | miles `1487c3f` |
+
+**Verification.** Local: bash syntax + python ast.parse + behavior tests (F9 5-input matrix all PASS). Vast smoke v9 (post-fix) — harness PASS with new C0 condition; F5 INFO log fires 0 times on healthy hardware.
+
+**Codex.** APPROVE_WITH_NOTES, 0 BLOCKERS across 3 rounds.
+
+---
+
+### Open M11.3 follow-ups (not blocking M11.2 sign-off)
+
+| Severity | ID | Title | Status |
+|---|---|---|---|
+| MED | F2 | configurable free-mem threshold via `MILES_MAX_RESIDUAL_GPU_MEM_GB` | howard989's PRs `rlops/rlix#11` + `rlops/miles#3` in flight (v2 per @taoluo) |
+| MED | MED1 | concurrent-resize stress test under `max_concurrency=4` | Open (Codex carryforward) |
+| NOTE | F8 / F10 | `orchestrator.cleanup_stale_pipelines()` RPC | M11.3 production hardening |
+| LOW | LOW1 | verify `generate_rollout_fully_async` accepts `rlix_hooks` kw | ~30 min check |
+
+---
+
 ## §4 M11.1 + M11.2 fix index (back-pointer to F1–F12)
 
-15 distinct fixes landed across M11.1 and M11.2; this index points each one back to its F1–F12 owner so a reviewer reading the source plan can locate every change.
+15 distinct fixes landed across M11.1 and M11.2 Option A; this index points each one back to its F1–F12 owner so a reviewer reading the source plan can locate every change. **§3.5 above tracks the additional post-Option-A fixes (Phase 1/3/7 + Tianye PRs + batch follow-ups).**
 
 | Fix | M11 attempt where surfaced | F-owner | File:line | Commit |
 |---|---|---|---|---|
@@ -517,16 +653,28 @@ For a reviewer already inside a file, here is the symbol → line-range index fo
 
 ## §6 Known limitations / deferred work
 
-| ID | What | Why deferred | Impact |
-|---|---|---|---|
-| **F22 (relaxed)** | Strict `shell → offloaded → active` engine-init state machine | Receiver-side shell-creation never wired into `RolloutManager.expand_engines`. M11.1 uses a pragmatic "engines come up active" hatch in `_expand_workers`. | Multi-pipeline (3+) needs F22 so the scheduler can manage engines that come up shell. M11.2 disjoint-pool topology works without it. |
-| **M11.3** | 3+ concurrent pipelines on small GPU pool with cross-pipeline contention | Topologically requires F22 + 1-GPU train shape. Not exercised by current smoke. | Three concurrent pipelines on 4 GPUs not validated. |
-| **F95.1** | Infer-pool PG via `MilesPlacementProvider.get_all_rollout_engine_placements()` (replace standalone `_create_placement_group` bypass) | Defer to dual-pipeline contention smoke; current code has a fail-fast assert that blocks silent oversubscription. | M11.2 disjoint-pool case unaffected (each pipeline's bypass owns its own PG). |
-| **F19/F20 (saving)** | Final-rollout save trigger | Megatron `save_model` does not onload weights internally; `_after_training` already offloaded. | Smoke runs pass `--save ""`. Real fix: explicit onload→save→offload bracket. |
-| **Eval at final rollout** | `should_run_periodic_action` fires at the last rollout regardless of `--eval-interval` | Same offloaded-weight problem as save. | Smoke skips eval. |
-| **Pytest coverage of M11 changes** | 6 critical files have no direct unit/integration tests | Time pressure; smoke run is the main verification. | Future iteration should add unit tests for `_wait_for_overlap_engines_offloaded`, pause_generation wrapping, `_split_pools_for_dual`, etc. |
-| **R04-F1 (HIGH from review-report)** | `rlix_train_loop.run_async_train_loop` lacks `try/finally` around `before_step / train / after_step` | Static-analysis finding; happy-path smoke does not exercise failure path. | Train() raise leaks rlix scheduler GPU allocation. Production hardening tracked into M11.x. |
-| **Vast-only `_with_region_config` patch** | Nested-region clobber in tms 0.0.9 entrypoint.py | Upstream tms bug. | Hot-patched on the vast image only; not in repo. Tracked in `docs/tms-fixes.md` §5. |
+| ID | What | Why deferred | Impact | Update (2026-05-24) |
+|---|---|---|---|---|
+| **F22 (relaxed)** | Strict `shell → offloaded → active` engine-init state machine | Receiver-side shell-creation never wired into `RolloutManager.expand_engines`. M11.1 uses a pragmatic "engines come up active" hatch in `_expand_workers`. | Multi-pipeline (3+) needs F22 so the scheduler can manage engines that come up shell. M11.2 disjoint-pool topology works without it. | **Partially resolved by Phase 3 Option β** (env-gated `MILES_INIT_DEFER_ADD_WORKER=1` lands engines in `loading` → `finish_init_offload` → `offloaded`). Full F22 architectural rebuild still deferred to M11.5; Option β provides the same observable Gate 4(c) semantics. |
+| **M11.3** | 3+ concurrent pipelines on small GPU pool with cross-pipeline contention | Topologically requires F22 + 1-GPU train shape. Not exercised by current smoke. | Three concurrent pipelines on 4 GPUs not validated. | M11.2 real overlap (2 pipelines on shared GPUs) now validated; 3+ still deferred. |
+| **F95.1** | Infer-pool PG via `MilesPlacementProvider.get_all_rollout_engine_placements()` (replace standalone `_create_placement_group` bypass) | Defer to dual-pipeline contention smoke; current code has a fail-fast assert that blocks silent oversubscription. | M11.2 disjoint-pool case unaffected (each pipeline's bypass owns its own PG). | Still deferred; real overlap M11.2 also unaffected because Option β's `finish_init_offload` parks engines before contention. |
+| **F19/F20 (saving)** | Final-rollout save trigger | Megatron `save_model` does not onload weights internally; `_after_training` already offloaded. | Smoke runs pass `--save ""`. Real fix: explicit onload→save→offload bracket. | Unchanged. |
+| **Eval at final rollout** | `should_run_periodic_action` fires at the last rollout regardless of `--eval-interval` | Same offloaded-weight problem as save. | Smoke skips eval. | Unchanged. |
+| **Pytest coverage of M11 changes** | 6 critical files have no direct unit/integration tests | Time pressure; smoke run is the main verification. | Future iteration should add unit tests for `_wait_for_overlap_engines_offloaded`, pause_generation wrapping, `_split_pools_for_dual`, etc. | Tianye's PR#16 added 3 new test files (`test_orchestrator_death_is_benign.py`, `test_scheduler_apply_plan_invariants.py`, `test_gap_ratio.py` rewrite) covering planner durability + scheduler intent. Still no unit tests on `_wait_for_overlap_engines_offloaded` or `_split_pools_for_dual` (F9 behavior-tested via local Python invocation). |
+| **R04-F1 (HIGH from review-report)** | `rlix_train_loop.run_async_train_loop` lacks `try/finally` around `before_step / train / after_step` | Static-analysis finding; happy-path smoke does not exercise failure path. | Train() raise leaks rlix scheduler GPU allocation. Production hardening tracked into M11.x. | **✅ RESOLVED** by Phase 1 (rlix `47bf02b` + miles `6513b25`). Verified on vast Attempt 0 via `MILES_INJECT_TRAIN_FAULT=1` injected smoke. |
+| **F3 (R04-F2, MEDIUM)** | Driver crash before `shutdown_hard` skips scheduler release | Static-analysis finding | Same as F1 — leaked ledger. | **✅ RESOLVED** by Phase 7 (miles `79f2874`). `try/finally` INSIDE `_async_main` fires `shutdown_hard.remote()` regardless of exit path. |
+| **F4 (R04-F3, MEDIUM)** | Dual driver `asyncio.gather` doesn't cancel peer coroutine on failure | Static-analysis finding | Orphan actors on one-pipeline crash. | **✅ RESOLVED** by Phase 7 (miles `79f2874`). `asyncio.wait(FIRST_EXCEPTION)` cancels pending tasks; Phase 1's `release_only` fires on the CancelledError path. |
+| **B-13 (CRITICAL-class)** | Dual-pipeline wedge after one pipeline finishes early (rollout-2+ hang under overlap) | Discovered in M11.2 real-overlap Attempt 1 | Production multi-tenant deployments hang | **✅ RESOLVED** by Tianye's paired PRs `rlops/rlix#16` + `rlops/miles#4` (both merged 2026-05-24). Durable `rollout_open_pipelines` registry + `signal_rollout_demand` pre-dispatch + `MilesRLixHooks` wired at init. See `docs/m11-tianye-prs-review.md`. |
+| **B-14 (hardware-class)** | OOM on 16 GB GPUs at rollout boundary | Megatron weights stayed resident across rollouts | 16 GB hardware infeasible for M11.2 overlap | **✅ RESOLVED** by env-flag toggle (rlix `a011bbf`). `MILES_SKIP_TMS_PAUSE=1` was a Blackwell-only workaround; removing it on stable-tms hardware enables `torch_memory_saver.pause()` to actually move weights off-GPU between rollouts. |
+| **B-15 (harness gap)** | `grep_overlap_log.sh` reported PASS even when training crashed | Phase 7's always-fire `shutdown_hard` decouples cleanup from training success | False positives in regression detection | **✅ RESOLVED** by new C0 condition (rlix `a4c6369`). Requires ≥1 `training loop complete pipeline_id=` + 0 `train_group.train raised` log lines. |
+| **Vast-only `_with_region_config` patch** | Nested-region clobber in tms 0.0.9 entrypoint.py | Upstream tms bug. | Hot-patched on the vast image only; not in repo. Tracked in `docs/tms-fixes.md` §5. | Unchanged. |
+| **MED1 (Codex carryforward)** | Concurrent-resize stress test under `max_concurrency=4` | Tianye's PR added `max_concurrency=4` on MilesCoordinator; `_resize_sync_lock` released across Ray RPCs is not race-proof | Concurrent resize/sync RPCs may interleave incorrectly | Open M11.3 follow-up; not exercised by current smoke. |
+| **F2 (MED)** | 20 GB free-mem threshold hardcoded in `_wait_for_overlap_engines_offloaded` | GPU-model dependent (20 GB ≠ same on 24 GB vs 80 GB GPU) | Threshold unreachable on small GPUs; wasteful on big ones | howard989's PRs `rlops/rlix#11` (receiver) + `rlops/miles#3` (sender) in flight; v2 per @taoluo flips semantic to `MILES_MAX_RESIDUAL_GPU_MEM_GB`. |
+| **F5 (LOW)** | `nvidia-smi probe unavailable` logged at DEBUG only | Observability gap | Operators miss the fallback signal | **✅ RESOLVED** by rlix `a4c6369` — promoted to INFO + counter. |
+| **F7 (NOTE)** | `shrink_engines` pause_generation contract undocumented | Documentation gap | Reviewers confused by broad `except Exception` | **✅ RESOLVED** by miles `1487c3f` — docstring covers mode='retract', idempotency, 4xx vs 5xx, swallowing rationale; log includes engine_indices. |
+| **F8 / F10 (NOTE)** | Detached coordinator persists after driver crash | M11.3 cleanup RPC scope | Stale actors on operator-killed runs | Still open; needs `orchestrator.cleanup_stale_pipelines()` RPC. |
+| **F9 (NOTE)** | `_split_pools_for_dual` silently ignored extra GPUs on non-2N machines | Static-analysis finding | Silent GPU leak on 5/6/7-GPU machines | **✅ RESOLVED** by miles `1487c3f` — explicit `ValueError` when `num_gpus_per_node != 2*infer_pool_size`; error message points at MILES_DUAL_P* workaround. |
+| **LOW1 (Codex carryforward)** | Verify `generate_rollout_fully_async` actually accepts `rlix_hooks` kw | `inspect.signature` forward silently no-ops if kw is missing | Demand signal path dead-codes silently | Open; ~30 min grep + startup assert. |
 
 Production hardening items (deferred to M11.5 per scope plan): `F79`–`F91` — bounded `_use_url` timeout, `admission_epoch` race defense, multi-pipeline cleanup daemon, `master_port` cooldown queue, dead-recovery, etc.
 
@@ -639,8 +787,8 @@ The two append-only iteration logs are the source of truth for what was exercise
 
 | Branch | HEAD | Contents |
 |---|---|---|
-| rlix `zhenyu/miles-mvp-e2e` | `03cbeb7` | F1–F12 rlix-side; `docs/m11-implementation-guide.md`; review artifacts |
-| miles `zhenyu/m11-mvp-test` | `6126e01` | F1, F2, F8, F11 miles-side rlix-mode wiring |
+| rlix `zhenyu/miles-mvp-e2e` | `9b1fa90` (was `03cbeb7` at original M11.2 Option A; updated 2026-05-24 post Phase 1/3/7 + Tianye `rlops/rlix#16` merge + B-15/F5 + B-14/v8 docs + Tianye PR review writeup) | F1–F12 rlix-side; **Phase 1 (R04-F1) + Phase 3 (Option β) + B-15 (harness C0) + F5 (nvidia-smi INFO)**; full smoke evidence in `plans/m11-2-overlap-log.md`; dedicated `docs/m11-tianye-prs-review.md` |
+| miles `zhenyu/m11-mvp-test` | `1487c3f` (was `6126e01` at original M11.2 Option A; updated 2026-05-24 post Phase 1+3+7 + Tianye `rlops/miles#4` merge + F7/F9 batch) | F1, F2, F8, F11 miles-side rlix-mode wiring; **Phase 7 (F3+F4 driver cleanup) + F7 (pause_generation docs) + F9 (odd-GPU validation)** |
 
 Both branches are pushed to GitHub:
 - https://github.com/rlops/rlix
