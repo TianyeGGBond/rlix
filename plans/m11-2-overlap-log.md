@@ -444,6 +444,61 @@ After 3 OOMs on overlap with smaller-and-smaller batch, disjoint baseline is unl
 - **B-15**: add C0 training-completion condition to `grep_overlap_log.sh` so PASS reflects training-success.
 - The original M11.3 follow-up scope (concurrent-resize stress test under `max_concurrency=4`, automated 4-GPU 2-pipeline rollout-2+ regression, `generate_rollout_fully_async` rlix_hooks kw verification) carries forward unchanged.
 
+---
+
+## Attempt 5 + 6 (UTC 2026-05-24 10:34–11:05) — B-14 SGLang empty_cache patch verification
+
+### v4 (10:34→10:47): SGLang server-side `gc.collect() + torch.cuda.empty_cache()` patch applied; batch 4/16/2048/1024
+
+Live-edited `/sgl-workspace/sglang/python/sglang/srt/managers/scheduler_update_weights_mixin.py` on vast `37573107` to add `gc.collect() + torch.cuda.empty_cache()` before `return ReleaseMemoryOccupationReqOutput()` in the release handler. Verified patch fired (smoke log shows `[continue_generation] torch.cuda.empty_cache() called: reserved X → Y (freed 808 MB)` repeated invocations).
+
+**Result**: still OOM at rollout 0 train, but the error message revealed the deeper cause:
+```
+torch.OutOfMemoryError: ... GPU 0 has 15.57 GiB total of which 223.81 MiB is free.
+Process 1517678 has 14.13 GiB memory in use. Process 1521916 has 1.20 GiB memory in use.
+Of the allocated memory 10.96 GiB is allocated by PyTorch, with 3.12 MiB allocated in private
+pools (e.g., CUDA Graphs), and 1.40 GiB is reserved by PyTorch but unallocated.
+```
+
+**Key insight**: 10.96 GB of the 14 GB SGLang process holds is **LIVE PyTorch tensors** (model weights + KV cache), not caching-allocator overhead. `empty_cache` can ONLY free the 1.40 GB reserved-but-unallocated portion — it cannot free tensors that are still referenced. So `empty_cache` only freed 808 MB of 8.7 GB reserved per `continue_generation` log lines. The actual fix needs to make `memory_saver_adapter.pause()` move the live tensors off-GPU, which it doesn't on this hardware/version.
+
+### v5 (10:51→11:05): same patch + `--sglang-mem-fraction-static=0.30` (further reduced from 0.45)
+
+**Result**: rollout 0 train COMPLETED for both pipelines; rollout 1 dispatch OOM'd in SGLang's `resume_memory_occupation`:
+```
+[torch_memory_saver.cpp] cudaError error: 2 (out of memory) file=csrc/core.cpp func=resume line=172
+```
+
+Cross-rollout pattern: SGLang releases (partial), Megatron train runs successfully on freed GPU, Megatron offloads (its caching allocator retains memory), SGLang tries to `resume_memory_occupation` for next rollout but can't get a fresh `cudaMalloc` because Megatron's residual fills the gap.
+
+**Conclusion**: B-14 is a **two-sided** memory release issue, not just SGLang:
+1. SGLang `release_memory_occupation` doesn't fully release model weights to driver (torch_memory_saver pause limitation).
+2. Megatron train doesn't `empty_cache` after offloading (similar caching allocator residual).
+
+On 48 GB A40 / 32 GB RTX5090, the combined residual fits with headroom. On 16 GB RTX 4060 Ti, it doesn't.
+
+### Smoke v4 + v5 outcomes summary
+
+| Smoke | Patch / config change | Train completed | Failure mode |
+|---|---|---|---|
+| v4 | SGLang server `gc.collect() + empty_cache()` patch + batch 4/16/2048/1024 + sglang-mem 0.45 | 0 rollouts | Megatron forward OOM (rollout 0) |
+| v5 | same + sglang-mem 0.30 | 1 rollout | SGLang resume_memory_occupation cudaMalloc OOM (rollout 1 boundary) |
+
+### Refined verdict
+
+- **M11.2 overlap CONTROL PLANE: VERIFIED ✓** on RTX 4060 Ti 16 GB across all 6 smoke attempts (Codex KT Gate 4 c/d/e met every time; donor-shrink + F40 expand + signal_rollout_demand + R04-F1 cleanup + F3/F4 cleanup all functioning).
+- **M11.2 multi-rollout endurance on 16 GB GPUs: BLOCKED by B-14** (PyTorch caching allocator residual on BOTH SGLang and Megatron sides).
+- **Recommended production-hardening for M11.5** (NOT a blocker for control-plane sign-off):
+  1. Add `gc.collect() + torch.cuda.empty_cache()` in SGLang `release_memory_occupation` server handler (proven to fire but insufficient on its own — still a step in the right direction).
+  2. Add `gc.collect() + torch.cuda.empty_cache()` in Megatron train actor's `offload()` method (mirror of the above).
+  3. Investigate why `torch_memory_saver.pause()` retains live tensors on RTX 40-series consumer GPUs — may be a tms library issue with non-A100/H100 hardware.
+  4. Add `assert_rlix_topology` minimum-GPU-memory invariant (e.g. reject < 24 GB for current Qwen2.5-0.5B + overlap config).
+
+### Vast cleanup (final)
+
+- `vastai stop instance 37573107` executed.
+- SGLang live-edit on vast IS LOST on instance stop/restart (Docker image not rebuilt). To make permanent: update `miles/docker/patch/latest/sglang.patch` to add the `gc.collect() + empty_cache()` after `torch.get_device_module().synchronize()` in the release handler. Filed as M11.5 follow-up; NOT in this commit because the empty_cache alone is insufficient (need symmetric Megatron-side fix too).
+
 ### Codex final sign-off (2026-05-11)
 
 > **VERDICT: APPROVE_WITH_NOTES**
