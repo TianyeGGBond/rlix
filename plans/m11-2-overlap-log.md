@@ -326,12 +326,12 @@ End of each phase: a markdown table `| file | lines changed | LoC delta | phase 
   - The gap-ratio planner needs a fresh demand signal to re-wake engines, but that signal only arrived from `begin_progress_batch` **inside** the rollout function — after sample dispatch had already started.
   - Race: whichever pipeline fires `begin_progress_batch` first wins all DP workers; peer hangs.
   - Two compounding sub-bugs: (a) `pending_bucket_gen` is a per-cycle snapshot that vanishes once consumed (planner blind during rollout boundary); (b) `MilesRLixHooks` was never wired at init — `begin_progress_batch` hit `NoOpRLixHooks`, scheduler never received demand at all.
-- **RESOLVED-by**: paired PRs **`rlops/miles#4`** + **`rlops/rlix#16`** (both by TianyeGGBond, both OPEN at time of this log update).
+- **RESOLVED-by**: paired PRs **`rlops/miles#4`** + **`rlops/rlix#16`** (both by TianyeGGBond, **both MERGED 2026-05-24**).
   - `rlix#16`: durable `rollout_open_pipelines` registry in scheduler; new `MilesPipeline.signal_rollout_demand(rollout_id, step_target)` method; wires `MilesRLixHooks` in Phase B init; fixes `pending_bucket_gen` durability in planner. NEW tests: `test_orchestrator_death_is_benign.py` (+139), `test_scheduler_apply_plan_invariants.py` (+21); `test_gap_ratio.py` rewritten (+25/-65) for new contract.
   - `miles#4`: `_signal_demand` step hook in dual driver (calls `pipe.signal_rollout_demand.remote(...)` before rollout 0 + each rollout N+1); `set_rlix_hooks` + `_rlix_hooks` threading on `RolloutManager`; `call_rollout_fn` forwards `rlix_hooks`; `max_concurrency=4` on coordinator; router `ClientDisconnect` → 499 + counter-balance fix.
   - **Codex joint verdict**: APPROVE_WITH_NOTES, 0 BLOCKERS — prior CRITICAL (`signal_rollout_demand` missing) + HIGH (`set_rlix_hooks` not wired) both RESOLVED in the pair.
   - **Joint smoke evidence** (from `rlops/miles#4` PR description): `run_4ppl_full_overlap_n10.sh --num-rollout 5` — run 28 completed all 5 rollouts with `EXIT=0`; earlier baseline/concurrency-only runs hung on rollout 2.
-- **Merge order required**: `rlops/rlix#16` MUST land before `rlops/miles#4` — miles#4 alone calls `pipe.signal_rollout_demand.remote(...)` which raises `AttributeError` on rlix master without the rlix#16 method.
+- **Merge order**: ~~`rlops/rlix#16` MUST land before `rlops/miles#4`~~ — both merged into their respective `zhenyu/*` branches; my Phase 1/3 work fast-forwarded cleanly under both merges (no conflicts because TianyeGGBond branched off my prior commits).
 - **TianyeGGBond's fix is better than my proposed M11.3 fire-shutdown-hard-early** — uses the scheduler's existing gap-ratio machinery as designed (pre-signalled durable demand) instead of fighting `asyncio.gather`. Root-cause framing (per-cycle pending_bucket_gen snapshot + hooks never wired) is also more precise than mine.
 
 ### M11.3 follow-up scope (smaller after rlix#16 + miles#4 land)
@@ -352,7 +352,7 @@ End of each phase: a markdown table `| file | lines changed | LoC delta | phase 
 ### Verdict
 
 - **M11.2 overlap CONTROL PLANE: VERIFIED ✓** (Codex KT (c) + (d) + (e) acceptance criteria all PASS)
-- **M11.2 overlap E2E shutdown: RESOLVED-PENDING-MERGE** — single-pipeline R04-F1 verification ✓ (Attempt 0); B-13 root-caused + fix shipped via `rlops/rlix#16` + `rlops/miles#4` (both OPEN at this update). Once merged together, B-13 is closed and M11.2 overlap E2E is fully PASS (manual smoke "run 28" already confirmed `--num-rollout 5` end-to-end on the joint branches).
+- **M11.2 overlap E2E shutdown: RESOLVED** — single-pipeline R04-F1 verification ✓ (Attempt 0); B-13 closed by `rlops/rlix#16` (merged into `zhenyu/miles-mvp-e2e` as `80583ee`) + `rlops/miles#4` (merged into `zhenyu/m11-mvp-test` as `8f5cef8`). Manual smoke "run 28" from miles#4 PR description confirmed `--num-rollout 5` end-to-end on the joint branches; **vast 4×A40 dual-overlap regression smoke pending — to be run on the new instance after this doc update.**
 
 ### Vast cleanup
 
