@@ -603,6 +603,18 @@ Four small follow-ups from `m11-review.review-report.md` §2:
 - rlix `a4c6369 fix(rlix): B-15 + F5 — harness training-completion check + nvidia-smi log promotion`
 - miles `1487c3f fix(miles): F7 + F9 — pause_generation contract docs + reject odd GPU counts`
 
+### Vast validation smoke v9 (post-fix end-to-end, 2026-05-24 12:30→12:33)
+
+Per user follow-up ("if you need vast, then start it"), restarted vast `37573107`, pulled both branches (rlix `6c72b98`, miles `1487c3f`), ran overlap smoke under the new harness:
+
+- ✅ **C0 PASS**: harness reports `training loop complete log lines: 2` + `train_group.train raised log lines: 0` → `PASS C0 — training completed cleanly`
+- ✅ **F5 silent**: `grep -c "nvidia-smi probe unavailable" dual_overlap_v9.log` = 0 (nvidia-smi works normally; the new INFO log fires only on probe failure)
+- ✅ **All 7 PASS-bar conditions** including C0 reported by `grep_overlap_log.sh`: PASS C2, C3, C4a, C4b, C5, C7, **C0** + informational C6, C20
+- ✅ Both training loops complete: mp2 @ 12:32:36, mp1 @ 12:32:55
+- ✅ GPU residual ~2 MiB across all 4 GPUs
+
+Vast stopped after validation.
+
 ### Open follow-ups
 
 | Severity | ID | Title | Status |
