@@ -558,6 +558,60 @@ The 2.76 GB delta on offload is what makes the 16 GB GPU fit the workload.
 - SGLang live-edit reverted on vast before stop (vast image is in its original state).
 - Total session wall-clock: ~3 hours including bug discovery + 8 smoke iterations.
 
+---
+
+## Batch follow-up fixes — B-15 + F5 + F9 + F7 (2026-05-24, post-v8)
+
+Four small follow-ups from `m11-review.review-report.md` §2:
+- **B-15** (harness): `grep_overlap_log.sh` reported PASS even when training crashed.
+- **F5** (LOW): `nvidia-smi` timeout was logged at DEBUG only.
+- **F9** (NOTE): `_split_pools_for_dual` silently ignored extra GPUs.
+- **F7** (NOTE): `shrink_engines` pause_generation contract undocumented.
+
+### Implementation
+
+| File | Fix | LoC | Commit |
+|---|---|---|---|
+| `rlix_miles/scripts/grep_overlap_log.sh:118-138` | B-15 — new C0 condition: ≥1 `training loop complete pipeline_id=` + 0 `train_group.train raised` | +19 | rlix `a4c6369` |
+| `rlix_miles/rlix/pipeline/miles_pipeline.py:585-602` | F5 — `nvidia-smi` probe-unavail log promoted DEBUG→INFO + counter | +12 / -5 | rlix `a4c6369` |
+| `miles/examples/rlix/run_miles_dual.py:76-91` | F9 — raise on `num_gpus_per_node != 2*infer_pool_size` | +15 | miles `1487c3f` |
+| `miles/miles/ray/rollout.py:1003-1030` | F7 — pause_generation contract docstring + `engine_indices` in log | +18 / -7 | miles `1487c3f` |
+
+### Validation performed (post-Codex-review, 2026-05-24)
+
+| Fix | Static syntax | Behavior test | Result |
+|---|---|---|---|
+| B-15 | `bash -n grep_overlap_log.sh` → syntax OK | Ran harness against synthetic PASS log (2 pipelines complete, 0 raised) → `PASS C0`; ran against synthetic train-crash log (0 complete, 1 raised) → `FAIL C0 — training loops never completed` | ✅ regex matches both single + dual driver log formats (`run_miles_rlix.py:256` + `run_miles_dual.py:496` both emit `pipeline_id=`) |
+| F5 | `python3 -c "import ast; ast.parse(miles_pipeline.py)"` → syntax OK | Read modified section: log message format string + nvidia_smi_unavail_count local counter + INFO level + 3s grace sleep short-circuit all correct | ✅ structural |
+| F9 | `python3 -c "ast.parse(run_miles_dual.py)"` → syntax OK | Executed `_split_pools_for_dual` with 5 input combinations: 4-GPU even (PASS p1=[0,1], p2=[2,3]); 3-GPU insufficient (raises "need 4 GPUs"); 5-GPU extra (raises "silently ignored — use MILES_DUAL_P\*"); 6-GPU extra (raises); 2-GPU insufficient (raises) | ✅ all 5 behavior tests PASS |
+| F7 | `python3 -c "ast.parse(rollout.py)"` → syntax OK | Read modified section: docstring blocks correctly formatted, `except Exception` body still calls `logger.warning(...)` with the new `engine_indices=%s` format placeholder + `indices` arg | ✅ control-flow bit-for-bit identical to pre-edit (Codex round-2 confirmed) |
+
+### NOT validated (would require vast)
+
+- **B-15 + F5** under a real overlap smoke run — both validated via synthetic logs + static. Vast was stopped per user request after v8 PASS, so no new smoke iteration was needed for these.
+- **F9** under a real `run_miles_dual.py` invocation — the function is pure (no side effects, no Ray), so static + 5 behavior tests are sufficient.
+- **F7** under a real SGLang pause_generation failure — would require fault injection that pause_generation rejects (e.g. 5xx). Behavior IS bit-for-bit identical to pre-edit (only comment + log format changed), so no behavior change to verify.
+
+### Codex sign-off
+
+- Round 1: NEEDS_REVISION (1 MEDIUM on hypothetical regex false-positive that didn't apply; 1 LOW on F7 idempotency overstatement).
+- Round 2: NEEDS_REVISION (1 CRITICAL — provided file artifact truncated, not a code issue).
+- Round 3: **APPROVE_WITH_NOTES, 0 BLOCKERS**.
+
+### Pushed
+
+- rlix `a4c6369 fix(rlix): B-15 + F5 — harness training-completion check + nvidia-smi log promotion`
+- miles `1487c3f fix(miles): F7 + F9 — pause_generation contract docs + reject odd GPU counts`
+
+### Open follow-ups
+
+| Severity | ID | Title | Status |
+|---|---|---|---|
+| MED | F2 | configurable free-mem threshold | howard989's PR `rlops/miles#3` in flight |
+| MED | MED1 | concurrent-resize stress test under `max_concurrency=4` | M11.3 multi-day |
+| NOTE | F8 + F10 | `orchestrator.cleanup_stale_pipelines()` RPC | M11.3 |
+| LOW | LOW1 | verify `generate_rollout_fully_async` accepts `rlix_hooks` kw | ~30 min |
+
 ### Codex final sign-off (2026-05-11)
 
 > **VERDICT: APPROVE_WITH_NOTES**
