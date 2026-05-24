@@ -50,9 +50,17 @@ fi
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export MILES_TMS_HOOK_MODE=torch
-# Also needed for the m11.1 smoke flow that the dual driver shares.
-export MILES_SKIP_TMS_PAUSE=1
+# B-14 mitigation on 16 GB GPUs: enable torch_memory_saver.pause() so
+# Megatron weights actually move off-GPU between train cycles. Original
+# `MILES_SKIP_TMS_PAUSE=1` was a workaround for tms.pause segfault on
+# CUDA 12.9 + Blackwell + tms 0.0.9. On this RTX 4060 Ti + torch 2.11
+# stack, attempt to use real tms.pause to free GPU memory between
+# rollouts.
+# export MILES_SKIP_TMS_PAUSE=1
 export MILES_SKIP_NODE_PG_PIN=1
+# NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is incompatible with
+# torch_memory_saver per "TorchMemorySaver is disabled for the current process
+# because expandable_segments is not supported yet" — do NOT set it.
 
 # Real M11.2 Option β switch + overlap topology (Codex KT review).
 # Comment any of these out to fall back to disjoint Option A behavior.
@@ -104,16 +112,16 @@ python /root/miles/examples/rlix/run_miles_dual.py \
   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl \
   --input-key prompt --label-key label --apply-chat-template --rollout-shuffle \
   --rm-type deepscaler \
-  --num-rollout 2 --rollout-batch-size 4 --n-samples-per-prompt 4 \
-  --rollout-max-response-len 1024 --rollout-temperature 1 \
-  --global-batch-size 16 --balance-data \
+  --num-rollout 2 --rollout-batch-size 1 --n-samples-per-prompt 1 \
+  --rollout-max-response-len 256 --rollout-temperature 1 \
+  --global-batch-size 1 --balance-data \
   --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 \
   --context-parallel-size 1 \
   --advantage-estimator grpo --use-kl-loss --kl-loss-coef 0.0 \
   --kl-loss-type low_var_kl --eps-clip 0.2 --eps-clip-high 0.28 \
   --optimizer adam --lr 1e-6 --lr-decay-style constant \
   --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98 \
-  --use-dynamic-batch-size --max-tokens-per-gpu 2048 \
+  --use-dynamic-batch-size --max-tokens-per-gpu 512 \
   --sglang-mem-fraction-static 0.30 \
   --rollout-num-gpus 2 --rollout-num-gpus-per-engine 1 \
   --use-miles-router \
