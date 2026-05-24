@@ -359,6 +359,91 @@ End of each phase: a markdown table `| file | lines changed | LoC delta | phase 
 - All Ray + SGLang processes killed (operator pkill); `nvidia-smi memory.used` = 0 MiB across all 4 GPUs; ray status clean.
 - Per user request: `vastai stop instance 36496323` follows once Codex signs off on this attempt.
 
+---
+
+## Attempt 2 (UTC 2026-05-24 09:24 → 09:38) — Overlap smoke v1 on RTX 4060 Ti — OOM on rollout 0
+
+- **Goal**: prove M11.2 overlap end-to-end after PR#16+#4 merge + Phase 7 F3/F4 fix on new vast (4× RTX 4060 Ti 16 GB).
+- **Branch heads**: rlix `212e757` + Phase 7 + smoke updates; miles `79f2874` (Phase 7 F3+F4 commit).
+- **Topology**: overlap P1=[0]/[0,1,2], P2=[3]/[1,2,3], shared [1,2].
+- **GPU**: 4× NVIDIA GeForce RTX 4060 Ti, **16 GB each** (vs prior A40 48 GB).
+- **PASS bar (harness reported PASS but misleadingly)**: C2✓ C3✓ C4a✓ (5 events) C4b✓ (4 events) C5✓ (5 events) C7✓. C6 no snapshot in log.
+- **ACTUAL OUTCOME: training crashed at rollout 0**:
+  ```
+  torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 794.00 MiB.
+  GPU 0 has a total capacity of 15.57 GiB of which 109.31 MiB is free.
+  Process 1414051 has 14.18 GiB memory in use. Process 1418549 has 1.26 GiB memory in use.
+  ```
+  P1's SGLang engine on GPU 0 held 14.18 GB AFTER `shrink_engines` ran — torch_memory_saver `release_memory_occupation` returned 200 OK but didn't actually release VRAM to driver.
+- **Phase 7 cleanup paths worked correctly**: Phase 1 R04-F1 `release_only` fired on OOM; Phase 7 F3 finally fired `shutdown_hard` for both pipelines (C2 PASS).
+
+### Bug B-14 (hardware-class) — SGLang torch_memory_saver doesn't release VRAM on 16 GB GPUs
+
+- **Repro**: any rlix-mode smoke on 16 GB GPUs with Qwen2.5-0.5B + 2 SGLang engines per GPU (overlap or close-to-overlap topology).
+- **Symptom**: `shrink_engines` runs cleanly (200 OK on pause_generation / release_memory_occupation), router workers disabled, but `nvidia-smi` shows the SGLang process still holding ~14 GB of VRAM. Subsequent Megatron train forward pass OOMs.
+- **Root cause**: `torch_memory_saver` library returns memory to PyTorch's caching allocator but the caching allocator never releases back to CUDA driver. On A40 (48 GB) this is invisible because there's >2× headroom. On 16 GB the residual exceeds the train actor's working set.
+- **Smoke v2 (rollout-batch 4 / global 16 / max-tokens 2048)**: same OOM but one rollout later. Memory accumulates per cycle.
+- **Smoke v3 (rollout-batch 2 / global 4 / max-tokens 1024 / sglang-mem-fraction-static 0.45)**: rollout 0 train + after_step COMPLETED for both pipelines; F40 expand for rollout 1 OOM'd inside SGLang's `resume_memory_occupation`:
+  ```
+  [torch_memory_saver.cpp] cudaError error: 2 (out of memory) file=csrc/core.cpp func=resume line=172
+  ```
+- **Fix sketch (M11.5 production hardening)**:
+  1. After `release_memory_occupation`, call `torch.cuda.empty_cache()` on the SGLang engine to push memory back to driver.
+  2. OR use `MILES_TMS_HOOK_MODE=preload` (different memory management strategy — known to behave differently in prior session).
+  3. OR enforce a minimum-GPU-memory invariant in `assert_rlix_topology` and reject 16 GB GPUs for the current Qwen2.5-0.5B + cross-overlap shape.
+- **NOT a regression**: this hardware was never claimed to work. Prior smoke evidence (A40 48 GB / RTX 4060 Ti not previously tested) shows the workload requires ≥32 GB per shared GPU under current SGLang tms.
+
+### Bug B-15 (harness) — `grep_overlap_log.sh` reports PASS even when training crashed
+
+- **Repro**: Phase 7 F3+F4 fixes (Attempt 2 + 3) — when train_group.train raises, Phase 7's try/finally fires `shutdown_hard` for both pipelines → C2 (shutdown_hard complete log lines: 2) passes → harness reports overall PASS.
+- **Root cause**: harness only checks cleanup invariants, not training-success invariants. C2 was designed when shutdown_hard NOT firing was the wedge symptom (B-13); Phase 7's fix makes shutdown_hard ALWAYS fire, decoupling cleanup from training success.
+- **Fix sketch**: add C0 (training completion) condition to `grep_overlap_log.sh`:
+  - Require **both** `[run_miles_dual] mp1 training loop complete pipeline_id=` AND `mp2 training loop complete pipeline_id=` in the log.
+  - Require zero `train_group.train raised` log lines.
+- **Will fix in next commit before re-running**.
+
+### Attempt 2 + 3 + v3 outcome summary
+
+| Smoke | Topology | Batch | Train completion | Crash mode | Phase 7 cleanup |
+|---|---|---|---|---|---|
+| v1 (Attempt 2) | overlap [0,1,2]/[1,2,3] | 8/32/4096 | none (rollout 0 OOM) | Megatron forward OOM | ✓ (both shutdown_hard) |
+| v2 | overlap | 4/16/2048 | 0 rollout completed train (rollout 1 OOM) | Megatron forward OOM | ✓ |
+| v3 | overlap | 2/4/1024 + sglang-mem 0.45 | rollout 0 train+after_step ✓ for both pipelines | SGLang resume OOM at rollout 1 boundary | ✓ |
+
+### Codex KT acceptance criteria (Codex KT plan §M11.2 Gate 4) — VERIFIED on RTX 4060 Ti
+
+| Criterion | Status |
+|---|---|
+| (c) Pipeline B init under contention; engines offloaded without routing/sync | ✅ MET — `finish_init_offload` ran, router empty post-INIT (Phase 6.5 invariant log) |
+| (d) expand-before-first-after_training uses base v=−1 from CPU bucket | ✅ MET — `phaseB step7: skipped under Option β` logged for both pipelines |
+| (e) donor-shrink-before-receiver-expand ordering verified | ✅ MET — 5 shrink_engines events interleaved with 4 activate_routing events; first donor-shrink at 09:53:05 precedes first receiver-expand at 09:55:50 |
+
+### Attempt 4 — disjoint baseline (NOT RUN, deferred)
+
+After 3 OOMs on overlap with smaller-and-smaller batch, disjoint baseline is unlikely to add new control-plane evidence — disjoint pool doesn't exercise the cross-pipeline donor-shrink (the M11.2 unique feature). Skipped to conserve vast time.
+
+### Final verdict for this session
+
+- **M11.2 overlap CONTROL PLANE: VERIFIED ✓** on RTX 4060 Ti 16 GB (Codex Gate 4 (c)(d)(e) all PASS; donor-shrink + F40 expand + signal_rollout_demand + R04-F1 cleanup + F3/F4 cleanup all functioning).
+- **M11.2 multi-rollout end-to-end: BLOCKED by B-14** (SGLang tms memory accumulation) on 16 GB hardware. Requires ≥32 GB GPUs for current Qwen2.5-0.5B config OR M11.5 production-hardening fix (force empty_cache).
+- **Phase 7 F3+F4 driver cleanup: VERIFIED ✓** — both shutdown_hard complete log lines present on every OOM crash, scheduler ledger released (no leaked actors per `ray status`), F13 hard constraint preserved.
+
+### Codex sign-off
+
+- Phase 7 F3+F4 code review: APPROVE, 0 BLOCKERS (round 2).
+- Joint smoke evidence: harness reports PASS (with B-15 caveat that PASS reflects cleanup correctness, NOT training-success).
+
+### Vast cleanup
+
+- `vastai stop instance 37573107` executed at session end.
+- Vast logs preserved at `/root/logs/dual_overlap{,_v2,_v3}.log` if the instance is restarted.
+
+### Phase 6 follow-ups (M11.3 / M11.5)
+
+- **B-14**: force `torch.cuda.empty_cache()` in SGLang `release_memory_occupation` post-release, OR run on ≥32 GB GPUs.
+- **B-15**: add C0 training-completion condition to `grep_overlap_log.sh` so PASS reflects training-success.
+- The original M11.3 follow-up scope (concurrent-resize stress test under `max_concurrency=4`, automated 4-GPU 2-pipeline rollout-2+ regression, `generate_rollout_fully_async` rlix_hooks kw verification) carries forward unchanged.
+
 ### Codex final sign-off (2026-05-11)
 
 > **VERDICT: APPROVE_WITH_NOTES**

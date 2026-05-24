@@ -104,16 +104,17 @@ python /root/miles/examples/rlix/run_miles_dual.py \
   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl \
   --input-key prompt --label-key label --apply-chat-template --rollout-shuffle \
   --rm-type deepscaler \
-  --num-rollout 2 --rollout-batch-size 8 --n-samples-per-prompt 4 \
-  --rollout-max-response-len 2048 --rollout-temperature 1 \
-  --global-batch-size 32 --balance-data \
+  --num-rollout 2 --rollout-batch-size 2 --n-samples-per-prompt 2 \
+  --rollout-max-response-len 512 --rollout-temperature 1 \
+  --global-batch-size 4 --balance-data \
   --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 \
   --context-parallel-size 1 \
   --advantage-estimator grpo --use-kl-loss --kl-loss-coef 0.0 \
   --kl-loss-type low_var_kl --eps-clip 0.2 --eps-clip-high 0.28 \
   --optimizer adam --lr 1e-6 --lr-decay-style constant \
   --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98 \
-  --use-dynamic-batch-size --max-tokens-per-gpu 4096 \
+  --use-dynamic-batch-size --max-tokens-per-gpu 1024 \
+  --sglang-mem-fraction-static 0.45 \
   --rollout-num-gpus 2 --rollout-num-gpus-per-engine 1 \
   --use-miles-router \
   --rollout-function-path examples.fully_async.fully_async_rollout.generate_rollout_fully_async \
