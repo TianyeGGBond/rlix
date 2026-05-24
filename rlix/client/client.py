@@ -73,8 +73,28 @@ def _get_or_create_orchestrator(opts: ConnectOptions) -> Any:
                     name=ORCHESTRATOR_ACTOR_NAME,
                     namespace=RLIX_NAMESPACE,
                     scheduling_strategy=strategy,
+                    # Stays at max_restarts=0 by design. Orchestrator.__init__
+                    # would re-bootstrap the scheduler topology on restart
+                    # (re-running _ensure_scheduler_singleton.initialize), but
+                    # the ``self._pipelines`` registry of admitted pipelines is
+                    # in-memory and would be wiped — every active pipeline
+                    # would become unreachable for admit / unregister. Cheaper
+                    # to surface the underlying Ray race (worker.py:1039
+                    # 'core_worker' AttributeError) as a hard failure than to
+                    # mask it with a half-recovered state.
                     max_restarts=0,
                     max_task_retries=0,
+                    # max_concurrency=4 mitigates the Ray-2.55.1 worker.py:1039
+                    # ``'Worker' object has no attribute 'core_worker'`` race
+                    # that fires when concurrent inbound RPCs (register_pipeline
+                    # / admit_pipeline / unregister + the per-rollout
+                    # signal_rollout_demand → scheduler.report_progress chain)
+                    # contend on the default single-threaded actor task loop.
+                    # The same fix is applied to MilesCoordinator
+                    # (rlix/pipeline/miles_coordinator.py:602). 4 matches the
+                    # number of cross-actor surfaces that can fire in parallel
+                    # under the 2-pipeline 4-GPU topology.
+                    max_concurrency=4,
                     runtime_env=runtime_env,
                 )
                 .remote(env_vars=opts.env_vars)

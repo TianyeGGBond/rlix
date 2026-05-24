@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from rlix.protocol.types import Priority, ProgressReport
 from rlix.scheduler.types import ClusterAllocation, PendingPlannedReleaseRequest, PendingRequest
@@ -23,6 +23,13 @@ class SchedulerState:
     #   latest_progress_by_pipeline[pipeline_id][mode][stream_key] = ProgressReport
     # where stream_key is lora_id for LoRA streams, or a reserved key for full-finetune.
     latest_progress_by_pipeline: Dict[str, Dict[str, Dict[str, ProgressReport]]] = field(default_factory=dict)
+
+    # Rollout demand signal: pipeline_id -> step_target_estimate.
+    # Set when request_gpus(priority=GENERATION) is enqueued; survives until the
+    # GENERATION cluster is released or clear_progress() retires all batch streams.
+    # Covers the gap between pending-request signal and first ProgressReport arrival.
+    # Cleared on release, clear_progress(), unregister_pipeline(), and fail-fast shutdown.
+    rollout_open_pipelines: Dict[str, Optional[int]] = field(default_factory=dict)
 
     def pending_bucket(self, priority: Priority) -> List[PendingRequest]:
         bucket = self.pending_requests.get(priority)

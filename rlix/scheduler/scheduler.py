@@ -288,6 +288,7 @@ class SchedulerImpl:
             # ============================================================
             self._state.pipeline_registry.pop(pipeline_id, None)
             self._state.latest_progress_by_pipeline.pop(pipeline_id, None)
+            self._clear_rollout_intent_locked(pipeline_id)
             self._coordinator_handle_cache.pop(pipeline_id, None)
 
             # Remove allocations
@@ -578,7 +579,11 @@ class SchedulerImpl:
         validate_pipeline_id(pipeline_id)
         async with self._lock:
             self._state.latest_progress_by_pipeline.pop(pipeline_id, None)
+            self._clear_rollout_intent_locked(pipeline_id)
             self._wakeup_event.set()
+
+    def _clear_rollout_intent_locked(self, pipeline_id: str) -> None:
+        self._state.rollout_open_pipelines.pop(pipeline_id, None)
 
     async def request_gpus(
         self,
@@ -629,6 +634,8 @@ class SchedulerImpl:
                 lora_name=lora_name,  # GPU Tracing: pass lora_name to pending request
             )
             self._state.pending_bucket(priority).append(pending)
+            if priority == Priority.GENERATION:
+                self._state.rollout_open_pipelines[pipeline_id] = step_target_estimate
             # Queue Tracing: Track enqueue AFTER append (depth is correct)
             self._tracer.trace_queue_enqueue(
                 cluster_id, priority, lora_name, bucket_depth=len(self._state.pending_bucket(priority))
@@ -656,6 +663,9 @@ class SchedulerImpl:
             self._tracer.trace_active_gpus_update(num_gpus=self._num_gpus, idle_gpu_count=len(self._state.idle_gpus))
             # GPU Tracing: Instant marker for release
             self._tracer.trace_release_marker(cluster_id, alloc.gpu_ids)
+            if is_generation_cluster(cluster_id):
+                released_pipeline_id, _ = parse_cluster_id(cluster_id)
+                self._clear_rollout_intent_locked(released_pipeline_id)
             self._wakeup_event.set()
 
     async def notify_release_then_request_gpus(
@@ -708,6 +718,9 @@ class SchedulerImpl:
             self._tracer.trace_active_gpus_update(num_gpus=self._num_gpus, idle_gpu_count=len(self._state.idle_gpus))
             # GPU Tracing: Instant marker for release
             self._tracer.trace_release_marker(release_cluster_id, alloc.gpu_ids)
+            if is_generation_cluster(release_cluster_id):
+                released_pipeline_id, _ = parse_cluster_id(release_cluster_id)
+                self._clear_rollout_intent_locked(released_pipeline_id)
             if self._has_any_pending_request_locked(cluster_id=request_cluster_id):
                 raise RuntimeError(f"Duplicate pending request for cluster_id={request_cluster_id!r} is not supported")
             self._request_seq += 1
@@ -721,6 +734,9 @@ class SchedulerImpl:
                 lora_name=request_lora_name,  # GPU Tracing: pass lora_name to pending request
             )
             self._state.pending_bucket(request_priority).append(pending)
+            if request_priority == Priority.GENERATION:
+                pipeline_id_gen, _ = parse_cluster_id(request_cluster_id)
+                self._state.rollout_open_pipelines[pipeline_id_gen] = request_step_target_estimate
             # Queue Tracing: Track enqueue AFTER append (depth is correct)
             self._tracer.trace_queue_enqueue(
                 request_cluster_id,
@@ -758,6 +774,7 @@ class SchedulerImpl:
             req.error = error
             req.event.set()
         self._state.pending_planned_release_requests.clear()
+        self._state.rollout_open_pipelines.clear()
 
     async def _central_scheduling_loop(self) -> None:
         """Async event loop that drives scheduling cycles.
@@ -1139,7 +1156,7 @@ class SchedulerImpl:
                     idle_gpus=idle_for_gen,
                     pipeline_registry=self._state.pipeline_registry,
                     active_allocations=self._state.active_allocations,
-                    pending_bucket_gen=list(self._state.pending_bucket(Priority.GENERATION)),
+                    rollout_open_pipelines=dict(self._state.rollout_open_pipelines),
                     progress_totals_fn=self._pipeline_progress_totals_locked,
                 )
 

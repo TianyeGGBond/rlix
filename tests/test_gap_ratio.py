@@ -5,7 +5,6 @@ Test 2: two-pipeline donor shrink (donor-search path).
 """
 from __future__ import annotations
 
-import asyncio
 import importlib
 import sys
 import types
@@ -60,9 +59,6 @@ def test_single_pipeline_idle_gpus_activated(monkeypatch: pytest.MonkeyPatch) ->
     gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
 
     ExecutionPlan = scheduler_types.ExecutionPlan
-    Priority = protocol_types.Priority
-    Request = scheduler_types.Request
-    PendingRequest = scheduler_types.PendingRequest
 
     plan = ExecutionPlan()
     pipeline_id = "ft_000000000000"
@@ -92,14 +88,7 @@ def test_single_pipeline_idle_gpus_activated(monkeypatch: pytest.MonkeyPatch) ->
         }
     }
 
-    pending_bucket_gen = [
-        PendingRequest(
-            request=Request(cluster_id=cluster_id, priority=Priority.GENERATION, timestamp=0.0),
-            event=asyncio.Event(),
-        )
-    ]
-
-    # 50% remaining -> nonzero demand weight
+    # 50% remaining -> nonzero demand weight; pipeline has an open rollout batch
     def progress_totals_fn(*, pipeline_id):
         return (50.0, 100.0)
 
@@ -111,7 +100,8 @@ def test_single_pipeline_idle_gpus_activated(monkeypatch: pytest.MonkeyPatch) ->
         idle_gpus={2, 3},
         pipeline_registry=pipeline_registry,
         active_allocations={},
-        pending_bucket_gen=pending_bucket_gen,
+        rollout_open_pipelines={pipeline_id: None},
+
         progress_totals_fn=progress_totals_fn,
     )
 
@@ -126,13 +116,10 @@ def test_single_pipeline_idle_gpus_activated(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_pending_request_uses_step_target_estimate_without_progress_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A pending GENERATION request can bootstrap demand from its explicit estimate."""
+    """A rollout-open pipeline can bootstrap demand from its explicit step_target_estimate."""
     gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
 
     ExecutionPlan = scheduler_types.ExecutionPlan
-    Priority = protocol_types.Priority
-    Request = scheduler_types.Request
-    PendingRequest = scheduler_types.PendingRequest
 
     plan = ExecutionPlan()
     pipeline_id = "ft_222222222222"
@@ -159,14 +146,8 @@ def test_pending_request_uses_step_target_estimate_without_progress_snapshot(mon
             "admitted": True,
         }
     }
-    pending_bucket_gen = [
-        PendingRequest(
-            request=Request(cluster_id=cluster_id, priority=Priority.GENERATION, timestamp=0.0),
-            event=asyncio.Event(),
-            step_target_estimate=4,
-        )
-    ]
 
+    # No progress yet; step_target_estimate carried from the original request
     def progress_totals_fn(*, pipeline_id):
         return (0.0, 0.0)
 
@@ -178,16 +159,15 @@ def test_pending_request_uses_step_target_estimate_without_progress_snapshot(mon
         idle_gpus={0, 1},
         pipeline_registry=pipeline_registry,
         active_allocations={},
-        pending_bucket_gen=pending_bucket_gen,
+        rollout_open_pipelines={pipeline_id: 4},
+
         progress_totals_fn=progress_totals_fn,
     )
 
     assert len(plan.sched_guided_allocation_ops) == 1
     op = plan.sched_guided_allocation_ops[0]
     assert op.cluster_id == cluster_id
-    assert set(op.gpus_to_allocate)
-    assert set(op.gpus_to_allocate).issubset({0, 1})
-    assert set(op.dp_ranks_to_add)
+    assert op.dp_rank_to_gpus_to_add
     assert remaining_idle != {0, 1}
 
 
@@ -196,13 +176,9 @@ def test_pending_request_without_progress_or_estimate_does_not_bootstrap(monkeyp
     gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
 
     ExecutionPlan = scheduler_types.ExecutionPlan
-    Priority = protocol_types.Priority
-    Request = scheduler_types.Request
-    PendingRequest = scheduler_types.PendingRequest
 
     plan = ExecutionPlan()
     pipeline_id = "ft_333333333333"
-    cluster_id = f"{pipeline_id}_actor_infer"
 
     _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
     active_dp_workers = {pipeline_id: []}
@@ -225,16 +201,11 @@ def test_pending_request_without_progress_or_estimate_does_not_bootstrap(monkeyp
             "admitted": True,
         }
     }
-    pending_bucket_gen = [
-        PendingRequest(
-            request=Request(cluster_id=cluster_id, priority=Priority.GENERATION, timestamp=0.0),
-            event=asyncio.Event(),
-        )
-    ]
 
     def progress_totals_fn(*, pipeline_id):
         return (0.0, 0.0)
 
+    # Pipeline is open but has no step_target_estimate (None) and no progress -> no demand
     remaining_idle = gap_ratio_mod.plan_generation_gap_ratio(
         plan,
         active_dp_workers=active_dp_workers,
@@ -243,7 +214,8 @@ def test_pending_request_without_progress_or_estimate_does_not_bootstrap(monkeyp
         idle_gpus={0, 1},
         pipeline_registry=pipeline_registry,
         active_allocations={},
-        pending_bucket_gen=pending_bucket_gen,
+        rollout_open_pipelines={pipeline_id: None},
+
         progress_totals_fn=progress_totals_fn,
     )
 
@@ -256,9 +228,6 @@ def test_real_progress_overrides_pending_estimate(monkeypatch: pytest.MonkeyPatc
     gap_ratio_mod, scheduler_types, protocol_types = _load_gap_ratio_modules(monkeypatch)
 
     ExecutionPlan = scheduler_types.ExecutionPlan
-    Priority = protocol_types.Priority
-    Request = scheduler_types.Request
-    PendingRequest = scheduler_types.PendingRequest
 
     plan = ExecutionPlan()
     pipeline_id = "ft_444444444444"
@@ -285,14 +254,8 @@ def test_real_progress_overrides_pending_estimate(monkeypatch: pytest.MonkeyPatc
             "admitted": True,
         }
     }
-    pending_bucket_gen = [
-        PendingRequest(
-            request=Request(cluster_id=cluster_id, priority=Priority.GENERATION, timestamp=0.0),
-            event=asyncio.Event(),
-            step_target_estimate=1000,
-        )
-    ]
 
+    # Real progress (5/10) is present; estimate=1000 should be ignored
     def progress_totals_fn(*, pipeline_id):
         return (5.0, 10.0)
 
@@ -304,13 +267,15 @@ def test_real_progress_overrides_pending_estimate(monkeypatch: pytest.MonkeyPatc
         idle_gpus={0, 1},
         pipeline_registry=pipeline_registry,
         active_allocations={},
-        pending_bucket_gen=pending_bucket_gen,
+        rollout_open_pipelines={pipeline_id: 1000},
+
         progress_totals_fn=progress_totals_fn,
     )
 
     assert len(plan.sched_guided_allocation_ops) == 1
     op = plan.sched_guided_allocation_ops[0]
-    assert set(op.gpus_to_allocate) == {0, 1}
+    assert op.cluster_id == cluster_id
+    assert {gpu_id for gpus in op.dp_rank_to_gpus_to_add.values() for gpu_id in gpus} == {0, 1}
 
 
 def test_two_pipelines_donor_shrink(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -319,8 +284,6 @@ def test_two_pipelines_donor_shrink(monkeypatch: pytest.MonkeyPatch) -> None:
 
     ExecutionPlan = scheduler_types.ExecutionPlan
     Priority = protocol_types.Priority
-    Request = scheduler_types.Request
-    PendingRequest = scheduler_types.PendingRequest
     ClusterAllocation = scheduler_types.ClusterAllocation
 
     plan = ExecutionPlan()
@@ -371,14 +334,7 @@ def test_two_pipelines_donor_shrink(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
     }
 
-    # Only Pipeline B has a pending request (drives demand inflation)
-    pending_bucket_gen = [
-        PendingRequest(
-            request=Request(cluster_id=cluster_b, priority=Priority.GENERATION, timestamp=0.0),
-            event=asyncio.Event(),
-        )
-    ]
-
+    # Only pipeline_b has an open rollout batch (drives demand inflation)
     def progress_totals_fn(*, pipeline_id):
         if pipeline_id == pipeline_a:
             return (10.0, 100.0)  # 10% remaining -> low demand weight
@@ -392,7 +348,8 @@ def test_two_pipelines_donor_shrink(monkeypatch: pytest.MonkeyPatch) -> None:
         idle_gpus=set(),  # No free GPUs — must donate from Pipeline A
         pipeline_registry=pipeline_registry,
         active_allocations=active_allocations,
-        pending_bucket_gen=pending_bucket_gen,
+        rollout_open_pipelines={pipeline_b: None},
+
         progress_totals_fn=progress_totals_fn,
     )
 
@@ -410,7 +367,7 @@ def test_two_pipelines_donor_shrink(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_no_donor_mutation_when_receiver_ineligible(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Receiver with no pending request and no active allocation must not trigger donor shrinks.
+    """Receiver with no open rollout batch and no active allocation must not trigger donor shrinks.
 
     Regression test: previously _try_activate_one committed donor shrink mutations before
     checking receiver eligibility, leaving orphaned shrink ops if the guard fired.
@@ -423,7 +380,7 @@ def test_no_donor_mutation_when_receiver_ineligible(monkeypatch: pytest.MonkeyPa
 
     plan = ExecutionPlan()
     donor_id = "ft_000000000000"  # Has active workers, can donate
-    receiver_id = "ft_111111111111"  # No pending request, no active allocation -> ineligible
+    receiver_id = "ft_111111111111"  # Not in rollout_open_pipelines, no active allocation -> ineligible
 
     _GapRatioDPWorker = gap_ratio_mod._GapRatioDPWorker
 
@@ -471,13 +428,16 @@ def test_no_donor_mutation_when_receiver_ineligible(monkeypatch: pytest.MonkeyPa
         idle_gpus=set(),  # No free GPUs — would need to donate
         pipeline_registry=pipeline_registry,
         active_allocations=active_allocations,
-        pending_bucket_gen=[],  # No pending request for receiver
+        rollout_open_pipelines={},  # receiver_id absent -> ineligible
+
         progress_totals_fn=progress_totals_fn,
     )
 
     # No shrink ops should have been added — donor must not be mutated for an ineligible receiver
     assert len(plan.sched_guided_shrink_ops) == 0
     assert len(plan.sched_guided_allocation_ops) == 0
+
+
 
 
 def test_snapshot_fails_fast_when_actor_infer_missing(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -187,12 +187,13 @@ def test_gen_allocation_through_scheduling_cycle(monkeypatch: pytest.MonkeyPatch
         }
     }
 
-    # Pending GENERATION request
+    # Pending GENERATION request (also mark pipeline as rollout-open, as request_gpus() would)
     pending = PendingRequest(
         request=Request(cluster_id=infer_cluster_id, priority=Priority.GENERATION, timestamp=0.0),
         event=asyncio.Event(),
     )
     scheduler._state.pending_bucket(Priority.GENERATION).append(pending)
+    scheduler._state.rollout_open_pipelines[pipeline_id] = None
 
     # Coordinator handle cache (needed for Phase 5 resize RPCs)
     scheduler._coordinator_handle_cache[pipeline_id] = ("test_ns", _FakeCoordinator())

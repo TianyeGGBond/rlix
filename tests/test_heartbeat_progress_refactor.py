@@ -245,7 +245,7 @@ class TestSchedulerIngressValidation:
             metrics={"mode": "aggregated", "collected": 50},
         )
         with pytest.raises(ValueError, match="missing required 'completed' metric"):
-            asyncio.get_event_loop().run_until_complete(scheduler.report_progress(report))
+            asyncio.run(scheduler.report_progress(report))
 
     def test_remaining_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         scheduler_module, protocol_types, _ = _load_scheduler_modules(monkeypatch)
@@ -259,7 +259,7 @@ class TestSchedulerIngressValidation:
             metrics={"mode": "aggregated", "completed": 50, "remaining": 50},
         )
         with pytest.raises(ValueError, match="contains wire-level 'remaining'"):
-            asyncio.get_event_loop().run_until_complete(scheduler.report_progress(report))
+            asyncio.run(scheduler.report_progress(report))
 
 
 # ===========================================================================
