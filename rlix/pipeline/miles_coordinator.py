@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import threading
 import time
 from copy import deepcopy
@@ -37,7 +38,7 @@ from rlix.protocol.types import (
     get_pipeline_namespace,
 )
 from rlix.protocol.validation import validate_pipeline_id
-from rlix.utils.env import pipeline_identity_env_vars
+from rlix.utils.env import parse_env_positive_float, pipeline_identity_env_vars
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -60,9 +61,13 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     runtime_env. Reads ``RLIX_CONTROL_PLANE`` from the environment so
     actors inside an existing pipeline preserve the inherited value.
     """
-    return pipeline_identity_env_vars(
+    env_vars = pipeline_identity_env_vars(
         pipeline_id=str(pipeline_id), ray_namespace=str(ray_namespace)
     )
+    for key in ("MILES_MAX_RESIDUAL_GPU_MEM_GB",):
+        if (value := os.environ.get(key)) is not None:
+            env_vars[key] = value
+    return env_vars
 
 
 class MilesCoordinator(Coordinator):
@@ -430,8 +435,26 @@ class MilesCoordinator(Coordinator):
             rollout_manager = self._model_update_resources.get("rollout_manager")
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for shrink")
-        # RPC outside the lock.
-        ray.get(rollout_manager.shrink_engines.remote(sorted(engine_indices)))
+        # RPC outside the lock. Use SGLang's server-side residual allocation
+        # check (weight + kvcache + graph) after release_memory_occupation; it
+        # is narrower than raw nvidia-smi used memory and avoids counting CUDA /
+        # Ray / process runtime overhead as model residue.
+        residual_threshold_gb = parse_env_positive_float(
+            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0
+        )
+        shrunk = ray.get(
+            rollout_manager.shrink_engines.remote(
+                sorted(engine_indices),
+                post_sleep_vram_threshold_gb=residual_threshold_gb,
+            )
+        )
+        logger.info(
+            "[MilesCoordinator] shrink_engines residual allocation check passed "
+            "pipeline_id=%s engine_indices=%s threshold=%.1f GB",
+            self._pipeline_id,
+            sorted(shrunk),
+            residual_threshold_gb,
+        )
         # Commit under lock.
         with self._resize_sync_lock:
             self._active_engine_indices -= engine_indices
