@@ -435,12 +435,17 @@ class MilesCoordinator(Coordinator):
             rollout_manager = self._model_update_resources.get("rollout_manager")
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for shrink")
-        # RPC outside the lock. Use SGLang's server-side residual allocation
-        # check (weight + kvcache + graph) after release_memory_occupation; it
-        # is narrower than raw nvidia-smi used memory and avoids counting CUDA /
-        # Ray / process runtime overhead as model residue.
+        # RPC outside the lock.
+        # Per-engine PROCESS-resident GPU memory threshold (GiB) passed to
+        # MILES shrink_engines -> assert_post_sleep_process_vram_below_threshold.
+        # Default 3.0: an offloaded SGLang scheduler process measures ~1.8 GiB
+        # resident (mostly non-offloadable CUDA context), so 3.0 leaves margin
+        # over that baseline while still catching large residuals such as an
+        # unoffloaded KV pool. (A 0.5B weight-only offload miss adds only ~1 GiB
+        # and may not trip it; the gate targets large KV/full-offload failures.)
+        # This is NOT whole-GPU used and NOT /server_info accounting.
         residual_threshold_gb = parse_env_positive_float(
-            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0
+            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 3.0
         )
         shrunk = ray.get(
             rollout_manager.shrink_engines.remote(
@@ -449,8 +454,9 @@ class MilesCoordinator(Coordinator):
             )
         )
         logger.info(
-            "[MilesCoordinator] shrink_engines residual allocation check passed "
-            "pipeline_id=%s engine_indices=%s threshold=%.1f GB",
+            "[MilesCoordinator] shrink_engines complete pipeline_id=%s "
+            "engine_indices=%s per_process_residual_threshold=%.1f GB "
+            "(per-engine resident gate ran inside shrink_engines; fail-open if unmeasurable)",
             self._pipeline_id,
             sorted(shrunk),
             residual_threshold_gb,

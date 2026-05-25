@@ -33,9 +33,9 @@ def test_miles_shrink_uses_server_side_residual_threshold() -> None:
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value == "MILES_MAX_RESIDUAL_GPU_MEM_GB"
         and isinstance(node.args[1], ast.Constant)
-        and node.args[1].value == 2.0
+        and node.args[1].value == 3.0
         for node in ast.walk(shrink_fn)
-    ), "_shrink_workers must parse the residual threshold env var with 2GB default"
+    ), "_shrink_workers must parse the residual threshold env var with 3GB default"
 
     assert any(
         isinstance(node, ast.Call)
