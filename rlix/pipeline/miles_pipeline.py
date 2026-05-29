@@ -519,16 +519,6 @@ class MilesPipeline:
             return
         miles_args = self._pipeline_config.miles_args
         per_engine = max(int(getattr(miles_args, "rollout_num_gpus_per_engine", 1)), 1)
-        # M11.2 multi-pipeline fix: physical GPU IDs are absolute machine
-        # indices, but the RolloutManager uses LOCAL engine indices
-        # (0..N-1) within this pipeline's infer pool. Convert physical →
-        # local by subtracting the infer pool's first physical GPU.
-        # M11.1 single-pipeline pool was [0..rollout_num_gpus-1], so
-        # ``g // per_engine`` happened to equal the local engine index;
-        # for M11.2 P2 (pool [2,3]), ``2 // 1 = 2`` is wrong (no engine
-        # at local index 2). Read the infer mapping from
-        # cluster_device_mappings, fall back to range(rollout_num_gpus)
-        # for backward compat.
         cluster_mappings = (
             getattr(self._pipeline_config, "cluster_device_mappings", None) or {}
         )
@@ -537,11 +527,11 @@ class MilesPipeline:
                 "actor_infer", list(range(int(miles_args.rollout_num_gpus)))
             )
         )
-        infer_first = min(infer_mapping) if infer_mapping else 0
-        target_indices = sorted(
-            {(int(g) - infer_first) // per_engine for g in allocated_train_gpus}
+        target_indices, target_gpu_ids = self._map_overlap_gpus_to_engine_indices(
+            allocated_train_gpus=list(allocated_train_gpus),
+            infer_mapping=infer_mapping,
+            per_engine=per_engine,
         )
-        target_gpu_ids = sorted(set(int(g) for g in allocated_train_gpus))
         if not target_indices:
             return
 
@@ -615,6 +605,39 @@ class MilesPipeline:
             target_free_gb,
             target_gpu_ids,
         )
+
+    @staticmethod
+    def _map_overlap_gpus_to_engine_indices(
+        *,
+        allocated_train_gpus: list[int],
+        infer_mapping: list[int],
+        per_engine: int,
+    ) -> tuple[list[int], list[int]]:
+        """Map physical train GPUs to rollout-engine indices in the infer pool."""
+        if not infer_mapping:
+            return [], []
+        if per_engine <= 0:
+            raise RuntimeError(
+                f"rollout_num_gpus_per_engine must be positive, got {per_engine}"
+            )
+        if len(infer_mapping) % per_engine != 0:
+            raise RuntimeError(
+                "actor_infer GPU mapping length must be divisible by "
+                f"rollout_num_gpus_per_engine: mapping={infer_mapping}, "
+                f"per_engine={per_engine}"
+            )
+
+        gpu_to_engine = {
+            int(gpu): local_idx // per_engine
+            for local_idx, gpu in enumerate(infer_mapping)
+        }
+        target_gpu_ids = sorted(
+            int(gpu)
+            for gpu in set(allocated_train_gpus)
+            if int(gpu) in gpu_to_engine
+        )
+        target_indices = sorted({gpu_to_engine[gpu] for gpu in target_gpu_ids})
+        return target_indices, target_gpu_ids
 
     @staticmethod
     def _probe_min_free_gpu_mem_gb(gpu_ids: list[int]) -> Optional[float]:
