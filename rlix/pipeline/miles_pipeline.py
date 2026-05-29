@@ -577,7 +577,7 @@ class MilesPipeline:
         # overlap GPU IDs. The train actor will need ~3.7 GB for the
         # 0.5B model + a few GB for activations; aim for ≥20 GB free
         # before we let _before_training proceed to wake_up.
-        target_free_gb = 20.0
+        target_free_gb = float(os.environ.get("MILES_MIN_FREE_GPU_MEM_GB", "20.0"))
         deadline2 = time.time() + float(timeout_s)
         last_min_free_gb: Optional[float] = None
         nvidia_smi_unavail_count = 0
