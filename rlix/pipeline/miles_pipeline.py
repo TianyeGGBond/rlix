@@ -535,7 +535,7 @@ class MilesPipeline:
         if not target_indices:
             return
 
-        # Phase 1: wait for engine state transitions to "offloaded" / "shell".
+        # Phase 1: wait until overlapping engines cannot hold inference memory.
         deadline = time.time() + float(timeout_s)
         uniq: set = set()
         while time.time() < deadline:
@@ -544,23 +544,24 @@ class MilesPipeline:
                     rollout_manager.get_engine_states.remote(target_indices)
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "_wait_for_overlap_engines_offloaded: get_engine_states failed: %r", exc
-                )
-                return
+                raise RuntimeError(
+                    "_wait_for_overlap_engines_offloaded: failed to read "
+                    f"engine states for {target_indices}"
+                ) from exc
             uniq = {states.get(i, "?") for i in target_indices}
             if uniq.issubset({"offloaded", "shell"}):
                 logger.info(
-                    "_wait_for_overlap_engines_offloaded: engines %s reached state=%s",
+                    "_wait_for_overlap_engines_offloaded: engines %s reached "
+                    "train-safe states=%s",
                     target_indices, uniq,
                 )
                 break
             time.sleep(0.1)
         else:
-            logger.warning(
-                "_wait_for_overlap_engines_offloaded: state timeout after %.1fs; "
-                "engines %s still in state=%r",
-                timeout_s, target_indices, uniq,
+            raise RuntimeError(
+                "_wait_for_overlap_engines_offloaded: timed out after "
+                f"{timeout_s:.1f}s waiting for engines {target_indices} "
+                f"to reach train-safe states; last_states={uniq!r}"
             )
 
         # Phase 2: verify the OS has enough free memory for the train actor
@@ -595,13 +596,13 @@ class MilesPipeline:
                 )
                 return
             time.sleep(0.5)
-        logger.warning(
-            "_wait_for_overlap_engines_offloaded: free-mem timeout after %.1fs; "
-            "min_free_gb=%.2f below %.1f GB target on GPUs %s — wake_up may OOM",
-            timeout_s,
-            last_min_free_gb if last_min_free_gb is not None else float("nan"),
-            target_free_gb,
-            target_gpu_ids,
+        observed_min_gb = (
+            last_min_free_gb if last_min_free_gb is not None else float("nan")
+        )
+        raise RuntimeError(
+            "_wait_for_overlap_engines_offloaded: timed out after "
+            f"{timeout_s:.1f}s waiting for free GPU memory on {target_gpu_ids}; "
+            f"min_free_gb={observed_min_gb:.2f}, target_free_gb={target_free_gb:.1f}"
         )
 
     @staticmethod
