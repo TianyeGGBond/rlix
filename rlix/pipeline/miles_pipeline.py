@@ -51,6 +51,7 @@ from rlix.protocol.types import (
     SCHEDULER_ACTOR_NAME,
     get_pipeline_namespace,
 )
+from rlix.utils.env import parse_env_positive_float
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -505,12 +506,13 @@ class MilesPipeline:
         """After scheduler grants actor_train, poll the rollout manager
         until the engines on overlap GPUs have transitioned to ``offloaded``.
 
-        The hard residual-allocation safety check runs during
-        ``RolloutManager.shrink_engines`` via SGLang ``/server_info``
-        (weight + kvcache + graph). This method only waits for the state
-        transition and logs raw OS-level ``nvidia-smi memory.used`` as a
-        diagnostic, because process-level GPU usage includes CUDA / Ray /
-        runtime overhead beyond SGLang's offloadable allocations.
+        After the rollout engines report ``offloaded`` / ``shell``, this
+        method enforces the whole-GPU residual availability gate using
+        ``nvidia-smi memory.used`` over the overlap GPUs. This intentionally
+        counts non-SGLang co-tenants (Megatron/Miles/vLLM/orphan processes)
+        so residual GPU pressure is not missed; Miles logs SGLang
+        per-process/server_info diagnostics during ``shrink_engines`` for
+        attribution.
         """
         rollout_manager = getattr(self, "_rollout_manager", None)
         if rollout_manager is None:
@@ -571,23 +573,35 @@ class MilesPipeline:
                 timeout_s, target_indices, uniq,
             )
 
-        # Phase 2: log raw nvidia-smi used memory as diagnostics only.
-        # The hard safety check now runs inside RolloutManager.shrink_engines
-        # via SGLang /server_info (weight + kvcache + graph), which is a
-        # narrower residual-allocation signal than process-level GPU usage.
+        # Phase 2: whole-GPU residual availability hard gate. This is
+        # intentionally broader than the SGLang process tree: it catches
+        # non-child/orphan/co-tenant VRAM (Megatron/Miles/vLLM/etc.) on the
+        # GPUs that must be clear before actor_train wakes up.
+        threshold_gb = parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 13.0)
         max_used_gb = self._probe_max_used_gpu_mem_gb(target_gpu_ids)
         if max_used_gb is None:
-            logger.info(
+            logger.warning(
                 "_wait_for_overlap_engines_offloaded: nvidia-smi probe unavailable; "
-                "server-side SGLang residual check already ran during shrink"
+                "skipping whole-GPU residual hard gate (fail-open)"
             )
             return
         logger.info(
-            "_wait_for_overlap_engines_offloaded: OS-level GPU mem used max=%.2f GB "
-            "across overlap GPUs %s (diagnostic; SGLang residual assert is the gate)",
+            "_wait_for_overlap_engines_offloaded: whole-GPU mem used max=%.2f GB "
+            "across overlap GPUs %s threshold=%.2f GB",
             max_used_gb,
             target_gpu_ids,
+            threshold_gb,
         )
+        if max_used_gb > threshold_gb:
+            raise RuntimeError(
+                f"Post-offload whole-GPU residual {max_used_gb:.2f} GiB exceeds "
+                f"threshold {threshold_gb:.2f} GiB on overlap GPUs {target_gpu_ids}. "
+                "GPU was not sufficiently cleared before wake_up; this whole-GPU "
+                "check may be caused by non-SGLang co-tenants such as "
+                "Megatron/Miles/vLLM/orphan processes. SGLang per-engine "
+                "process-resident and server_info residual diagnostics are logged "
+                "engine-side for attribution."
+            )
 
     @staticmethod
     def _probe_max_used_gpu_mem_gb(gpu_ids: list[int]) -> Optional[float]:

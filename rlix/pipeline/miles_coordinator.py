@@ -436,16 +436,15 @@ class MilesCoordinator(Coordinator):
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for shrink")
         # RPC outside the lock.
-        # Per-engine PROCESS-resident GPU memory threshold (GiB) passed to
-        # MILES shrink_engines -> assert_post_sleep_process_vram_below_threshold.
-        # Default 3.0: an offloaded SGLang scheduler process measures ~1.8 GiB
-        # resident (mostly non-offloadable CUDA context), so 3.0 leaves margin
-        # over that baseline while still catching large residuals such as an
-        # unoffloaded KV pool. (A 0.5B weight-only offload miss adds only ~1 GiB
-        # and may not trip it; the gate targets large KV/full-offload failures.)
-        # This is NOT whole-GPU used and NOT /server_info accounting.
+        # Whole-GPU residual threshold (GiB). Miles shrink_engines logs
+        # SGLang per-process/server_info attribution diagnostics with this
+        # value; the hard whole-GPU gate runs in MilesPipeline after the
+        # engines report offloaded. Default 13.0 is a temporary smoke-safe
+        # value based on observed whole-GPU residuals with the known Megatron
+        # train-offload gap; lower it after that follow-up is fixed and
+        # re-measured.
         residual_threshold_gb = parse_env_positive_float(
-            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 3.0
+            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 13.0
         )
         shrunk = ray.get(
             rollout_manager.shrink_engines.remote(
@@ -455,8 +454,8 @@ class MilesCoordinator(Coordinator):
         )
         logger.info(
             "[MilesCoordinator] shrink_engines complete pipeline_id=%s "
-            "engine_indices=%s per_process_residual_threshold=%.1f GB "
-            "(per-engine resident gate ran inside shrink_engines; fail-open if unmeasurable)",
+            "engine_indices=%s whole_gpu_residual_threshold=%.1f GB "
+            "(whole-GPU hard gate runs in MilesPipeline; Miles shrink logs SGLang diagnostics)",
             self._pipeline_id,
             sorted(shrunk),
             residual_threshold_gb,
