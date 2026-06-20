@@ -130,28 +130,20 @@ class MilesModelUpdateService:
         sync_id: str | None,
         target_engine_indices: set[int] | frozenset[int],
         version: int,
-        *,
-        broadcast_local_ranks: set[int] | frozenset[int] | None = None,
     ) -> int:
-        """F15 / F20 atomic sync unit — sender + finalize + publish.
+        """Atomic sync unit — transport + finalize + publish.
 
-        Single ``asyncio.wait_for(self._timeout_s)`` covers:
-          (a) ``cache_owner_actor.run_sync_session(plan)`` — single composite RPC
-              that drives every per-bucket transport (cpu_serialize tmpfs +
-              NCCL broadcast, classified via the ``broadcast_local_ranks``
-              kwarg below).
+        Every target engine receives its weights over the cpu_serialize
+        (tmpfs) transport. A single ``asyncio.wait_for(self._timeout_s)``
+        covers:
+          (a) ``cache_owner_actor.run_sync_session(plan)`` — single composite
+              RPC that drives every per-bucket transport.
           (b) ``finalize_weight_update`` fan-out across receivers.
           (c) ``manager.set_weight_version(version, engine_indices=target)``
-              single publish per sync (F21).
+              single publish per sync.
 
-        ``version == -1`` is the F40 base path: the cache_owner has already
-        built buckets at init Step 4; the transport flow is identical (no
-        special-case branch).
-
-        ``broadcast_local_ranks`` is the subset of ``target_engine_indices``
-        whose engines need the NCCL broadcast path (non-colocate engines
-        whose GPU is outside the train pool). M11.1 RLix mode default is
-        all-cpu_serialize, so the kwarg defaults to ``None`` (empty set).
+        ``version == -1`` is the base path: the cache_owner has already built
+        buckets at init; the transport flow is identical (no special case).
 
         Returns the published version (echoed for caller logging).
         """
@@ -168,29 +160,10 @@ class MilesModelUpdateService:
             )
             return int(version)
 
-        broadcast_set = frozenset(int(i) for i in (broadcast_local_ranks or ()))
-        if not broadcast_set.issubset(target):
-            raise ValueError(
-                f"broadcast_local_ranks={sorted(broadcast_set)} must be a subset "
-                f"of target_engine_indices={sorted(target)}"
-            )
-        if broadcast_set:
-            # The cache-owner sender NCCL path (init_process_group +
-            # per-bucket dist.broadcast + dist.destroy_process_group)
-            # is not yet implemented inside MILES run_sync_session
-            # (iter 12 wires only the receiver-side fan-out). Fail
-            # fast rather than hang the receivers waiting for an
-            # absent sender.
-            raise NotImplementedError(
-                "broadcast_local_ranks transport requires sender-side NCCL "
-                "(init_process_group + dist.broadcast on the cache_owner). "
-                "MILES iter 12 only wired the receiver-side fan-out. "
-                "Until the sender-side path lands, route every target "
-                "through cpu_serialize."
-            )
-        cpu_serialize_set = target - broadcast_set
+        # Every target goes over the cpu_serialize transport.
+        cpu_serialize_set = target
 
-        # R06-F1 fix: track every Ray ObjectRef issued by this atomic
+        # Track every Ray ObjectRef issued by this atomic
         # unit so an asyncio.wait_for timeout (or any other cancellation)
         # can fan out ray.cancel(force=True) on them. Without this, the
         # local coroutine cancels but the Ray actor methods on
@@ -205,7 +178,6 @@ class MilesModelUpdateService:
                 target=target,
                 version=int(version),
                 cpu_serialize_set=cpu_serialize_set,
-                broadcast_set=broadcast_set,
                 inflight_refs=inflight_refs,
             )
 
@@ -252,7 +224,6 @@ class MilesModelUpdateService:
         target: frozenset[int],
         version: int,
         cpu_serialize_set: frozenset[int],
-        broadcast_set: frozenset[int],
         inflight_refs: list,
     ) -> int:
         # Each .remote() is captured into inflight_refs BEFORE we await
@@ -274,7 +245,6 @@ class MilesModelUpdateService:
             version=version,
             target_handles=handles,
             cpu_serialize_set=cpu_serialize_set,
-            broadcast_set=broadcast_set,
             inflight_refs=inflight_refs,
         )
 
@@ -328,13 +298,12 @@ class MilesModelUpdateService:
         await _ray_get(publish_ref)
         logger.info(
             "[MilesModelUpdateService] sync_selected_workers_done pipeline_id=%s "
-            "sync_id=%s version=%s targets=%s cpu_serialize=%s broadcast=%s",
+            "sync_id=%s version=%s targets=%s cpu_serialize=%s",
             self._pipeline_id,
             sync_id,
             version,
             sorted(target),
             sorted(cpu_serialize_set),
-            sorted(broadcast_set),
         )
         return int(version)
 
@@ -345,7 +314,6 @@ class MilesModelUpdateService:
         version: int,
         target_handles: dict[int, Any],
         cpu_serialize_set: frozenset[int],
-        broadcast_set: frozenset[int],
         inflight_refs: list,
     ) -> dict[str, Any]:
         # F26 / C16: master_port != 0. Claim a free port from the
@@ -421,19 +389,11 @@ class MilesModelUpdateService:
                     "claims before retrying."
                 )
 
-        # Per-engine NCCL rank within the dynamic broadcast group.
-        # cache_owner is rank 0; receivers are 1..N.
-        comm_ranks: dict[int, int] = {}
-        for r, idx in enumerate(sorted(broadcast_set), start=1):
-            comm_ranks[idx] = r
-        # cpu_serialize engines are not in the broadcast group; they
-        # never enter setup_collective_group. Comm-rank assignment is
-        # ignored for them but kept in the dict for plan-shape
-        # uniformity (run_sync_session reads it conditionally).
-        for idx in cpu_serialize_set:
-            comm_ranks.setdefault(idx, 0)
-
-        world_size = 1 + len(broadcast_set) if broadcast_set else 1
+        # cpu_serialize engines never enter a collective group, so they
+        # carry rank 0. The comm_ranks / broadcast_local_ranks / world_size
+        # fields are kept in the wire plan for plan-shape uniformity with
+        # the MILES run_sync_session reader.
+        comm_ranks = {idx: 0 for idx in cpu_serialize_set}
 
         plan = SyncSessionPlan(
             sync_id=sync_id,
@@ -444,9 +404,9 @@ class MilesModelUpdateService:
             timeout_s=float(self._timeout_s or 0.0),
             target_handles=dict(target_handles),
             cpu_serialize_local_ranks=cpu_serialize_set,
-            broadcast_local_ranks=broadcast_set,
+            broadcast_local_ranks=frozenset(),
             comm_ranks=comm_ranks,
-            world_size=int(world_size),
+            world_size=1,
         )
         return plan.as_wire_dict()
 
