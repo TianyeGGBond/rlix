@@ -44,6 +44,11 @@ def get_pipeline_namespace(pipeline_id: str) -> str:
     return f"pipeline_{pipeline_id}_NS"
 
 
+def get_coordinator_actor_name(pipeline_id: str) -> str:
+    """Canonical Ray actor name for a per-pipeline coordinator actor."""
+    return f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}"
+
+
 @dataclass(frozen=True, slots=True)
 class ActionResponse:
     success: bool
