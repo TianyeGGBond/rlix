@@ -16,13 +16,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import ray
 
 from rlix.protocol.types import (
-    COORDINATOR_ACTOR_NAME_PREFIX,
     GENERATION_CLUSTER_NAME,
     ORCHESTRATOR_ACTOR_NAME,
     REWARD_CLUSTER_NAME,
     RLIX_NAMESPACE,
     Priority,
     ProgressReport,
+    get_coordinator_actor_name,
     get_pipeline_namespace,
 )
 from rlix.protocol.validation import validate_pipeline_id
@@ -1227,7 +1227,7 @@ class SchedulerImpl:
             if cached_namespace == coordinator_namespace:
                 return cached_handle
 
-        coordinator_name = f"{COORDINATOR_ACTOR_NAME_PREFIX}{pipeline_id}"
+        coordinator_name = get_coordinator_actor_name(pipeline_id)
         handle = get_actor_or_raise(
             coordinator_name,
             coordinator_namespace,
