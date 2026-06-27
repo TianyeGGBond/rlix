@@ -67,6 +67,9 @@ output/
 # External submodules
 external/
 
+## Personal reference directories
+joe/
+
 ## Internal / personal files (not for release)
 #CLAUDE.md
 #AGENTS.md
