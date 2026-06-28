@@ -894,11 +894,11 @@ class SchedulerImpl:
                 continue
 
             pipeline_id, cluster_name = parse_cluster_id(cluster_id)
-            if cluster_name != "actor_infer":
+            if cluster_name != GENERATION_CLUSTER_NAME:
                 continue
 
             infer_cfg = (
-                self._state.pipeline_registry.get(pipeline_id, {}).get("cluster_configs", {}).get("actor_infer")
+                self._state.pipeline_registry.get(pipeline_id, {}).get("cluster_configs", {}).get(GENERATION_CLUSTER_NAME)
             )
             if infer_cfg is None:
                 continue
@@ -990,7 +990,7 @@ class SchedulerImpl:
                         bundle = alloc.dp_rank_to_gpus.get(dp_rank)
                         if bundle is None:
                             pipeline_id, _ = parse_cluster_id(cluster_id)
-                            infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
+                            infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"][GENERATION_CLUSTER_NAME]
                             tp_size = int(infer_cfg.get("tp_size", 1))
                             device_mapping = list(infer_cfg.get("device_mapping") or [])
                             start = dp_rank * tp_size
@@ -1054,7 +1054,7 @@ class SchedulerImpl:
                                     continue
                                 tp_size = int(
                                     self._state.pipeline_registry[parse_cluster_id(donor_cid)[0]]["cluster_configs"][
-                                        "actor_infer"
+                                        GENERATION_CLUSTER_NAME
                                     ]["tp_size"]
                                 )
                                 active_ranks = sorted(donor_alloc.active_dp_ranks)
@@ -1133,7 +1133,7 @@ class SchedulerImpl:
                 for pending in pending_gen:
                     cluster_id = pending.request.cluster_id
                     pipeline_id, cluster_name = parse_cluster_id(cluster_id)
-                    if cluster_name != "actor_infer":
+                    if cluster_name != GENERATION_CLUSTER_NAME:
                         continue
                     # Signal when any dp worker is active (partial allocation is valid).
                     if not active_dp_workers.get(pipeline_id):
@@ -1244,9 +1244,9 @@ class SchedulerImpl:
         can be reused by _collect_shrink_trace_infos_locked without duplicating logic.
         """
         pipeline_id, cluster_name = parse_cluster_id(cluster_id)
-        if cluster_name != "actor_infer":
+        if cluster_name != GENERATION_CLUSTER_NAME:
             return set()
-        infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
+        infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"][GENERATION_CLUSTER_NAME]
         tp_size = int(infer_cfg.get("tp_size", 1))
         device_mapping = list(infer_cfg.get("device_mapping") or [])
         start = dp_rank * tp_size
@@ -1328,7 +1328,7 @@ class SchedulerImpl:
             if not dp_ranks:
                 return
             pipeline_id, cluster_name = parse_cluster_id(cluster_id)
-            if cluster_name != "actor_infer":
+            if cluster_name != GENERATION_CLUSTER_NAME:
                 return
             s = pipeline_to_remove.setdefault(pipeline_id, set())
             for r in dp_ranks:
@@ -1338,7 +1338,7 @@ class SchedulerImpl:
             if not dp_ranks:
                 return
             pipeline_id, cluster_name = parse_cluster_id(cluster_id)
-            if cluster_name != "actor_infer":
+            if cluster_name != GENERATION_CLUSTER_NAME:
                 return
             s = pipeline_to_add.setdefault(pipeline_id, set())
             for r in dp_ranks:
@@ -1725,7 +1725,7 @@ class SchedulerImpl:
                 req = existing
             else:
                 pipeline_id, cluster_name = parse_cluster_id(cluster_id)
-                if cluster_name != "actor_infer":
+                if cluster_name != GENERATION_CLUSTER_NAME:
                     raise RuntimeError(
                         f"await_release_gpus only supports actor_infer generation clusters, got {cluster_id!r}"
                     )
