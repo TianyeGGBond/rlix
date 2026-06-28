@@ -72,6 +72,10 @@ Minimal training steps: --num-rollout 2
 
 Open the template link, filter for 4x RTX 5090 or 4x A40, pick a machine with reliability ≥99%, and click RENT.
 
+Below is a reference configuration that was used for a successful run:
+
+![Vast.ai machine configuration — 4x RTX 5090, Host 4535, CUDA 13.2, PCIe 4.0/16x](smoke-test-runbook.png)
+
 ### Step 2: SSH In
 
 ```bash
@@ -331,6 +335,10 @@ SSH 进去后，按以下步骤跑 M11.2 dual-pipeline smoke test：
 ### Step 1: 租机器
 
 打开模板链接，筛选 4x RTX 5090 或 4x A40，选 reliability ≥99% 的机器，点 RENT。
+
+以下是之前成功跑通时使用的机器配置：
+
+![Vast.ai 机器配置 — 4x RTX 5090, Host 4535, CUDA 13.2, PCIe 4.0/16x](smoke-test-runbook.png)
 
 ### Step 2: SSH 进入
 
