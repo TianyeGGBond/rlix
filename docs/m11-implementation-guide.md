@@ -723,7 +723,7 @@ New deferred-work entries surfaced during M11.2 real-overlap work (not in the hi
 
 ## §7 How to reproduce
 
-The three scripts under `scripts/` are the verification rig. **A reviewer cloning the repo can re-run M11.1 single + M11.2 dual end-to-end and confirm `EXIT_CODE=0` themselves.** No hidden setup.
+The three scripts under `scripts/` are the verification rig. **A reviewer cloning the repo can re-run M11.1 single + M11.2 dual end-to-end and confirm `EXIT_CODE=0` themselves.** No hidden setup. For the full step-by-step guide (from renting a Vast.ai instance to verifying success), see [`docs/smoke-test-runbook.md`](smoke-test-runbook.md).
 
 ### 7.1 Prerequisites
 
@@ -816,6 +816,7 @@ The two append-only iteration logs are the source of truth for what was exercise
 - `plans/m11-e2e-test-log.md` — M11.1 attempts 0–10 (10 fix-retest cycles, ~3.5 hr vast time). Final attempt 10 = `EXIT_CODE=0` with both rollouts trained on 4xRTX5090.
 - `plans/m11-2-dual-pipeline-log.md` — M11.2 attempts 0–4 (4 fix-retest cycles, ~33 min vast time). Final attempt 4 = `EXIT_CODE=0` with both pipelines reaching `shutdown_hard` on 4xA40.
 - `plans/m11-review.debug.md` — post-review verification: M11.2 dual smoke RERUN at HEAD `5dc4e43` / `6126e01` on 2026-05-08 (Run 1) confirms Feature 11/F2 engine-index fix is non-regressing (`EXIT_CODE=0`, 0 `KeyError`, 0 `engine_index` warnings).
+- `docs/smoke-test-runbook.md` — independent verification by Joe Zhou on 2026-06-26: M11.2 dual-pipeline overlap smoke on 4×RTX 5090 (32GB), `EXIT_CODE=0`.
 
 ## Appendix B — Code review artifacts
 
