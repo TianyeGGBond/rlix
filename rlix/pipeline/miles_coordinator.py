@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import threading
 import time
 from copy import deepcopy
@@ -37,7 +38,7 @@ from rlix.protocol.types import (
     get_pipeline_namespace,
 )
 from rlix.protocol.validation import validate_pipeline_id
-from rlix.utils.env import pipeline_identity_env_vars
+from rlix.utils.env import parse_env_positive_float, pipeline_identity_env_vars
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -60,9 +61,13 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     runtime_env. Reads ``RLIX_CONTROL_PLANE`` from the environment so
     actors inside an existing pipeline preserve the inherited value.
     """
-    return pipeline_identity_env_vars(
+    env_vars = pipeline_identity_env_vars(
         pipeline_id=str(pipeline_id), ray_namespace=str(ray_namespace)
     )
+    for key in ("MILES_MAX_RESIDUAL_GPU_MEM_GB",):
+        if (value := os.environ.get(key)) is not None:
+            env_vars[key] = value
+    return env_vars
 
 
 class MilesCoordinator(Coordinator):
@@ -431,7 +436,30 @@ class MilesCoordinator(Coordinator):
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for shrink")
         # RPC outside the lock.
-        ray.get(rollout_manager.shrink_engines.remote(sorted(engine_indices)))
+        # Whole-GPU residual threshold (GiB). Miles shrink_engines logs
+        # SGLang per-process/server_info attribution diagnostics with this
+        # value; the hard whole-GPU gate runs in MilesPipeline after the
+        # engines report offloaded. Default 13.0 is a temporary smoke-safe
+        # value based on observed whole-GPU residuals with the known Megatron
+        # train-offload gap; lower it after that follow-up is fixed and
+        # re-measured.
+        residual_threshold_gb = parse_env_positive_float(
+            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 13.0
+        )
+        shrunk = ray.get(
+            rollout_manager.shrink_engines.remote(
+                sorted(engine_indices),
+                post_sleep_vram_threshold_gb=residual_threshold_gb,
+            )
+        )
+        logger.info(
+            "[MilesCoordinator] shrink_engines complete pipeline_id=%s "
+            "engine_indices=%s whole_gpu_residual_threshold=%.1f GB "
+            "(whole-GPU hard gate runs in MilesPipeline; Miles shrink logs SGLang diagnostics)",
+            self._pipeline_id,
+            sorted(shrunk),
+            residual_threshold_gb,
+        )
         # Commit under lock.
         with self._resize_sync_lock:
             self._active_engine_indices -= engine_indices
