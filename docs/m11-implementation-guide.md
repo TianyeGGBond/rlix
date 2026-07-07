@@ -60,6 +60,8 @@ _(added 2026-05-24)_ Real-overlap (M11.2 shared-infer) verification rig: vast.ai
 - `plans/m11-2-overlap-log.md` — M11.2 real overlap attempts 0–10 (incl. Phase 1/3/7 implementation + Tianye PR integration + B-13 fix + batch follow-ups)
 - `docs/m11-tianye-prs-review.md` — dedicated writeup on Tianye's paired PRs (`rlops/rlix#16` + `rlops/miles#4`) that fixed B-13
 
+_(added 2026-07-05)_ Independent verification by Joe Zhou: M11.2 dual-pipeline overlap smoke on vast.ai 4× RTX 5090 (32GB), 2026-06-26, `EXIT_CODE=0`. Full runbook: [`docs/smoke-test-runbook.md`](smoke-test-runbook.md).
+
 ### 1.5 5-minute reading order
 
 1. §2 architecture diagram below.
