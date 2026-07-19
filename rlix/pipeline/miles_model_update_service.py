@@ -213,6 +213,9 @@ class MilesModelUpdateService:
         # hold cache_owner._cache_lock — the next sync_selected_workers
         # call would queue behind the still-executing prior method.
         inflight_refs: list = []
+        # Carries the (addr, port) claim out of the atomic unit so the
+        # cancellation handlers below can still release it.
+        port_claim_holder: list = []
 
         async def _run() -> int:
             return await self._run_atomic_unit(
@@ -222,6 +225,7 @@ class MilesModelUpdateService:
                 cpu_serialize_set=cpu_serialize_set,
                 broadcast_set=broadcast_set,
                 inflight_refs=inflight_refs,
+                port_claim_holder=port_claim_holder,
             )
 
         try:
@@ -230,12 +234,14 @@ class MilesModelUpdateService:
             return await asyncio.wait_for(_run(), timeout=float(self._timeout_s))
         except asyncio.TimeoutError:
             self._cancel_inflight(inflight_refs, reason="wait_for timeout")
+            self._release_port_claim_nowait(port_claim_holder)
             raise
         except asyncio.CancelledError:
             # Outer cancellation (caller cancelled sync_selected_workers
             # task) — propagate after firing ray.cancel so we don't leak
             # inflight Ray work either.
             self._cancel_inflight(inflight_refs, reason="task cancelled")
+            self._release_port_claim_nowait(port_claim_holder)
             raise
 
     def _cancel_inflight(self, inflight_refs: list, *, reason: str) -> None:
@@ -269,6 +275,7 @@ class MilesModelUpdateService:
         cpu_serialize_set: frozenset[int],
         broadcast_set: frozenset[int],
         inflight_refs: list,
+        port_claim_holder: list,
     ) -> int:
         # Each .remote() is captured into inflight_refs BEFORE we await
         # so the outer cancellation handler can fire ray.cancel(force=True)
@@ -292,19 +299,26 @@ class MilesModelUpdateService:
             broadcast_set=broadcast_set,
             inflight_refs=inflight_refs,
         )
+        if port_claim is not None:
+            port_claim_holder.append(port_claim)
 
         # (3) Single composite RPC into the cache_owner. F04 invariant
         #     means run_sync_session is the ONLY top-level Ray method
         #     used for transport.
         sync_ref = self._cache_owner_actor.run_sync_session.remote(plan)
         inflight_refs.append(sync_ref)
-        await _ray_get(sync_ref)
-        if port_claim is not None:
-            await self._release_port_claim(
-                master_addr=port_claim[0],
-                master_port=port_claim[1],
-                inflight_refs=inflight_refs,
-            )
+        try:
+            await _ray_get(sync_ref)
+        finally:
+            # The port is only needed for the NCCL rendezvous during
+            # transport, so release it however the transport ended.
+            if port_claim is not None:
+                await self._release_port_claim(
+                    master_addr=port_claim[0],
+                    master_port=port_claim[1],
+                    inflight_refs=inflight_refs,
+                )
+                port_claim_holder.clear()
 
         # (4) Finalize fan-out. F21: per-bucket payload had no version;
         #     finalize_weight_update on every receiver flushes pending
@@ -458,6 +472,29 @@ class MilesModelUpdateService:
             world_size=int(world_size),
         )
         return plan.as_wire_dict(), port_claim
+
+    def _release_port_claim_nowait(self, port_claim_holder: list) -> None:
+        """Fire-and-forget release used on the cancellation path.
+
+        An awaited release would itself be cancelled by ``wait_for`` (and
+        ``CancelledError`` is a ``BaseException``, so the ``except Exception``
+        in :meth:`_release_port_claim` would not catch it). A bare
+        ``.remote()`` still dispatches the delete on the actor.
+        """
+        if not port_claim_holder:
+            return
+        master_addr, master_port = port_claim_holder.pop()
+        try:
+            shared_storage = _get_shared_storage_actor()
+            shared_storage.delete.remote(f"MASTER_ADDR_PORT:{master_addr}:{int(master_port)}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "MilesModelUpdateService: failed to release port claim "
+                "master_addr=%s master_port=%s: %r",
+                master_addr,
+                master_port,
+                exc,
+            )
 
     async def _release_port_claim(
         self,
